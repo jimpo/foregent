@@ -26,3 +26,10 @@ def list_issues() -> list[dict[str, str]]:
         {"key": issue.key, "title": issue.title, "status": issue.status}
         for issue in store.list_issues()
     ]
+
+
+@app.post("/issues/{key}/complete")
+def complete_issue(key: str) -> dict[str, str]:
+    """Mark issue ``key`` Done and return the resulting record."""
+    issue = store.complete(key)
+    return {"key": issue.key, "title": issue.title, "status": issue.status}

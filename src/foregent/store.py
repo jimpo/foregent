@@ -9,8 +9,9 @@ populated — the rebuild path lands with the bridge.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import replace
 
-from foregent.models import Issue
+from foregent.models import Issue, IssueStatus
 
 
 class IssueStore:
@@ -30,6 +31,21 @@ class IssueStore:
     def get(self, key: str) -> Issue | None:
         """Return the issue with ``key``, or ``None`` if absent."""
         return self._issues.get(key)
+
+    def complete(self, key: str) -> Issue:
+        """Mark the issue ``key`` as Done, upserting a minimal issue if unknown.
+
+        There is no dispatch/claim path yet (the store starts empty), so an
+        unknown key is created rather than rejected.
+        """
+        existing = self._issues.get(key)
+        issue = (
+            replace(existing, status=IssueStatus.DONE)
+            if existing is not None
+            else Issue(key=key, title="", status=IssueStatus.DONE)
+        )
+        self._issues[key] = issue
+        return issue
 
     def list_issues(self) -> list[Issue]:
         """Return all issues, sorted by key for stable output."""

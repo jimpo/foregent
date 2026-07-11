@@ -26,6 +26,11 @@ mcpServers:
   github:
     type: http
     url: "https://api.githubcopilot.com/mcp/"
+  # foregent lifecycle tools (complete_task, ...). Provisioning must put the
+  # foregent-mcp console script on PATH — same assumption as the foregent CLI.
+  foregent:
+    type: stdio
+    command: foregent-mcp
 ---
 
 # TASK SUPERVISOR AGENT

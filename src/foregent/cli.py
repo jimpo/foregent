@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import urllib.error
 import urllib.request
@@ -17,14 +16,8 @@ from collections.abc import Sequence
 from urllib.parse import urlparse
 
 from foregent import __version__
+from foregent.config import api_url
 from foregent.models import Issue, IssueStatus
-
-DEFAULT_API_URL = "http://127.0.0.1:8577"
-
-
-def api_url() -> str:
-    """Base URL of the foregent server (``FOREGENT_API_URL`` or the default)."""
-    return os.environ.get("FOREGENT_API_URL", DEFAULT_API_URL)
 
 
 def build_parser() -> argparse.ArgumentParser:
