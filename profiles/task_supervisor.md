@@ -3,8 +3,8 @@ name: task_supervisor
 description: Foregent task supervisor — owns one Linear issue end to end, delegating to developer/reviewer workers
 role: supervisor
 provider: claude_code
-allowedTools:
-  - "*"
+model: opus
+allowedTools: ["*"]
 mcpServers:
   # cao-mcp-server: spawn and message the developer/reviewer workers.
   # Declaring ANY mcpServers here makes CAO launch with --strict-mcp-config,

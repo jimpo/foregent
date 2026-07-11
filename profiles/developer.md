@@ -3,6 +3,11 @@ name: developer
 description: Foregent developer agent — implements a task in the workspace, reports back to the task supervisor
 role: developer
 provider: claude_code
+model: sonnet
+# Unrestricted tools (overrides the role's CAO defaults): full-permission
+# agents on a dedicated box, per PLAN §3 goal 1. Isolation is the MCP
+# allowlist below, not the tool set.
+allowedTools: ["*"]
 mcpServers:
   # cao-mcp-server ONLY. This lone declaration triggers CAO's
   # --strict-mcp-config, which locks out the devbox's global Linear/GitHub

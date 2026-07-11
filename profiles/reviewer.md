@@ -3,6 +3,13 @@ name: reviewer
 description: Foregent reviewer agent — reviews a developer's diff, reports back to the task supervisor
 role: reviewer
 provider: claude_code
+model: opus
+# Unrestricted tools (overrides the role's CAO defaults, which withhold
+# execute_bash — the JIM-49 reviewer couldn't even run ty check). The
+# reviewer may run tests/typecheckers, edit scratch files, and web-fetch;
+# "report, don't modify the change" stays a prompt-level rule enforced by
+# the supervisor checking the diff.
+allowedTools: ["*"]
 mcpServers:
   # cao-mcp-server ONLY. This lone declaration triggers CAO's
   # --strict-mcp-config, which locks out the devbox's global Linear/GitHub
