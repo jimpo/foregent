@@ -1,18 +1,30 @@
 """The ``foregent`` management CLI.
 
-A thin reporting surface over an :class:`~foregent.store.IssueStore`. Today it
-exposes a single ``status`` subcommand that lists tracked issues and their
-lifecycle state; the store is empty in this skeleton, so ``status`` reports
-that no issues are being tracked.
+A thin client over the foregent API server (:mod:`foregent.server`). The
+``status`` subcommand fetches tracked issues over HTTP and pretty-prints them;
+``serve`` runs the server itself. The store lives in the server, not here.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
 from collections.abc import Sequence
+from urllib.parse import urlparse
 
 from foregent import __version__
-from foregent.store import IssueStore
+from foregent.models import Issue, IssueStatus
+
+DEFAULT_API_URL = "http://127.0.0.1:8577"
+
+
+def api_url() -> str:
+    """Base URL of the foregent server (``FOREGENT_API_URL`` or the default)."""
+    return os.environ.get("FOREGENT_API_URL", DEFAULT_API_URL)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,12 +47,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.set_defaults(func=cmd_status)
 
+    serve = subparsers.add_parser(
+        "serve",
+        help="Run the foregent API server.",
+        description="Serve the issue store over HTTP for the CLI to query.",
+    )
+    serve.set_defaults(func=cmd_serve)
+
     return parser
 
 
-def cmd_status(args: argparse.Namespace, store: IssueStore) -> int:
-    """Print a table of tracked issues and their statuses."""
-    issues = store.list_issues()
+def fetch_issues() -> list[Issue]:
+    """Fetch the tracked issues from the server, deserialized into `Issue`."""
+    with urllib.request.urlopen(f"{api_url()}/issues") as response:
+        records = json.load(response)
+    return [
+        Issue(key=r["key"], title=r["title"], status=IssueStatus(r["status"]))
+        for r in records
+    ]
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Fetch tracked issues from the server and print them as a table."""
+    try:
+        issues = fetch_issues()
+    except urllib.error.URLError as exc:
+        print(
+            f"Cannot reach foregent server at {api_url()}: {exc.reason}",
+            file=sys.stderr,
+        )
+        return 1
+
     if not issues:
         print("No issues are being tracked.")
         return 0
@@ -57,17 +94,20 @@ def cmd_status(args: argparse.Namespace, store: IssueStore) -> int:
     return 0
 
 
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the API server on the host/port from the configured API URL."""
+    import uvicorn
+
+    url = urlparse(api_url())
+    uvicorn.run("foregent.server:app", host=url.hostname or "127.0.0.1", port=url.port or 8577)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point. Returns a process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
-
-    # In-memory store: empty in the skeleton, rebuilt from CAO + Linear once
-    # the bridge lands (docs/PLAN.md §5.11).
-    store = IssueStore()
-
-    func = args.func
-    return func(args, store)
+    return args.func(args)
 
 
 if __name__ == "__main__":

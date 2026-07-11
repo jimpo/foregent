@@ -16,5 +16,8 @@ __pycache__/
 # Devbox sandbox (not committed, per README)
 .devbox/
 
+# Foregent supervisor task/review scratch files
+.foregent-tasks/
+
 *.local.md
 
