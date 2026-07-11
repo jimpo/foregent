@@ -23,8 +23,10 @@ CAO-launched agents develop foregent from inside the box.
 - `devbox ssh`, then `herdr --session cao` — observe agents.
 - `scripts/install-profiles.sh` — install/refresh foregent's agent profiles
   (`profiles/*.md`) into CAO's store; rerun after editing a profile.
-- `cao launch --agents developer --auto-approve` — hand-drive until the
-  bridge exists. The profile carries `provider: claude_code` and
-  `allowedTools: ["*"]`, so no `--provider`/`--yolo` flags are needed;
-  `--auto-approve` only skips the CLI's interactive confirm (the REST API the
-  bridge will use has no such prompt).
+- `cao launch --agents task_supervisor --auto-approve` — hand-drive until the
+  bridge exists. The supervisor owns a Linear issue and delegates to
+  `developer`/`reviewer` workers (which it spawns via cao-mcp-server). The
+  profile carries `provider: claude_code` and `allowedTools: ["*"]`, so no
+  `--provider`/`--yolo` flags are needed; `--auto-approve` only skips the
+  CLI's interactive confirm (the REST API the bridge will use has no such
+  prompt).

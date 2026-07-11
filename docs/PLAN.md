@@ -30,7 +30,7 @@ active AWS Labs team, neutral governance.
 
 - Best-in-class file-based agent profiles (provider / model / role / tool
   allowlist / MCP servers / prompt per profile) — maps directly to our
-  developer / reviewer / task-manager / cryptographer personas.
+  task_supervisor / developer / reviewer personas (plus deferred/project ones).
 - Best-in-class async messaging: DB-backed inbox with idle-gated (or eager)
   delivery into running sessions.
 - Real provider abstraction: Claude Code first-class (incl.
@@ -96,8 +96,9 @@ detection.
    the operator interacts through those platforms only.
 3. **Bootstrap mode** for young projects: Linear-driven but pre-GitHub /
    pre-code-review — agents auto-merge to the local repo's main branch.
-4. Multiple agent profiles: developer, reviewer, task-manager, cryptographer,
-   … per-project extensible.
+4. Multiple agent profiles: a `task_supervisor` per issue delegating to
+   `developer`/`reviewer` workers; a deferred issue-scout; per-project extras
+   (e.g. binius `cryptographer`).
 5. Ralph-style continuous operation: webhook-triggered plus a keep-things-
    moving loop; no human babysitting.
 6. Parallel tasks in isolated workspaces; **rebase-based, linear history** is
@@ -171,8 +172,9 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
 - Maintains the issue ↔ agent ↔ workspace mapping as an **in-memory cache**,
   rebuildable from CAO + Linear — the bridge owns no database (§5.11).
 - Dispatch: ready issue → claim it (assignee + In Progress, §5.12) → acquire
-  workspace → launch CAO terminal `foregent/<KEY>` with the right profile +
-  cwd → deliver assignment.
+  workspace → launch CAO terminal `foregent/<KEY>` running the
+  `task_supervisor` profile (§5.2) with cwd = the workspace → deliver
+  assignment. The supervisor spawns `developer`/`reviewer` workers itself.
 - Wake: event matching a parked agent's blocker → inbox message to the
   still-alive session (see 5.6).
 - Loop insurance: a periodic tick (CAO flow or internal scheduler) re-checks
@@ -180,21 +182,46 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
   system (Ralph loop = webhooks + tick).
 
 ### 5.2 Agent profiles
-- CAO profiles, one file per persona: `developer`, `reviewer`,
-  `task-manager`, `cryptographer`, project-specific extras.
-- Live in the project's config repo/dir (see 5.8) and are `cao install`ed at
-  provision time and on sync.
-- All profiles get: foregent MCP server, Linear MCP, GitHub MCP,
-  `permissionMode: bypassPermissions`, project env (sccache etc.).
+- CAO profiles, one file per persona, adapted from CAO's default agent store
+  (`code_supervisor` → `task_supervisor`, plus `developer` and `reviewer`).
+- Live in the project's config repo/dir (see 5.8), `cao install`ed at
+  provision time and on sync (`scripts/install-profiles.sh`).
+- **The default set is three personas:**
+  - **`task_supervisor`** (CAO `role: supervisor`) — **what foregent launches
+    per Linear issue.** Owns one issue end to end: reads the issue, drives its
+    Linear status, decomposes the work, and delegates coding to `developer`
+    and review to `reviewer` via CAO handoff/assign, never writing code
+    itself. It is the **only** persona with outward MCP reach:
+    **foregent MCP** (lifecycle: `report_blocked`, `complete_task`),
+    **Linear MCP**, **GitHub MCP**, and **cao-mcp-server** (to spawn/message
+    workers).
+  - **`developer`** (CAO `role: developer`) — worker; implements in the
+    workspace. **cao-mcp-server only** (for `send_message` back to the
+    supervisor). No Linear/GitHub/foregent MCP.
+  - **`reviewer`** (CAO `role: reviewer`) — worker; reviews the developer's
+    diff. **cao-mcp-server only**. No Linear/GitHub/foregent MCP.
+- **MCP isolation is structural, not just convention.** CAO's `claude_code`
+  provider adds `--strict-mcp-config` (excluding the devbox's global
+  Linear/GitHub Claude Code plugins) **only when the profile declares
+  `mcpServers`**. So `developer`/`reviewer` must each declare
+  `mcpServers: {cao-mcp-server}` — that lone declaration is what locks the
+  outward plugins out. A profile with no `mcpServers` block would silently
+  inherit the global plugins (a leak). "No outward MCP" = "cao-mcp only,
+  strictly."
+- All Linear/GitHub/foregent communication for an issue therefore flows
+  through its `task_supervisor`; workers only talk to the supervisor.
 - Each profile carries a `skills:` filter (fnmatch patterns) scoping which of
   CAO's installed skills appear in that persona's catalog (see 5.8).
+- Project-specific extras (e.g. binius **`cryptographer`**, a `developer`
+  variant) ship in the managed repo, not the default set.
 
-### 5.3 Task-manager agent
+### 5.3 Issue-scout agent (deferred)
 - A profile whose job is grooming: select, order, decompose, and assign
-  Linear issues; keep WIP bounded.
-- Triggered by the bridge on a schedule and/or on "queue empty" /
-  "issue completed" events. It writes to Linear; the bridge reacts to the
-  resulting webhooks — the task-manager never dispatches work directly.
+  Linear issues; keep WIP bounded. It writes to Linear; the bridge reacts to
+  the resulting webhooks — the scout never dispatches work directly.
+- **Deferred to a later phase.** Initial development drives issues through the
+  `task_supervisor` only; until the scout exists, issue selection/sequencing
+  is the operator's job (or a simple bridge tick over ready issues).
 
 ### 5.4 Review-comment monitor
 - GitHub PR review / comment webhooks → triage: actionable now (deliver to
@@ -353,7 +380,7 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
     blocker in the attachment metadata so a later re-dispatch resumes at the
     right stage.
 - **Orphaned feeds the scheduler, never auto-re-dispatch.** Orphaned issues
-  are a queue the scheduler / task-manager (or operator) decides on —
+  are a queue the scheduler / issue-scout (or operator) decides on —
   re-dispatch, defer, or escalate. Re-dispatch transitions Orphaned → In
   Progress/In Review and launches a fresh `foregent/<KEY>` session, briefed
   from the metadata.
@@ -391,22 +418,31 @@ system itself.
    `cao launch --agent-profile developer` Claude terminal works in the
    foregent checkout.
 1. **Self-hosting bootstrap**: this repo pushed into the box (devbox `push`
-   mode); a minimal `developer` profile; operator hand-slings foregent tasks
-   to agents via `cao` CLI / inbox, observes via `herdr --session cao`.
-   Agents commit with jj, rebase-to-main locally (bootstrap mode by hand).
+   mode); the `task_supervisor` + `developer` + `reviewer` profiles (§5.2,
+   cao-mcp-only isolation on the workers); operator hand-launches a
+   `task_supervisor` per foregent task via `cao` CLI / inbox and observes via
+   `herdr --session cao`, confirming the supervisor delegates coding/review to
+   its workers. Agents commit with jj, rebase-to-main locally (bootstrap mode
+   by hand).
    Also the validation spike, run on the box: inbox messaging (this is the
    wake mechanism — §5.6), status transitions (including the parked agent
    sitting at `WAITING_USER_ANSWER` and waking on an inbox message),
    kill-the-process crash behavior (expect `UNKNOWN` on tmux / `pane.closed`
    on herdr), CAO skill-catalog + `load_skill` working for the `claude_code`
    provider with a per-profile `skills:` filter (§5.8), SSE stream
-   (`CAO_MCP_APPS_ENABLED`).
+   (`CAO_MCP_APPS_ENABLED`), and **wiring Linear/GitHub MCP into the
+   `task_supervisor` under `--strict-mcp-config`** — the supervisor must
+   declare cao-mcp-server (to spawn workers), which forces strict mode and
+   excludes the devbox's global Linear/GitHub plugins, so their remote
+   endpoints + auth (Linear OAuth, GitHub PAT) must be plumbed explicitly into
+   the profile (§5.2).
 2. **Bridge core**: FastAPI service, in-memory cache rebuilt from CAO session
    names (no database — §5.11), CAO REST client, foregent MCP server
    (get_assignment / report_blocked / complete_task), manual dispatch via CLI.
    Single repo, bootstrap mode, no webhooks yet. From here on, foregent
    development itself runs through the bridge.
-3. **Linear loop**: webhook ingestion + task-manager profile + tick; the
+3. **Linear loop**: webhook ingestion + a bridge tick over ready issues (the
+   issue-scout profile stays deferred, §5.3); the
    claim/orphan protocol (§5.12: claim-on-start, boot reconciliation, Orphaned
    state + scheduler); the Linear-persistence spike (§5.11: attachment
    `metadata` upsert-by-url, self-webhook actor filtering); the managed team
@@ -414,7 +450,7 @@ system itself.
    Linear end-to-end in bootstrap mode.
 4. **Workspaces**: pool, jj-or-git decision executed (Q6), multi-repo layout,
    sccache wiring.
-5. **GitHub full mode**: PR flow, reviewer profile, review-comment monitor,
+5. **GitHub full mode**: PR flow, review-comment monitor,
    park-alive on PR blockers + inbox wake. Foregent graduates from bootstrap
    to full mode on its own repo.
 6. **Provisioning generalization + hardening**: manifest + cloud-init for
