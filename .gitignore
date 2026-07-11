@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# uv
+# (uv.lock IS committed)
+
+# Type checker / tooling caches
+.ty_cache/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+
+# Devbox sandbox (not committed, per README)
+.devbox/
