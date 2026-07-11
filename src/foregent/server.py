@@ -25,16 +25,23 @@ store = IssueStore()
 
 
 def _record(issue: Issue) -> dict[str, str]:
-    return {"key": issue.key, "title": issue.title, "status": issue.status}
+    return {
+        "key": issue.key,
+        "title": issue.title,
+        "status": issue.status,
+        "blocker": issue.blocker,
+    }
 
 
 def dispatch() -> None:
     """Launch a task_supervisor for the oldest Queued issue, capacity allowing.
 
-    Capacity is hardcoded at one concurrently running agent. On a CAO failure
-    the issue stays Queued and the caller's request fails with 502.
+    Capacity is hardcoded at one concurrently running agent, occupied by an
+    IN_PROGRESS or a parked-alive BLOCKED issue (docs/PLAN.md §5.6). On a CAO
+    failure the issue stays Queued and the caller's request fails with 502.
     """
-    if any(issue.status is IssueStatus.IN_PROGRESS for issue in store):
+    occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
+    if any(issue.status in occupied for issue in store):
         return
     issue = store.next_queued()
     if issue is None:
@@ -56,7 +63,7 @@ def dispatch() -> None:
 
 @app.get("/issues")
 def list_issues() -> list[dict[str, str]]:
-    """Return the tracked issues as ``{key, title, status}`` records."""
+    """Return the tracked issues as ``{key, title, status, blocker}`` records."""
     return [_record(issue) for issue in store.list_issues()]
 
 
@@ -84,4 +91,16 @@ def complete_issue(key: str) -> dict[str, str]:
     # error, but the issue is Done and the next one stays Queued until a later
     # queue/complete triggers dispatch again. Retrying complete is safe.
     dispatch()
+    return _record(issue)
+
+
+@app.post("/issues/{key}/block")
+def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str, str]:
+    """Mark issue ``key`` Blocked with ``blocker`` and return the record.
+
+    Does not dispatch: a blocked agent parks alive in its workspace and keeps
+    holding its capacity slot (docs/PLAN.md §5.6), so blocking must not free
+    capacity or launch another agent.
+    """
+    issue = store.block(key, blocker)
     return _record(issue)

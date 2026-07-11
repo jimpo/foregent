@@ -66,6 +66,21 @@ class IssueStore:
         self._issues[key] = issue
         return issue
 
+    def block(self, key: str, blocker: str) -> Issue:
+        """Mark the issue ``key`` as Blocked with ``blocker``, upserting if unknown.
+
+        Mirrors :meth:`complete`: an unknown key is created rather than
+        rejected, since there is no dispatch/claim path yet.
+        """
+        existing = self._issues.get(key)
+        issue = (
+            replace(existing, status=IssueStatus.BLOCKED, blocker=blocker)
+            if existing is not None
+            else Issue(key=key, title="", status=IssueStatus.BLOCKED, blocker=blocker)
+        )
+        self._issues[key] = issue
+        return issue
+
     def list_issues(self) -> list[Issue]:
         """Return all issues, sorted by key for stable output."""
         return sorted(self._issues.values(), key=lambda issue: issue.key)

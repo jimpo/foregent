@@ -78,7 +78,12 @@ def fetch_issues() -> list[Issue]:
     with urllib.request.urlopen(f"{api_url()}/issues") as response:
         records = json.load(response)
     return [
-        Issue(key=r["key"], title=r["title"], status=IssueStatus(r["status"]))
+        Issue(
+            key=r["key"],
+            title=r["title"],
+            status=IssueStatus(r["status"]),
+            blocker=r.get("blocker", ""),
+        )
         for r in records
     ]
 
@@ -102,10 +107,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     status_width = max(len("STATUS"), *(len(issue.status) for issue in issues))
     print(f"{'ISSUE':<{key_width}}  {'STATUS':<{status_width}}  TITLE")
     for issue in issues:
+        title = issue.title
+        if issue.blocker:
+            title = f"{title}  (blocked on {issue.blocker})"
         print(
             f"{issue.key:<{key_width}}  "
             f"{issue.status:<{status_width}}  "
-            f"{issue.title}"
+            f"{title}"
         )
     return 0
 

@@ -44,3 +44,4 @@ class Issue:
     title: str
     status: IssueStatus = IssueStatus.TODO
     directory: str = ""
+    blocker: str = ""
