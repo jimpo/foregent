@@ -1,0 +1,14 @@
+{
+  "name": "foregent",
+  "owner": {
+    "name": "Foregent"
+  },
+  "description": "Foregent's own Claude Code plugins, committed in-repo.",
+  "plugins": [
+    {
+      "name": "ty-lsp",
+      "source": "./ty-lsp",
+      "description": "Python code intelligence via the ty language server (Astral)."
+    }
+  ]
+}

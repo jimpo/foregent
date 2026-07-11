@@ -1,0 +1,8 @@
+{
+  "name": "ty-lsp",
+  "description": "Python code intelligence for Claude Code via the ty language server (Astral).",
+  "version": "0.1.0",
+  "author": {
+    "name": "Foregent"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "ty": {
+    "command": "uvx",
+    "args": ["ty", "server"],
+    "extensionToLanguage": {
+      ".py": "python",
+      ".pyi": "python"
+    },
+    "startupTimeout": 30000
+  }
+}
