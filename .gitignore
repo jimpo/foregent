@@ -15,3 +15,6 @@ __pycache__/
 
 # Devbox sandbox (not committed, per README)
 .devbox/
+
+*.local.md
+
