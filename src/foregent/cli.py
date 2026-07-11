@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Run the foregent API server.",
         description="Serve the issue store over HTTP for the CLI to query.",
     )
+    serve.add_argument(
+        "--dev",
+        action="store_true",
+        help="Enable autoreload: restart the server when source files change.",
+    )
     serve.set_defaults(func=cmd_serve)
 
     return parser
@@ -92,7 +97,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn
 
     url = urlparse(api_url())
-    uvicorn.run("foregent.server:app", host=url.hostname or "127.0.0.1", port=url.port or 8577)
+    uvicorn.run(
+        "foregent.server:app",
+        host=url.hostname or "127.0.0.1",
+        port=url.port or 8577,
+        reload=args.dev,
+    )
     return 0
 
 
