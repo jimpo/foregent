@@ -22,6 +22,7 @@ class IssueStatus(StrEnum):
     """
 
     TODO = "Todo"
+    QUEUED = "Queued"
     IN_PROGRESS = "In Progress"
     BLOCKED = "Blocked"
     IN_REVIEW = "In Review"
@@ -35,8 +36,11 @@ class Issue:
 
     ``key`` is the Linear identifier (e.g. ``"JIM-43"``) and is the stable
     handle used throughout the system (CAO session names, workspace paths).
+    ``directory`` is the working directory the issue was queued with, where
+    its task_supervisor agent is launched.
     """
 
     key: str
     title: str
     status: IssueStatus = IssueStatus.TODO
+    directory: str = ""

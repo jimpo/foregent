@@ -32,6 +32,25 @@ class IssueStore:
         """Return the issue with ``key``, or ``None`` if absent."""
         return self._issues.get(key)
 
+    def queue(self, key: str, directory: str) -> Issue:
+        """Mark issue ``key`` Queued with ``directory``, at the back of the queue.
+
+        Re-inserting the key makes dict insertion order the queue (FIFO)
+        order, so :meth:`next_queued` needs no separate queue structure.
+        Unknown keys are upserted, as in :meth:`complete`.
+        """
+        existing = self._issues.pop(key, None) or Issue(key=key, title="")
+        issue = replace(existing, status=IssueStatus.QUEUED, directory=directory)
+        self._issues[key] = issue
+        return issue
+
+    def next_queued(self) -> Issue | None:
+        """Return the oldest Queued issue, or ``None`` if the queue is empty."""
+        return next(
+            (i for i in self._issues.values() if i.status is IssueStatus.QUEUED),
+            None,
+        )
+
     def complete(self, key: str) -> Issue:
         """Mark the issue ``key`` as Done, upserting a minimal issue if unknown.
 

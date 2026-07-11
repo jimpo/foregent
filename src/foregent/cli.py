@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from foregent import __version__
 from foregent.config import api_url
@@ -39,6 +40,23 @@ def build_parser() -> argparse.ArgumentParser:
         description="List every issue foregent is tracking and its status.",
     )
     status.set_defaults(func=cmd_status)
+
+    queue = subparsers.add_parser(
+        "queue",
+        help="Queue an issue for an autonomous task supervisor.",
+        description=(
+            "Ask the server to queue an issue; it is dispatched to a CAO "
+            "task_supervisor agent as soon as capacity allows."
+        ),
+    )
+    queue.add_argument("issue_id", help="Linear issue key, e.g. JIM-49.")
+    queue.add_argument(
+        "-d",
+        "--directory",
+        default=".",
+        help="Working directory for the agent (default: current directory).",
+    )
+    queue.set_defaults(func=cmd_queue)
 
     serve = subparsers.add_parser(
         "serve",
@@ -89,6 +107,39 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"{issue.status:<{status_width}}  "
             f"{issue.title}"
         )
+    return 0
+
+
+def cmd_queue(args: argparse.Namespace) -> int:
+    """Queue an issue on the server and print its resulting status."""
+    request = urllib.request.Request(
+        f"{api_url()}/issues/{quote(args.issue_id, safe='')}/queue",
+        data=json.dumps({"directory": os.path.abspath(args.directory)}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            record = json.load(response)
+    except urllib.error.HTTPError as exc:
+        # The body is FastAPI's {"detail": str} on our server, but don't
+        # assume: fall back to the HTTP reason on anything else. A 502 means
+        # the issue queued but dispatch failed, so don't claim queueing failed.
+        try:
+            detail = json.load(exc)["detail"]
+        except (ValueError, KeyError):
+            detail = exc.reason
+        if not isinstance(detail, str):
+            detail = exc.reason
+        print(f"{args.issue_id}: {detail}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(
+            f"Cannot reach foregent server at {api_url()}: {exc.reason}",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"{record['key']}: {record['status']}")
     return 0
 
 
