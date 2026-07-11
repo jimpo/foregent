@@ -28,8 +28,8 @@ mcpServers:
   # Linear / GitHub remote MCP. Auth wiring under --strict-mcp-config (OAuth
   # token / PAT injection) is a phase-1/2 provisioning task — see PLAN §5.2.
   linear:
-    type: sse
-    url: "https://mcp.linear.app/sse"
+    type: http
+    url: "https://mcp.linear.app/mcp"
   github:
     type: http
     url: "https://api.githubcopilot.com/mcp/"
