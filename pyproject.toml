@@ -8,7 +8,6 @@ dependencies = ["fastapi>=0.115", "uvicorn>=0.34", "watchfiles>=0.24", "mcp>=1.2
 
 [project.scripts]
 foregent = "foregent.cli:main"
-foregent-mcp = "foregent.mcp_server:main"
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]

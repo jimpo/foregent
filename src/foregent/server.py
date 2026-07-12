@@ -3,21 +3,43 @@
 Owns the authoritative :class:`~foregent.store.IssueStore` and exposes it over
 HTTP so the CLI can stay a thin client (``docs/PLAN.md`` §2, Bridge core).
 Queued issues are dispatched to CAO ``task_supervisor`` agents as capacity
-allows.
+allows. Also mounts the foregent MCP server (``complete_task``,
+``report_blocked``) as streamable HTTP at ``/mcp``, so the ``task_supervisor``
+agent's lifecycle tools mutate this same in-process store directly instead of
+looping back over HTTP.
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException
+from mcp.server.fastmcp import FastMCP
+from starlette.concurrency import run_in_threadpool
 
 from foregent import cao
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 
-app = FastAPI(title="foregent")
+# stateless_http: these tools are fire-and-forget, so session-id bookkeeping
+# would be pure overhead.
+mcp = FastMCP("foregent", stateless_http=True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
+    # so the session manager has to be driven from here instead. By the time
+    # this runs (server startup), `mcp.streamable_http_app()` has already
+    # been called at import time (see the `app.mount` call at the bottom of
+    # this module), so `mcp.session_manager` exists.
+    async with mcp.session_manager.run():
+        yield
+
+
+app = FastAPI(title="foregent", lifespan=lifespan)
 
 # The single, process-wide issue store this server serves. Empty on startup;
 # rebuilt from CAO + Linear once the bridge lands (JIM-52).
@@ -104,3 +126,41 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
     """
     issue = store.block(key, blocker)
     return _record(issue)
+
+
+@mcp.tool()
+async def complete_task(issue_key: str) -> str:
+    """Record ``issue_key`` as Done in the foregent issue store."""
+    # complete_issue's dispatch() call can block on a urllib call to
+    # cao-server for up to ~60s; FastMCP runs sync tools inline on the event
+    # loop (no auto-offload like Starlette gives sync FastAPI routes), so
+    # this must be threadpooled to avoid stalling the whole server.
+    try:
+        await run_in_threadpool(complete_issue, issue_key)
+    except HTTPException as exc:
+        # store.complete already succeeded; only the follow-on dispatch
+        # failed, and retrying complete is safe (server.py's /complete route
+        # docstring) — so report success rather than raising a tool error.
+        return f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
+    return f"Marked {issue_key} complete."
+
+
+@mcp.tool()
+async def report_blocked(issue_key: str, blocker: str) -> str:
+    """Record ``blocker`` on ``issue_key`` in the foregent issue store.
+
+    The agent session stays parked alive in its workspace: this only records
+    state, nothing is terminated, and there is no wake mechanism here (the
+    bridge posts the resolving event later; see docs/PLAN.md §5.6).
+    """
+    await run_in_threadpool(block_issue, issue_key, blocker)
+    return f"Recorded blocker {blocker!r} on {issue_key}."
+
+
+# Mounted at "/" (not "/mcp") because streamable_http_app() already routes at
+# its own streamable_http_path (default "/mcp") — mounting it at "/mcp" would
+# yield "/mcp/mcp". Mounted last so the explicit REST routes above take
+# precedence and this catch-all doesn't shadow them. Calling
+# streamable_http_app() here (import time) is also what creates
+# `mcp.session_manager` lazily, which `lifespan` above depends on.
+app.mount("/", mcp.streamable_http_app())

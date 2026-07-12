@@ -1,8 +1,7 @@
 """Shared client configuration for the foregent API server.
 
-Both the CLI (:mod:`foregent.cli`) and the MCP server
-(:mod:`foregent.mcp_server`) are thin HTTP clients of the API server, so the
-base-URL config lives here in one place.
+The CLI (:mod:`foregent.cli`) is a thin HTTP client of the API server, so the
+base-URL config lives here.
 """
 
 from __future__ import annotations
