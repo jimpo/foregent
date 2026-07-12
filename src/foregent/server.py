@@ -19,7 +19,7 @@ from fastapi import Body, FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import cao
+from foregent import cao, linear
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 
@@ -59,8 +59,11 @@ def dispatch() -> None:
     """Launch a task_supervisor for the oldest Queued issue, capacity allowing.
 
     Capacity is hardcoded at one concurrently running agent, occupied by an
-    IN_PROGRESS or a parked-alive BLOCKED issue (docs/PLAN.md §5.6). On a CAO
-    failure the issue stays Queued and the caller's request fails with 502.
+    IN_PROGRESS or a parked-alive BLOCKED issue (docs/PLAN.md §5.6). Before
+    launch, the issue is claimed directly in Linear (assignee + In Progress
+    state, docs/PLAN.md §5.11-5.12) — the task_supervisor is not launched
+    without a durable ownership record. On a Linear or CAO failure the issue
+    stays Queued and the caller's request fails with 502.
     """
     occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
     if any(issue.status in occupied for issue in store):
@@ -71,13 +74,21 @@ def dispatch() -> None:
     # ponytail: not atomic — if send_message fails after create_session, the
     # unassigned supervisor session leaks and a retry launches a second one.
     # Accepted for the skeleton; session naming/adoption (JIM-52) is the fix.
+    # Similarly, if claim_issue succeeds but create_session then fails, the
+    # issue is left In Progress + assigned in Linear while the store keeps it
+    # Queued; this self-heals on retry since claim_issue is idempotent (same
+    # assignee+state, so re-claiming still succeeds) — the §5.12
+    # orphan/reconciliation case.
     try:
+        linear.claim_issue(issue.key)
         terminal = cao.create_session("task_supervisor", issue.directory)
         cao.send_message(
             terminal["id"],
             f"You are assigned Linear issue {issue.key}. "
             "Read it via the Linear MCP and drive it to completion.",
         )
+    except linear.LinearError as exc:
+        raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except OSError as exc:  # URLError and friends
         raise HTTPException(status_code=502, detail=f"cao-server: {exc}") from exc
     store.add(replace(issue, status=IssueStatus.IN_PROGRESS))
