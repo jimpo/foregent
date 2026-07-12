@@ -45,3 +45,5 @@ class Issue:
     status: IssueStatus = IssueStatus.TODO
     directory: str = ""
     blocker: str = ""
+    # CAO session name of the dispatched task_supervisor; empty until dispatch.
+    session: str = ""

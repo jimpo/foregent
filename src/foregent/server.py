@@ -91,7 +91,11 @@ def dispatch() -> None:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except OSError as exc:  # URLError and friends
         raise HTTPException(status_code=502, detail=f"cao-server: {exc}") from exc
-    store.add(replace(issue, status=IssueStatus.IN_PROGRESS))
+    store.add(
+        replace(
+            issue, status=IssueStatus.IN_PROGRESS, session=terminal["session_name"]
+        )
+    )
 
 
 @app.get("/issues")
@@ -141,19 +145,28 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
 
 @mcp.tool()
 async def complete_task(issue_key: str) -> str:
-    """Record ``issue_key`` as Done in the foregent issue store."""
+    """Record ``issue_key`` as Done and shut down its supervisor's CAO session."""
     # complete_issue's dispatch() call can block on a urllib call to
     # cao-server for up to ~60s; FastMCP runs sync tools inline on the event
     # loop (no auto-offload like Starlette gives sync FastAPI routes), so
     # this must be threadpooled to avoid stalling the whole server.
     try:
         await run_in_threadpool(complete_issue, issue_key)
+        result = f"Marked {issue_key} complete."
     except HTTPException as exc:
         # store.complete already succeeded; only the follow-on dispatch
         # failed, and retrying complete is safe (server.py's /complete route
         # docstring) — so report success rather than raising a tool error.
-        return f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
-    return f"Marked {issue_key} complete."
+        result = f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
+    # Tear down this issue's own supervisor session (the caller). Best-effort:
+    # the issue is already Done, so a failed teardown must not fail the tool.
+    issue = store.get(issue_key)
+    if issue is not None and issue.session:
+        try:
+            await run_in_threadpool(cao.delete_session, issue.session)
+        except OSError as exc:
+            return f"{result} Session teardown failed: {exc}"
+    return result
 
 
 @mcp.tool()
