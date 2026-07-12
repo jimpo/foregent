@@ -1,17 +1,18 @@
 """Minimal Linear GraphQL client.
 
 Linear ships no first-party client library either, so this is a thin
-stdlib-``urllib`` wrapper over the single mutation foregent needs: claiming an
-issue. This is the bridge's own direct Linear access, separate from the
-agent-facing Linear MCP (docs/PLAN.md §5.12).
+wrapper, built on the ``gql`` library, over the single mutation foregent
+needs: claiming an issue. This is the bridge's own direct Linear access,
+separate from the agent-facing Linear MCP (docs/PLAN.md §5.12).
 """
 
 from __future__ import annotations
 
-import json
 import os
-import urllib.error
-import urllib.request
+
+from gql import Client, gql
+from gql.transport.exceptions import TransportError
+from gql.transport.requests import RequestsHTTPTransport
 
 # Cap on each Linear call: claim_issue runs inside a foregent request
 # handler, so a wedged Linear API must fail the request (502), not hang.
@@ -53,22 +54,17 @@ def _request(query: str, variables: dict) -> dict:
     api_key = os.environ.get("LINEAR_API_KEY")
     if not api_key:
         raise LinearError("LINEAR_API_KEY is not set")
-    request = urllib.request.Request(
-        api_url(),
-        data=json.dumps({"query": query, "variables": variables}).encode(),
-        headers={"Content-Type": "application/json", "Authorization": api_key},
-        method="POST",
+    transport = RequestsHTTPTransport(
+        url=api_url(),
+        headers={"Authorization": api_key},
+        timeout=TIMEOUT,
     )
+    client = Client(transport=transport)
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            body = json.loads(response.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        data = client.execute(gql(query), variable_values=variables)
+    except (TransportError, OSError) as exc:
         raise LinearError(f"Linear API request failed: {exc}") from exc
-    errors = body.get("errors")
-    if errors:
-        raise LinearError(f"Linear API returned errors: {errors}")
-    data = body.get("data")
-    if data is None:
+    if not data:
         raise LinearError("Linear API returned no data")
     return data
 
