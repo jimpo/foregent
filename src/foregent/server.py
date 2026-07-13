@@ -11,6 +11,7 @@ looping back over HTTP.
 
 from __future__ import annotations
 
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Annotated
@@ -23,6 +24,8 @@ from foregent import cao, linear
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 
+logger = logging.getLogger(__name__)
+
 # stateless_http: these tools are fire-and-forget, so session-id bookkeeping
 # would be pure overhead.
 mcp = FastMCP("foregent", stateless_http=True)
@@ -30,6 +33,7 @@ mcp = FastMCP("foregent", stateless_http=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    await run_in_threadpool(rebuild_store)
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -41,9 +45,41 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="foregent", lifespan=lifespan)
 
-# The single, process-wide issue store this server serves. Empty on startup;
-# rebuilt from CAO + Linear once the bridge lands (JIM-52).
+# The single, process-wide issue store this server serves. Empty until
+# rebuild_store() runs at startup (JIM-52); Linear-side rebuild (titles etc.)
+# lands with the rest of the bridge.
 store = IssueStore()
+
+
+def rebuild_store() -> None:
+    """Reconstruct the issue<->agent map from live CAO sessions (JIM-52).
+
+    The store is a volatile in-memory cache (docs/PLAN.md §5.11); on startup
+    we recover every dispatched supervisor by parsing the issue key out of
+    its ``cao-foregent-<KEY>`` session name. Best-effort: a cao-server
+    hiccup logs and leaves the store empty rather than blocking startup.
+    """
+    try:
+        sessions = cao.list_sessions()
+    except OSError as exc:
+        logger.warning("rebuild_store: cao-server unreachable: %s", exc)
+        return
+    for session in sessions:
+        key = cao.issue_key_from_session(session["id"])
+        if key is None:
+            continue
+        # Reconstructed as IN_PROGRESS: enough to hold the capacity-1 slot
+        # and prevent double-launch. A BLOCKED issue also holds a live
+        # session, but distinguishing that (and full orphan reconciliation)
+        # is docs/PLAN.md §5.12, out of scope here.
+        store.add(
+            Issue(
+                key=key,
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                session=session["id"],
+            )
+        )
 
 
 def _record(issue: Issue) -> dict[str, str]:
@@ -73,15 +109,20 @@ def dispatch() -> None:
         return
     # ponytail: not atomic — if send_message fails after create_session, the
     # unassigned supervisor session leaks and a retry launches a second one.
-    # Accepted for the skeleton; session naming/adoption (JIM-52) is the fix.
-    # Similarly, if claim_issue succeeds but create_session then fails, the
-    # issue is left In Progress + assigned in Linear while the store keeps it
-    # Queued; this self-heals on retry since claim_issue is idempotent (same
-    # assignee+state, so re-claiming still succeeds) — the §5.12
-    # orphan/reconciliation case.
+    # With the deterministic session name (JIM-52), that retry's
+    # create_session now hits cao-server's "Session already exists" (400,
+    # surfaced as our 502) instead of silently launching a second supervisor
+    # — an improvement, though full orphan/adoption reconciliation is still
+    # §5.12. Similarly, if claim_issue succeeds but create_session then
+    # fails, the issue is left In Progress + assigned in Linear while the
+    # store keeps it Queued; this self-heals on retry since claim_issue is
+    # idempotent (same assignee+state, so re-claiming still succeeds) — also
+    # §5.12.
     try:
         linear.claim_issue(issue.key)
-        terminal = cao.create_session("task_supervisor", issue.directory)
+        terminal = cao.create_session(
+            "task_supervisor", issue.directory, cao.session_name_for(issue.key)
+        )
         cao.send_message(
             terminal["id"],
             f"You are assigned Linear issue {issue.key}. "
