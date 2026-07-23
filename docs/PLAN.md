@@ -286,8 +286,8 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
 - cloud-init consumes the manifest: install tmux/herdr/uv/CAO/providers/
   foregent-bridge, auth (Claude, GitHub app, Linear), clone repos, install
   profiles + skills, systemd units for cao-server + bridge, start.
-- Targets: devbox-managed libvirt VMs (first, via `.devbox/cloud-config.yaml`
-  layered on devbox's common template) and cloud VMs from the same material.
+- Targets: devbox-managed libvirt VMs (first, via `.devbox/mods/*.sh` appended
+  to devbox's base playbook) and cloud VMs from the same material.
 - Skills: use **CAO's own skill subsystem** (embrace, don't work around it).
   CAO keeps a global skill store (`cao skills add <folder>`, into
   `~/.aws/cli-agent-orchestrator/skills`) plus `extra_skill_dirs` (settings
@@ -409,11 +409,12 @@ Ordered to reach **self-hosting** — CAO developing foregent inside a devbox �
 as fast as possible; everything after is developed (increasingly) by the
 system itself.
 
-0. **Provisioning skeleton** *(in progress)*: `.devbox/config.toml` +
-   `.devbox/cloud-config.yaml` layered on devbox's common template (which
-   already ships Claude Code + github/linear plugins and jj): installs tmux,
-   uv, herdr, CAO (uv tool from git), writes CAO settings (herdr backend),
-   cao-server systemd user unit + linger. Exit criteria: `devbox create`
+0. **Provisioning skeleton** *(in progress)*: `.devbox/config.toml` + the
+   `uv`/`herdr`/`cao` mods in `.devbox/mods/`, appended to devbox's base
+   playbook (which already ships Claude Code + github/linear plugins and jj):
+   installs uv, herdr, CAO (uv tool from git) + tmux, writes CAO settings
+   (herdr backend), cao-server systemd user unit + linger. Exit criteria:
+   `devbox create`
    yields a box where `cao-server` is up, and a hand-launched
    `cao launch --agent-profile developer` Claude terminal works in the
    foregent checkout.
