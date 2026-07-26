@@ -339,17 +339,17 @@ driven*. The seam exists so a second harness can be added without touching
 dispatch, and so the herdr dependency is contained in one module.
 
 ```python
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class LaunchSpec:
     label: str                     # "fg-jim-52" — the harness-level agent name
     cwd: str
-    env: dict[str, str]
+    env: Mapping[str, str]
     model: str | None
     effort: str | None
     system_prompt: str             # appended to the harness default
-    tools_allow: list[str]
-    tools_deny: list[str]
-    mcp_servers: dict              # foregent | linear | github
+    tools_allow: tuple[str, ...]
+    tools_deny: tuple[str, ...]
+    mcp_servers: Mapping[str, Mapping]   # foregent | linear | github
     conversation_id: str | None    # foregent-generated UUID; None = new
     resume: bool
 
@@ -357,15 +357,20 @@ class AgentStatus(StrEnum):
     IDLE; WORKING; BLOCKED; DONE; UNKNOWN; GONE
 
 class AgentManager(Protocol):
-    async def launch(self, spec: LaunchSpec) -> AgentRef
-    async def send(self, ref, text, *, when_idle: bool = True, timeout: float) -> None
-    async def status(self, ref) -> AgentStatus
-    async def wait(self, ref, until: set[AgentStatus], timeout: float) -> AgentStatus
-    async def read(self, ref, lines: int) -> str        # scrollback, for triage
-    async def stop(self, ref) -> None
-    async def list(self) -> list[AgentRecord]           # boot reconciliation (§5.11)
-    def events(self) -> AsyncIterator[AgentEvent]       # status_changed | exited
+    def launch(self, spec: LaunchSpec) -> AgentRef
+    def send(self, ref, text, *, when_idle: bool = True) -> None
+    def status(self, ref) -> AgentStatus
+    def wait(self, ref, until: Collection[AgentStatus], timeout: float) -> AgentStatus
+    def read(self, ref, lines: int) -> str          # scrollback, for triage
+    def stop(self, ref) -> None
+    def list_agents(self) -> list[AgentRecord]      # boot reconciliation (§5.11)
+    def events(self) -> Iterator[AgentEvent]        # status_changed | exited
 ```
+
+Calls are synchronous and may block for as long as an agent takes; the API
+server runs them in a threadpool, as it already does for the Linear client.
+Harness failures surface as a single `AgentError`, so the bridge never
+catches one runtime's socket errors and another's HTTP errors.
 
 **`HerdrClaudeManager`** is the implementation we build: it renders
 `LaunchSpec` to a `claude` argv, calls `workspace.create` → `agent.start` →
