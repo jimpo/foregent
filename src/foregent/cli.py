@@ -43,10 +43,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     queue = subparsers.add_parser(
         "queue",
-        help="Queue an issue for an autonomous task supervisor.",
+        help="Queue an issue for an autonomous agent.",
         description=(
-            "Ask the server to queue an issue; it is dispatched to a CAO "
-            "task_supervisor agent as soon as capacity allows."
+            "Ask the server to queue an issue; an agent is launched for it "
+            "as soon as capacity allows."
         ),
     )
     queue.add_argument("issue_id", help="Linear issue key, e.g. JIM-49.")

@@ -2,16 +2,18 @@
 
 Owns the authoritative :class:`~foregent.store.IssueStore` and exposes it over
 HTTP so the CLI can stay a thin client (``docs/PLAN.md`` §2, Bridge core).
-Queued issues are dispatched to CAO ``task_supervisor`` agents as capacity
-allows. Also mounts the foregent MCP server (``complete_task``,
-``report_blocked``) as streamable HTTP at ``/mcp``, so the ``task_supervisor``
-agent's lifecycle tools mutate this same in-process store directly instead of
-looping back over HTTP.
+Queued issues are dispatched to agents as capacity allows, through the
+:class:`~foregent.agents.AgentManager` seam (§5.13) rather than to any one
+harness. Also mounts the foregent MCP server (``complete_task``,
+``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
+tools mutate this same in-process store directly instead of looping back over
+HTTP.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Annotated
@@ -20,7 +22,17 @@ from fastapi import Body, FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import cao, linear
+from foregent import config, linear
+from foregent.agents import (
+    AgentError,
+    AgentEventKind,
+    AgentManager,
+    AgentRef,
+    LaunchSpec,
+    issue_key_from_label,
+    label_for,
+)
+from foregent.agents.herdr_claude import HerdrClaudeManager
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 
@@ -34,6 +46,7 @@ mcp = FastMCP("foregent", stateless_http=True)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     await run_in_threadpool(rebuild_store)
+    watch_agents()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -50,36 +63,67 @@ app = FastAPI(title="foregent", lifespan=lifespan)
 # lands with the rest of the bridge.
 store = IssueStore()
 
+# The harness foregent runs agents on. One process-wide manager, swapped
+# wholesale to change harness (docs/PLAN.md §5.13).
+manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
+
 
 def rebuild_store() -> None:
-    """Reconstruct the issue<->agent map from live CAO sessions (JIM-52).
+    """Reconstruct the issue<->agent map from live agents (JIM-52).
 
     The store is a volatile in-memory cache (docs/PLAN.md §5.11); on startup
-    we recover every dispatched supervisor by parsing the issue key out of
-    its ``cao-foregent-<KEY>`` session name. Best-effort: a cao-server
-    hiccup logs and leaves the store empty rather than blocking startup.
+    every dispatched agent is recovered by parsing the issue key out of its
+    label. Best-effort: a harness hiccup logs and leaves the store empty
+    rather than blocking startup.
     """
     try:
-        sessions = cao.list_sessions()
-    except OSError as exc:
-        logger.warning("rebuild_store: cao-server unreachable: %s", exc)
+        agents = manager.list_agents()
+    except AgentError as exc:
+        logger.warning("rebuild_store: agent harness unreachable: %s", exc)
         return
-    for session in sessions:
-        key = cao.issue_key_from_session(session["id"])
+    for record in agents:
+        key = issue_key_from_label(record.ref.label)
         if key is None:
             continue
         # Reconstructed as IN_PROGRESS: enough to hold the capacity-1 slot
         # and prevent double-launch. A BLOCKED issue also holds a live
-        # session, but distinguishing that (and full orphan reconciliation)
+        # agent, but distinguishing that (and full orphan reconciliation)
         # is docs/PLAN.md §5.12, out of scope here.
         store.add(
             Issue(
                 key=key,
                 title="",
                 status=IssueStatus.IN_PROGRESS,
-                session=session["id"],
+                directory=record.cwd,
+                agent=record.ref,
             )
         )
+
+
+def watch_agents() -> None:
+    """Consume harness events, orphaning issues whose agent dies (JIM-87).
+
+    The bridge learns about agent death from a subscription rather than a
+    probe (docs/PLAN.md §5.6). The consumer is a daemon thread because the
+    manager's stream is blocking and endless; it needs no shutdown path,
+    since it holds nothing the process cares about losing at exit.
+    """
+
+    def consume() -> None:
+        for event in manager.events():
+            if event.kind is not AgentEventKind.EXITED:
+                continue
+            key = issue_key_from_label(event.ref.label)
+            if key is None:
+                continue
+            issue = store.orphan(key)
+            if issue is not None:
+                # Orphaned frees the capacity slot: a dead agent must not go
+                # on holding one. Deciding what happens next — re-dispatch,
+                # defer, escalate — is the scheduler's (docs/PLAN.md §5.12).
+                logger.warning("agent for %s exited; issue orphaned", key)
+
+    threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
 
 
 def _record(issue: Issue) -> dict[str, str]:
@@ -91,15 +135,31 @@ def _record(issue: Issue) -> dict[str, str]:
     }
 
 
+def brief_for(key: str) -> str:
+    """The opening message an agent is given for issue ``key``."""
+    return (
+        f"You are assigned Linear issue {key}. "
+        "Read it via the Linear MCP and drive it to completion."
+    )
+
+
 def dispatch() -> None:
-    """Launch a task_supervisor for the oldest Queued issue, capacity allowing.
+    """Launch an agent for the oldest Queued issue, capacity allowing.
 
     Capacity is hardcoded at one concurrently running agent, occupied by an
     IN_PROGRESS or a parked-alive BLOCKED issue (docs/PLAN.md §5.6). Before
     launch, the issue is claimed directly in Linear (assignee + In Progress
-    state, docs/PLAN.md §5.11-5.12) — the task_supervisor is not launched
-    without a durable ownership record. On a Linear or CAO failure the issue
-    stays Queued and the caller's request fails with 502.
+    state, docs/PLAN.md §5.11-5.12) — no agent runs without a durable
+    ownership record. On a Linear or harness failure the issue stays Queued
+    and the caller's request fails with 502.
+
+    Dispatch is not atomic, and the deterministic agent label is what makes
+    that survivable. If the brief fails to send after the agent starts, a
+    retry finds the existing agent by label and adopts it instead of running
+    a second one for the same issue. If the claim succeeds but the launch
+    fails, Linear is left In Progress while the store keeps the issue Queued;
+    that self-heals on retry, because claiming is idempotent — the durable
+    fix for both is the reconciliation of §5.12.
     """
     occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
     if any(issue.status in occupied for issue in store):
@@ -107,36 +167,27 @@ def dispatch() -> None:
     issue = store.next_queued()
     if issue is None:
         return
-    # ponytail: not atomic — if send_message fails after create_session, the
-    # unassigned supervisor session leaks and a retry launches a second one.
-    # With the deterministic session name (JIM-52), that retry's
-    # create_session now hits cao-server's "Session already exists" (400,
-    # surfaced as our 502) instead of silently launching a second supervisor
-    # — an improvement, though full orphan/adoption reconciliation is still
-    # §5.12. Similarly, if claim_issue succeeds but create_session then
-    # fails, the issue is left In Progress + assigned in Linear while the
-    # store keeps it Queued; this self-heals on retry since claim_issue is
-    # idempotent (same assignee+state, so re-claiming still succeeds) — also
-    # §5.12.
+    label = label_for(issue.key)
     try:
         linear.claim_issue(issue.key)
-        terminal = cao.create_session(
-            "task_supervisor", issue.directory, cao.session_name_for(issue.key)
+        ref = _adopt(label) or manager.launch(
+            LaunchSpec(label=label, cwd=issue.directory)
         )
-        cao.send_message(
-            terminal["id"],
-            f"You are assigned Linear issue {issue.key}. "
-            "Read it via the Linear MCP and drive it to completion.",
-        )
+        manager.send(ref, brief_for(issue.key))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
-    except OSError as exc:  # URLError and friends
-        raise HTTPException(status_code=502, detail=f"cao-server: {exc}") from exc
-    store.add(
-        replace(
-            issue, status=IssueStatus.IN_PROGRESS, session=terminal["session_name"]
-        )
-    )
+    except AgentError as exc:
+        raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
+    store.add(replace(issue, status=IssueStatus.IN_PROGRESS, agent=ref))
+
+
+def _adopt(label: str) -> AgentRef | None:
+    """An already-running agent for ``label``, if a previous attempt left one."""
+    for record in manager.list_agents():
+        if record.ref.label == label:
+            logger.info("adopting the agent already running as %s", label)
+            return record.ref
+    return None
 
 
 @app.get("/issues")
@@ -186,11 +237,11 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
 
 @mcp.tool()
 async def complete_task(issue_key: str) -> str:
-    """Record ``issue_key`` as Done and shut down its supervisor's CAO session."""
-    # complete_issue's dispatch() call can block on a urllib call to
-    # cao-server for up to ~60s; FastMCP runs sync tools inline on the event
-    # loop (no auto-offload like Starlette gives sync FastAPI routes), so
-    # this must be threadpooled to avoid stalling the whole server.
+    """Record ``issue_key`` as Done and shut down its agent."""
+    # complete_issue's dispatch() call can block on the harness for a minute
+    # or more; FastMCP runs sync tools inline on the event loop (no
+    # auto-offload like Starlette gives sync FastAPI routes), so this must be
+    # threadpooled to avoid stalling the whole server.
     try:
         await run_in_threadpool(complete_issue, issue_key)
         result = f"Marked {issue_key} complete."
@@ -199,14 +250,14 @@ async def complete_task(issue_key: str) -> str:
         # failed, and retrying complete is safe (server.py's /complete route
         # docstring) — so report success rather than raising a tool error.
         result = f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
-    # Tear down this issue's own supervisor session (the caller). Best-effort:
-    # the issue is already Done, so a failed teardown must not fail the tool.
+    # Tear down the agent that called this. Best-effort: the issue is already
+    # Done, so a failed teardown must not fail the tool.
     issue = store.get(issue_key)
-    if issue is not None and issue.session:
+    if issue is not None and issue.agent is not None:
         try:
-            await run_in_threadpool(cao.delete_session, issue.session)
-        except OSError as exc:
-            return f"{result} Session teardown failed: {exc}"
+            await run_in_threadpool(manager.stop, issue.agent)
+        except AgentError as exc:
+            return f"{result} Agent teardown failed: {exc}"
     return result
 
 
@@ -214,9 +265,9 @@ async def complete_task(issue_key: str) -> str:
 async def report_blocked(issue_key: str, blocker: str) -> str:
     """Record ``blocker`` on ``issue_key`` in the foregent issue store.
 
-    The agent session stays parked alive in its workspace: this only records
-    state, nothing is terminated, and there is no wake mechanism here (the
-    bridge posts the resolving event later; see docs/PLAN.md §5.6).
+    The agent stays parked alive in its workspace: this only records state,
+    nothing is terminated, and there is no wake mechanism here (the bridge
+    prompts the agent with the resolving event later; see docs/PLAN.md §5.6).
     """
     await run_in_threadpool(block_issue, issue_key, blocker)
     return f"Recorded blocker {blocker!r} on {issue_key}."

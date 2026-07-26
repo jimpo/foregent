@@ -81,6 +81,19 @@ class IssueStore:
         self._issues[key] = issue
         return issue
 
+    def orphan(self, key: str) -> Issue | None:
+        """Mark issue ``key`` Orphaned; its agent is gone (docs/PLAN.md §5.12).
+
+        Unknown keys are ignored rather than upserted: an agent dying for an
+        issue foregent is not tracking says nothing worth recording.
+        """
+        existing = self._issues.get(key)
+        if existing is None:
+            return None
+        issue = replace(existing, status=IssueStatus.ORPHANED, agent=None)
+        self._issues[key] = issue
+        return issue
+
     def list_issues(self) -> list[Issue]:
         """Return all issues, sorted by key for stable output."""
         return sorted(self._issues.values(), key=lambda issue: issue.key)

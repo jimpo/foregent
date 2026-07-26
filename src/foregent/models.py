@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from foregent.agents import AgentRef
+
 
 class IssueStatus(StrEnum):
     """Lifecycle state of an issue as foregent sees it.
@@ -35,9 +37,9 @@ class Issue:
     """A single unit of work foregent tracks.
 
     ``key`` is the Linear identifier (e.g. ``"JIM-43"``) and is the stable
-    handle used throughout the system (CAO session names, workspace paths).
+    handle used throughout the system (agent labels, workspace paths).
     ``directory`` is the working directory the issue was queued with, where
-    its task_supervisor agent is launched.
+    its agent is launched.
     """
 
     key: str
@@ -45,5 +47,7 @@ class Issue:
     status: IssueStatus = IssueStatus.TODO
     directory: str = ""
     blocker: str = ""
-    # CAO session name of the dispatched task_supervisor; empty until dispatch.
-    session: str = ""
+    # The agent working this issue: where it runs, and the conversation it
+    # holds. None until dispatch. The conversation id is the half that
+    # outlives the process (docs/PLAN.md §5.11).
+    agent: AgentRef | None = None
