@@ -1,15 +1,16 @@
-"""Integration tests for foregent.herdr against a real herdr server (JIM-83).
+"""Integration tests against a real herdr server (JIM-83, JIM-85).
 
 Starts an actual headless ``herdr --session <scratch> server``, drives
-:mod:`foregent.herdr` against it, and tears the session down afterward.
-Skips (does not fail) when the ``herdr`` binary is not on PATH. To run:
+:mod:`foregent.herdr` and the manager built on it against that server, and
+tears the session down afterward. Skips (does not fail) when the ``herdr``
+binary is not on PATH. To run:
 
     .venv/bin/python -m unittest tests.test_herdr_integration -v
 
-``AgentIntegrationTests`` additionally launches a real Claude Code process,
-so it needs the ``claude`` binary and working auth on the box. It only starts
-an agent and reads its state — it never prompts one — so it costs no API
-tokens. It is gated separately behind ``FOREGENT_HERDR_AGENT_TESTS=1``.
+The classes that launch a real Claude Code process need the ``claude`` binary
+and working auth on the box. They only start agents and read their state —
+they never prompt one — so they cost no API tokens. They are gated separately
+behind ``FOREGENT_HERDR_AGENT_TESTS=1``.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ import uuid
 from pathlib import Path
 
 from foregent import herdr
+from foregent.agents import AgentError, AgentStatus, LaunchSpec
+from foregent.agents.herdr_claude import HerdrClaudeManager
 
 _HERDR = shutil.which("herdr")
 _AGENT_TESTS = os.environ.get("FOREGENT_HERDR_AGENT_TESTS") == "1"
@@ -228,6 +231,60 @@ class AgentIntegrationTests(unittest.TestCase):
                 for a in self.client.call("agent.list")["agents"]
             ]
             self.assertNotIn(name, names)
+
+
+@unittest.skipUnless(_HERDR, "herdr is not installed")
+@unittest.skipUnless(_AGENT_TESTS, "FOREGENT_HERDR_AGENT_TESTS is not set")
+class ManagerIntegrationTests(unittest.TestCase):
+    """HerdrClaudeManager against a real herdr and a real Claude Code."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.process = _start_server()
+        cls.manager = HerdrClaudeManager(herdr.HerdrClient(session=_SESSION))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        _stop_server(cls.process)
+
+    def test_launch_list_and_stop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = str(Path(directory).resolve())
+            label = f"fg-inttest-{os.getpid()}"
+            ref = self.manager.launch(
+                LaunchSpec(label=label, cwd=cwd, model="haiku")
+            )
+            self.addCleanup(self.manager.stop, ref)
+
+            # A conversation id exists from the moment the agent does, which
+            # is what makes it resumable (docs/PLAN.md §5.11).
+            self.assertTrue(ref.conversation_id)
+            self.assertEqual(self.manager.status(ref), AgentStatus.IDLE)
+
+            records = self.manager.list_agents()
+            self.assertIn(label, [record.ref.label for record in records])
+            record = next(r for r in records if r.ref.label == label)
+            self.assertEqual(record.cwd, cwd)
+
+            self.assertIn("claude", self.manager.read(ref, lines=40).lower())
+
+            self.manager.stop(ref)
+            self.assertEqual(self.manager.status(ref), AgentStatus.GONE)
+            self.assertNotIn(
+                label, [r.ref.label for r in self.manager.list_agents()]
+            )
+
+    def test_a_second_launch_for_one_issue_is_refused(self) -> None:
+        # The deterministic label is what makes a double dispatch impossible
+        # rather than merely unlikely (docs/PLAN.md §5.11).
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = str(Path(directory).resolve())
+            label = f"fg-dup-{os.getpid()}"
+            spec = LaunchSpec(label=label, cwd=cwd, model="haiku")
+            ref = self.manager.launch(spec)
+            self.addCleanup(self.manager.stop, ref)
+            with self.assertRaises(AgentError):
+                self.manager.launch(spec)
 
 
 if __name__ == "__main__":

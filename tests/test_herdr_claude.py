@@ -1,0 +1,310 @@
+"""Unit tests for the herdr + Claude Code manager (JIM-85).
+
+Driven through a fake herdr client: these pin the socket calls the manager
+makes and the flags it renders, without needing a server. The live behavior
+is covered by ``ManagerIntegrationTests`` in ``tests.test_herdr_integration``.
+"""
+
+from __future__ import annotations
+
+import json
+import unittest
+from dataclasses import replace
+from unittest import mock
+
+from foregent import herdr
+from foregent.agents import AgentError, AgentRef, AgentStatus, LaunchSpec
+from foregent.agents.herdr_claude import HerdrClaudeManager, render_args
+
+WORKSPACE = {
+    "workspace": {"workspace_id": "w1", "label": "JIM-85"},
+    "root_pane": {"pane_id": "w1:p1"},
+}
+
+
+_BASE = LaunchSpec(label="fg-jim-85", cwd="/ws/JIM-85")
+
+
+def spec(**overrides) -> LaunchSpec:
+    """A launch spec with the fields every test needs already set."""
+    return replace(_BASE, **overrides)
+
+
+class FakeClient:
+    """Records calls and answers from a canned table."""
+
+    def __init__(
+        self,
+        responses: dict | None = None,
+        errors: dict | None = None,
+    ) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.responses = responses or {}
+        self.errors = errors or {}
+
+    def call(self, method: str, params: dict | None = None, **kwargs) -> dict:
+        self.calls.append((method, params or {}))
+        if method in self.errors:
+            raise self.errors[method]
+        answer = self.responses.get(method, {})
+        return answer(params or {}) if callable(answer) else answer
+
+    def params_for(self, method: str) -> dict:
+        """Params of the first call to ``method``."""
+        return next(params for name, params in self.calls if name == method)
+
+    def methods(self) -> list[str]:
+        return [name for name, _ in self.calls]
+
+
+def manager(client: FakeClient) -> HerdrClaudeManager:
+    return HerdrClaudeManager(client)  # ty: ignore[invalid-argument-type]
+
+
+class RenderArgsTests(unittest.TestCase):
+    def test_a_fresh_agent_names_its_conversation(self) -> None:
+        args = render_args(spec(conversation_id="abc-123"))
+        self.assertIn("--session-id", args)
+        self.assertEqual(args[args.index("--session-id") + 1], "abc-123")
+        self.assertNotIn("--resume", args)
+
+    def test_a_resumed_agent_continues_it_instead(self) -> None:
+        # --session-id and --resume contradict each other: one names a new
+        # conversation, the other reopens a recorded one.
+        args = render_args(spec(conversation_id="abc-123", resume=True))
+        self.assertIn("--resume", args)
+        self.assertNotIn("--session-id", args)
+
+    def test_permissions_are_always_bypassed(self) -> None:
+        # Full permissions on a dedicated box (docs/PLAN.md goal 1): not a
+        # per-agent choice, so it cannot be omitted by a caller.
+        args = render_args(spec())
+        self.assertEqual(args[args.index("--permission-mode") + 1], "bypassPermissions")
+
+    def test_mcp_servers_are_declared_strictly(self) -> None:
+        args = render_args(spec(mcp_servers={"foregent": {"type": "http"}}))
+        # Strict mode is what keeps the box's global MCP config out of the
+        # agent, so it must accompany every --mcp-config.
+        self.assertIn("--strict-mcp-config", args)
+        config = json.loads(args[args.index("--mcp-config") + 1])
+        self.assertEqual(config, {"mcpServers": {"foregent": {"type": "http"}}})
+
+    def test_no_mcp_servers_means_no_strict_flag(self) -> None:
+        self.assertNotIn("--strict-mcp-config", render_args(spec()))
+
+    def test_optional_fields_are_omitted_when_unset(self) -> None:
+        args = render_args(spec())
+        for flag in ("--model", "--effort", "--append-system-prompt", "--allowedTools"):
+            self.assertNotIn(flag, args)
+
+    def test_label_becomes_the_display_name(self) -> None:
+        args = render_args(spec())
+        self.assertEqual(args[args.index("-n") + 1], "fg-jim-85")
+
+    def test_the_binary_is_left_to_herdr(self) -> None:
+        self.assertNotIn("claude", render_args(spec()))
+
+
+class LaunchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The post-idle settle is real but untestable in unit time.
+        patcher = mock.patch("foregent.agents.herdr_claude.SETTLE_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_launch_opens_a_workspace_and_starts_the_agent(self) -> None:
+        client = FakeClient({"workspace.create": WORKSPACE})
+        ref = manager(client).launch(spec(conversation_id="abc-123"))
+
+        self.assertEqual(
+            client.methods(), ["workspace.create", "agent.start", "agent.wait"]
+        )
+        created = client.params_for("workspace.create")
+        self.assertEqual(created["cwd"], "/ws/JIM-85")
+        # The workspace is labeled with the issue key, not the agent label:
+        # it is what an attached operator scans the session for.
+        self.assertEqual(created["label"], "JIM-85")
+
+        started = client.params_for("agent.start")
+        self.assertEqual(started["name"], "fg-jim-85")
+        self.assertEqual(started["kind"], "claude")
+        self.assertEqual(started["pane_id"], "w1:p1")
+        self.assertEqual(ref, AgentRef("fg-jim-85", "abc-123"))
+
+    def test_launch_waits_for_idle_before_returning(self) -> None:
+        client = FakeClient({"workspace.create": WORKSPACE})
+        manager(client).launch(spec())
+        self.assertEqual(client.params_for("agent.wait")["until"], ["idle"])
+
+    def test_launch_assigns_a_conversation_id_when_given_none(self) -> None:
+        # Every agent must be resumable from the moment it exists, so the id
+        # cannot wait for the agent to report one (docs/PLAN.md §5.11).
+        client = FakeClient({"workspace.create": WORKSPACE})
+        ref = manager(client).launch(spec())
+        self.assertTrue(ref.conversation_id)
+        args = client.params_for("agent.start")["args"]
+        self.assertEqual(args[args.index("--session-id") + 1], ref.conversation_id)
+
+    def test_a_failed_start_does_not_leak_its_workspace(self) -> None:
+        client = FakeClient(
+            {"workspace.create": WORKSPACE},
+            {"agent.start": herdr.HerdrAPIError("agent_exists", "taken")},
+        )
+        with self.assertRaises(AgentError):
+            manager(client).launch(spec())
+        self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+
+    def test_an_agent_that_never_settles_reports_the_screen(self) -> None:
+        # A start that hangs is nearly always a modal (the trust dialog), so
+        # the error carries the screen rather than just "timeout".
+        client = FakeClient(
+            {
+                "workspace.create": WORKSPACE,
+                "agent.read": {"read": {"text": "1. Yes, I trust this folder"}},
+            },
+            {"agent.wait": herdr.HerdrAPIError("timeout", "timed out")},
+        )
+        with self.assertRaises(AgentError) as caught:
+            manager(client).launch(spec())
+        self.assertIn("I trust this folder", str(caught.exception))
+        self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+
+
+class StatusTests(unittest.TestCase):
+    def test_status_maps_herdr_states(self) -> None:
+        for herdr_status, expected in [
+            ("idle", AgentStatus.IDLE),
+            ("working", AgentStatus.WORKING),
+            ("blocked", AgentStatus.BLOCKED),
+            ("done", AgentStatus.DONE),
+        ]:
+            client = FakeClient({"agent.get": {"agent": {"agent_status": herdr_status}}})
+            self.assertEqual(manager(client).status(AgentRef("fg-jim-85")), expected)
+
+    def test_an_unrecognized_state_is_unknown_not_an_error(self) -> None:
+        # A herdr release that adds a status must not crash the bridge.
+        client = FakeClient({"agent.get": {"agent": {"agent_status": "meditating"}}})
+        self.assertEqual(
+            manager(client).status(AgentRef("fg-jim-85")), AgentStatus.UNKNOWN
+        )
+
+    def test_a_missing_agent_is_gone(self) -> None:
+        client = FakeClient(
+            errors={"agent.get": herdr.HerdrAPIError("agent_not_found", "nope")}
+        )
+        self.assertEqual(
+            manager(client).status(AgentRef("fg-jim-85")), AgentStatus.GONE
+        )
+
+    def test_other_failures_are_not_mistaken_for_death(self) -> None:
+        client = FakeClient(errors={"agent.get": herdr.HerdrTransportError("down")})
+        with self.assertRaises(AgentError):
+            manager(client).status(AgentRef("fg-jim-85"))
+
+
+class WaitTests(unittest.TestCase):
+    def test_wait_passes_the_requested_states(self) -> None:
+        client = FakeClient({"agent.wait": {"agent": {"agent_status": "idle"}}})
+        status = manager(client).wait(AgentRef("fg-jim-85"), {AgentStatus.IDLE}, 30)
+        self.assertEqual(status, AgentStatus.IDLE)
+        self.assertEqual(client.params_for("agent.wait")["until"], ["idle"])
+        self.assertEqual(client.params_for("agent.wait")["timeout_ms"], 30_000)
+
+    def test_a_dying_agent_resolves_the_wait_as_gone(self) -> None:
+        # Crash authority on the call the bridge is already making, rather
+        # than a hang until the timeout (docs/PLAN.md §5.6).
+        client = FakeClient(
+            errors={"agent.wait": herdr.HerdrAPIError("agent_not_found", "nope")}
+        )
+        status = manager(client).wait(AgentRef("fg-jim-85"), {AgentStatus.IDLE}, 30)
+        self.assertEqual(status, AgentStatus.GONE)
+
+    def test_a_timeout_is_an_error(self) -> None:
+        client = FakeClient(
+            errors={"agent.wait": herdr.HerdrAPIError("timeout", "timed out")}
+        )
+        with self.assertRaises(AgentError):
+            manager(client).wait(AgentRef("fg-jim-85"), {AgentStatus.IDLE}, 1)
+
+    def test_waiting_only_for_gone_is_rejected(self) -> None:
+        # GONE has no herdr spelling, so such a wait would send an empty
+        # `until` and block forever.
+        client = FakeClient()
+        with self.assertRaises(AgentError):
+            manager(client).wait(AgentRef("fg-jim-85"), {AgentStatus.GONE}, 1)
+
+
+class StopTests(unittest.TestCase):
+    def test_stop_closes_the_whole_workspace(self) -> None:
+        client = FakeClient(
+            {"agent.get": {"agent": {"workspace_id": "w1", "pane_id": "w1:p1"}}}
+        )
+        manager(client).stop(AgentRef("fg-jim-85"))
+        self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+
+    def test_stopping_an_absent_agent_is_not_an_error(self) -> None:
+        client = FakeClient(
+            errors={"agent.get": herdr.HerdrAPIError("agent_not_found", "nope")}
+        )
+        manager(client).stop(AgentRef("fg-jim-85"))
+        self.assertNotIn("workspace.close", client.methods())
+
+
+class ListAgentsTests(unittest.TestCase):
+    def test_only_foregent_agents_are_reported(self) -> None:
+        # An operator's own pane in the same session is not ours to reconcile.
+        client = FakeClient(
+            {
+                "agent.list": {
+                    "agents": [
+                        {"name": "fg-jim-85", "agent_status": "idle", "cwd": "/ws"},
+                        {"name": "scratch", "agent_status": "idle"},
+                        {"agent_status": "working"},
+                    ]
+                }
+            }
+        )
+        records = manager(client).list_agents()
+        self.assertEqual([r.ref.label for r in records], ["fg-jim-85"])
+        self.assertEqual(records[0].status, AgentStatus.IDLE)
+        self.assertEqual(records[0].cwd, "/ws")
+
+    def test_a_reported_session_id_is_carried_through(self) -> None:
+        # herdr learns the id from Claude Code's SessionStart hook; it is a
+        # cross-check on the id foregent assigned at launch.
+        client = FakeClient(
+            {
+                "agent.list": {
+                    "agents": [
+                        {
+                            "name": "fg-jim-85",
+                            "agent_status": "idle",
+                            "agent_session": {"kind": "id", "value": "abc-123"},
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertEqual(
+            manager(client).list_agents()[0].ref.conversation_id, "abc-123"
+        )
+
+    def test_a_path_style_session_ref_is_not_a_conversation_id(self) -> None:
+        client = FakeClient(
+            {
+                "agent.list": {
+                    "agents": [
+                        {
+                            "name": "fg-jim-85",
+                            "agent_status": "idle",
+                            "agent_session": {"kind": "path", "value": "/t.jsonl"},
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertIsNone(manager(client).list_agents()[0].ref.conversation_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
