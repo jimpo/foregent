@@ -38,14 +38,34 @@ PERMISSION_MODE = "bypassPermissions"
 # failed dispatch.
 START_MS = 90_000
 
-# Breathing room after herdr first reports idle. The TUI is briefly
-# unreceptive even once the status reads idle, and a prompt sent into that
-# window is dropped with `agent_prompt_stalled`.
-SETTLE_SECONDS = 2.0
+# An agent reads as idle before its TUI can accept input; herdr exposes the
+# real precondition as `interactive_ready`, and prompting early is refused
+# with `agent_not_ready`. Poll for it rather than sleeping a guessed amount.
+READY_TIMEOUT = 30
+POLL_SECONDS = 0.25
+
+# Statuses in which an agent is free to be given something new to do.
+READY = frozenset({AgentStatus.IDLE, AgentStatus.DONE})
+
+# How long `send` waits for a busy agent to come free before giving up.
+IDLE_TIMEOUT = 300
+
+# A prompt is retried only after checking whether it actually landed; three
+# attempts is enough for a transient TUI hiccup and small enough that a
+# genuinely wedged agent surfaces quickly.
+PROMPT_ATTEMPTS = 3
+RETRY_SECONDS = 2.0
+
+# Budget for the delivery check herdr performs on a prompt. It must exceed
+# herdr's own five-second stall window, or the wait expires before the check
+# it exists to run can report.
+CONFIRM_MS = 15_000
 
 # herdr error codes this manager reacts to rather than propagates.
 _NOT_FOUND = "agent_not_found"
 _TIMEOUT = "timeout"
+_NOT_READY = "agent_not_ready"
+_STALLED = "agent_prompt_stalled"
 
 # herdr's agent statuses. Anything unrecognized (a new herdr release) maps to
 # UNKNOWN rather than raising: an unreadable state is not a dead agent.
@@ -149,8 +169,18 @@ class HerdrClaudeManager:
         return AgentRef(spec.label, spec.conversation_id)
 
     def send(self, ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
-        """Deliver ``text`` to the agent (JIM-86)."""
-        raise NotImplementedError
+        """Deliver ``text`` to the agent, retrying only if it did not land.
+
+        This is both the assignment brief at dispatch and the wake of a
+        parked agent (docs/PLAN.md §5.6), so silently dropping a message and
+        silently sending it twice are both real failures.
+        """
+        if when_idle:
+            status = self.wait(ref, READY, IDLE_TIMEOUT)
+            if status is AgentStatus.GONE:
+                raise AgentError(f"cannot send to {ref.label}: agent is gone")
+        self._await_interactive(ref.label)
+        self._prompt(ref, text)
 
     def status(self, ref: AgentRef) -> AgentStatus:
         """Current status, or ``GONE`` if herdr no longer knows the agent."""
@@ -173,7 +203,8 @@ class HerdrClaudeManager:
         making.
         """
         # GONE has no herdr spelling; it arrives as `agent_not_found`.
-        wire = [s.value for s in until if s in _STATUS.values()]
+        # Sorted so the same wait always produces the same request.
+        wire = sorted(s.value for s in until if s in _STATUS.values())
         if not wire:
             raise AgentError(f"cannot wait for {sorted(until)}: no live status")
         timeout_ms = int(timeout * 1000)
@@ -231,8 +262,67 @@ class HerdrClaudeManager:
             )
         return records
 
+    def _prompt(self, ref: AgentRef, text: str) -> None:
+        """Submit ``text``, and only call it sent once the agent reacted.
+
+        The prompt carries a ``wait``, which is what makes herdr watch for a
+        lifecycle change and answer `agent_prompt_stalled` when none comes.
+        That check is the delivery oracle, and it is not optional: a bare
+        prompt is reported as succeeding even when the text is swallowed by a
+        modal the agent is sitting on — the workspace trust dialog on any
+        directory Claude Code has not been told to trust — leaving the
+        message in the input box, unsent, while herdr still reports the agent
+        idle and interactive.
+
+        Retrying is therefore safe: a stall means the agent never saw it.
+        Retrying *without* the check would be how a woken agent answers the
+        same message twice (docs/PLAN.md §5.6, §5.13).
+        """
+        for attempt in range(PROMPT_ATTEMPTS):
+            try:
+                self.client.call(
+                    "agent.prompt",
+                    {
+                        "target": ref.label,
+                        "text": text,
+                        "wait": {"until": ["working"], "timeout_ms": CONFIRM_MS},
+                    },
+                    timeout=herdr.timeout_for_wait(CONFIRM_MS),
+                )
+                return
+            except herdr.HerdrAPIError as exc:
+                if exc.code == _TIMEOUT:
+                    # The stall check passed — the agent reacted — it just
+                    # never entered `working` while we watched. Delivered.
+                    return
+                if exc.code not in (_STALLED, _NOT_READY):
+                    raise AgentError(f"prompting {ref.label}: {exc}") from exc
+            except herdr.HerdrError as exc:
+                raise AgentError(f"prompting {ref.label}: {exc}") from exc
+            if attempt < PROMPT_ATTEMPTS - 1:
+                time.sleep(RETRY_SECONDS)
+        raise AgentError(
+            f"could not deliver a prompt to {ref.label} in {PROMPT_ATTEMPTS} "
+            f"attempts; last screen:\n{self.read(ref, lines=20)}"
+        )
+
+    def _await_interactive(self, label: str) -> None:
+        """Block until herdr reports the agent's TUI can accept input."""
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
+            agent = self._agent(label)
+            if agent is None:
+                raise AgentError(f"{label} is gone")
+            if agent.get("interactive_ready"):
+                return
+            time.sleep(POLL_SECONDS)
+        raise AgentError(
+            f"{label} never became interactive; last screen:\n"
+            f"{self.read(AgentRef(label), lines=20)}"
+        )
+
     def _await_ready(self, label: str) -> None:
-        """Wait for the agent to reach idle, then let the TUI settle."""
+        """Wait for the agent to reach idle and be able to take input."""
         try:
             self.client.call(
                 "agent.wait",
@@ -252,7 +342,7 @@ class HerdrClaudeManager:
             ) from exc
         except herdr.HerdrError as exc:
             raise AgentError(f"starting {label}: {exc}") from exc
-        time.sleep(SETTLE_SECONDS)
+        self._await_interactive(label)
 
     def _agent(self, label: str) -> dict | None:
         """herdr's record for ``label``, or ``None`` if there is no such agent."""

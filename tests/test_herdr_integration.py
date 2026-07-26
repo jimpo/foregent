@@ -30,6 +30,7 @@ from foregent.agents import AgentError, AgentStatus, LaunchSpec
 from foregent.agents.herdr_claude import HerdrClaudeManager
 
 _HERDR = shutil.which("herdr")
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 _AGENT_TESTS = os.environ.get("FOREGENT_HERDR_AGENT_TESTS") == "1"
 
 # Scratch session per test process, so a run never touches the operator's
@@ -273,6 +274,46 @@ class ManagerIntegrationTests(unittest.TestCase):
             self.assertNotIn(
                 label, [r.ref.label for r in self.manager.list_agents()]
             )
+
+    def test_a_prompt_sent_right_after_launch_is_answered(self) -> None:
+        # The acceptance criterion for launch + send: no settle guesswork, no
+        # `agent_prompt_stalled`, no lost first message. Runs in the repo
+        # checkout because it is a directory Claude Code already trusts —
+        # see the next test for what a fresh one costs.
+        label = f"fg-prompt-{os.getpid()}"
+        ref = self.manager.launch(
+            LaunchSpec(label=label, cwd=str(_REPO_ROOT), model="haiku")
+        )
+        self.addCleanup(self.manager.stop, ref)
+        self.manager.send(ref, "Reply with just the word PONG.")
+        self.manager.wait(ref, {AgentStatus.IDLE, AgentStatus.DONE}, 120)
+        self.assertIn("PONG", self.manager.read(ref, lines=40))
+
+    def test_an_untrusted_workspace_costs_a_retry_not_the_message(self) -> None:
+        # A directory Claude Code has not been told to trust opens a modal
+        # that swallows the first prompt while herdr still reports the agent
+        # idle and interactive. The delivery check catches that (herdr
+        # answers `agent_prompt_stalled`) and the resend gets through, since
+        # the first attempt's Enter dismissed the dialog.
+        #
+        # Recovering is not a reason to leave it: relying on a modal being
+        # dismissed by a keystroke meant for something else is fragile, and a
+        # dialog whose default is "No, exit" would kill the agent instead.
+        # Pre-accepting trust for the workspace pool root is the real fix
+        # (docs/PLAN.md §5.8, JIM-96).
+        with tempfile.TemporaryDirectory() as directory:
+            label = f"fg-untrusted-{os.getpid()}"
+            ref = self.manager.launch(
+                LaunchSpec(
+                    label=label,
+                    cwd=str(Path(directory).resolve()),
+                    model="haiku",
+                )
+            )
+            self.addCleanup(self.manager.stop, ref)
+            self.manager.send(ref, "Reply with just the word PONG.")
+            self.manager.wait(ref, {AgentStatus.IDLE, AgentStatus.DONE}, 120)
+            self.assertIn("PONG", self.manager.read(ref, lines=40))
 
     def test_a_second_launch_for_one_issue_is_refused(self) -> None:
         # The deterministic label is what makes a double dispatch impossible

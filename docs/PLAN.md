@@ -377,12 +377,21 @@ catches one runtime's socket errors and another's HTTP errors.
 `agent.prompt`, and translates herdr's event stream into `AgentEvent`s.
 Requirements observed on live runs:
 
-- `launch()` must wait for `idle`/`interactive_ready` **and** let the TUI
-  settle before the first prompt; the first `agent.prompt` after `agent.start`
-  can fail with `agent_prompt_stalled` even when status already reads idle.
-- **Retry must not blind-resend.** A stalled prompt may still have been
-  delivered — a naive retry double-delivers. Check `state_change_seq` /
-  scrollback before re-sending.
+- `launch()` waits for `idle` and then polls for `interactive_ready`. An
+  agent reads as idle seconds before its TUI will take input, and prompting
+  in that window is refused with `agent_not_ready`; `interactive_ready` is
+  the real precondition, so there is no settle time to guess at.
+- **Every prompt carries a `wait` block, and that is not optional.** herdr
+  only runs its delivery check — answering `agent_prompt_stalled` when the
+  prompt produced no lifecycle change — when a prompt is sent with `wait`. A
+  bare `agent.prompt` is reported as succeeding even when the text is
+  swallowed by a modal the agent is sitting on, leaving the message unsent in
+  the input box while the agent still reads as idle and interactive. Neither
+  the screen nor `state_change_seq` distinguishes that case: typed-and-unsent
+  text is on screen, and typing alone moves the counter.
+- **A stall means the agent never saw it, so a resend cannot double up.** A
+  `timeout` on that wait means the opposite — the agent reacted but did not
+  reach the watched state — and counts as delivered.
 - `send(when_idle=True)` gates delivery: `wait(until={IDLE})` then `prompt`.
   Queueing semantics are ours.
 - `GONE` is derived from an agent's absence from `agent.list` or a

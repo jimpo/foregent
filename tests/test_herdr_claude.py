@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
 from unittest import mock
 
@@ -21,6 +22,19 @@ WORKSPACE = {
     "root_pane": {"pane_id": "w1:p1"},
 }
 
+# A live, prompt-ready agent as herdr reports it. `interactive_ready` is the
+# real precondition for prompting: an agent reads as idle several seconds
+# before its TUI will accept input.
+READY_AGENT = {
+    "agent": {
+        "agent_status": "idle",
+        "interactive_ready": True,
+        "state_change_seq": 1,
+        "workspace_id": "w1",
+        "pane_id": "w1:p1",
+    }
+}
+
 
 _BASE = LaunchSpec(label="fg-jim-85", cwd="/ws/JIM-85")
 
@@ -30,24 +44,35 @@ def spec(**overrides) -> LaunchSpec:
     return replace(_BASE, **overrides)
 
 
+# A canned answer: a fixed payload, or one computed from the request when a
+# test needs the server to change between calls.
+Answer = dict | Callable[[dict], dict]
+
+# What herdr answers when a test does not care about the details.
+_DEFAULTS: dict[str, Answer] = {
+    "agent.get": READY_AGENT,
+    "agent.read": {"read": {"text": ""}},
+}
+
+
 class FakeClient:
     """Records calls and answers from a canned table."""
 
     def __init__(
         self,
-        responses: dict | None = None,
-        errors: dict | None = None,
+        responses: dict[str, Answer] | None = None,
+        errors: dict[str, Exception] | None = None,
     ) -> None:
         self.calls: list[tuple[str, dict]] = []
-        self.responses = responses or {}
+        self.responses: dict[str, Answer] = responses or {}
         self.errors = errors or {}
 
     def call(self, method: str, params: dict | None = None, **kwargs) -> dict:
         self.calls.append((method, params or {}))
         if method in self.errors:
             raise self.errors[method]
-        answer = self.responses.get(method, {})
-        return answer(params or {}) if callable(answer) else answer
+        answer: Answer = self.responses.get(method, _DEFAULTS.get(method, {}))
+        return answer if isinstance(answer, dict) else answer(params or {})
 
     def params_for(self, method: str) -> dict:
         """Params of the first call to ``method``."""
@@ -55,6 +80,9 @@ class FakeClient:
 
     def methods(self) -> list[str]:
         return [name for name, _ in self.calls]
+
+    def count(self, method: str) -> int:
+        return self.methods().count(method)
 
 
 def manager(client: FakeClient) -> HerdrClaudeManager:
@@ -106,18 +134,13 @@ class RenderArgsTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
-    def setUp(self) -> None:
-        # The post-idle settle is real but untestable in unit time.
-        patcher = mock.patch("foregent.agents.herdr_claude.SETTLE_SECONDS", 0)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def test_launch_opens_a_workspace_and_starts_the_agent(self) -> None:
         client = FakeClient({"workspace.create": WORKSPACE})
         ref = manager(client).launch(spec(conversation_id="abc-123"))
 
         self.assertEqual(
-            client.methods(), ["workspace.create", "agent.start", "agent.wait"]
+            client.methods()[:3],
+            ["workspace.create", "agent.start", "agent.wait"],
         )
         created = client.params_for("workspace.create")
         self.assertEqual(created["cwd"], "/ws/JIM-85")
@@ -168,6 +191,121 @@ class LaunchTests(unittest.TestCase):
             manager(client).launch(spec())
         self.assertIn("I trust this folder", str(caught.exception))
         self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+
+
+class SendTests(unittest.TestCase):
+    """Delivery: never silently dropped, never silently doubled."""
+
+    def setUp(self) -> None:
+        for name, value in [("RETRY_SECONDS", 0), ("POLL_SECONDS", 0)]:
+            patcher = mock.patch(f"foregent.agents.herdr_claude.{name}", value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def stalls(self, times: int) -> Answer:
+        """A prompt herdr reports as stalled ``times`` times, then accepts."""
+        attempts = {"count": 0}
+
+        def prompt(params: dict) -> dict:
+            attempts["count"] += 1
+            if attempts["count"] <= times:
+                raise herdr.HerdrAPIError(
+                    "agent_prompt_stalled", "no observed state change"
+                )
+            return {"type": "agent_prompted"}
+
+        return prompt
+
+    def test_send_waits_for_a_free_agent_first(self) -> None:
+        client = FakeClient({"agent.wait": {"agent": {"agent_status": "idle"}}})
+        manager(client).send(AgentRef("fg-jim-86"), "go")
+        self.assertEqual(client.params_for("agent.wait")["until"], ["done", "idle"])
+        self.assertEqual(client.params_for("agent.prompt")["text"], "go")
+
+    def test_every_prompt_asks_herdr_to_check_delivery(self) -> None:
+        # Without a `wait` block herdr reports success even when the text is
+        # swallowed by a modal, so the check is not optional.
+        client = FakeClient()
+        manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        wait = client.params_for("agent.prompt")["wait"]
+        self.assertEqual(wait["until"], ["working"])
+        # The budget has to outlast herdr's own five-second stall window.
+        self.assertGreater(wait["timeout_ms"], 5_000)
+
+    def test_send_can_skip_the_wait(self) -> None:
+        client = FakeClient()
+        manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertNotIn("agent.wait", client.methods())
+        self.assertEqual(client.count("agent.prompt"), 1)
+
+    def test_sending_to_a_dead_agent_is_an_error(self) -> None:
+        client = FakeClient(
+            errors={"agent.wait": herdr.HerdrAPIError("agent_not_found", "nope")}
+        )
+        with self.assertRaises(AgentError):
+            manager(client).send(AgentRef("fg-jim-86"), "go")
+
+    def test_a_stalled_prompt_is_resent(self) -> None:
+        # A stall means the agent never saw it, so resending cannot double
+        # up — and not resending would lose the message.
+        client = FakeClient({"agent.prompt": self.stalls(1)})
+        manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertEqual(client.count("agent.prompt"), 2)
+
+    def test_an_undeliverable_prompt_fails_loudly(self) -> None:
+        client = FakeClient(
+            {"agent.read": {"read": {"text": "1. Yes, I trust this folder"}},
+             "agent.prompt": self.stalls(99)}
+        )
+        with self.assertRaises(AgentError) as caught:
+            manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertEqual(client.count("agent.prompt"), 3)
+        # The screen goes in the error: the cause is nearly always visible.
+        self.assertIn("I trust this folder", str(caught.exception))
+
+    def test_a_reacting_agent_that_never_worked_still_counts(self) -> None:
+        # herdr's stall check passed and only the `until` state was missed,
+        # which is delivery, not failure.
+        client = FakeClient(
+            errors={"agent.prompt": herdr.HerdrAPIError("timeout", "timed out")}
+        )
+        manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertEqual(client.count("agent.prompt"), 1)
+
+    def test_an_agent_not_ready_yet_is_retried(self) -> None:
+        attempts = {"count": 0}
+
+        def prompt(params: dict) -> dict:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise herdr.HerdrAPIError("agent_not_ready", "not active")
+            return {"type": "agent_prompted"}
+
+        client = FakeClient({"agent.prompt": prompt})
+        manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertEqual(client.count("agent.prompt"), 2)
+
+    def test_other_prompt_failures_are_not_retried(self) -> None:
+        client = FakeClient(
+            errors={"agent.prompt": herdr.HerdrAPIError("invalid_request", "bad")}
+        )
+        with self.assertRaises(AgentError):
+            manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertEqual(client.count("agent.prompt"), 1)
+
+    def test_send_waits_for_the_tui_to_accept_input(self) -> None:
+        # An agent reads as idle before it will take a prompt; prompting in
+        # that window is refused with `agent_not_ready`.
+        polls = {"count": 0}
+
+        def get(params: dict) -> dict:
+            polls["count"] += 1
+            return {"agent": {"interactive_ready": polls["count"] > 2}}
+
+        client = FakeClient({"agent.get": get})
+        manager(client).send(AgentRef("fg-jim-86"), "go", when_idle=False)
+        self.assertGreater(polls["count"], 2)
+        self.assertEqual(client.count("agent.prompt"), 1)
 
 
 class StatusTests(unittest.TestCase):
