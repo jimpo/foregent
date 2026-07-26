@@ -1,119 +1,97 @@
 # Foregent — Design & Plan
 
-Status: **source of truth** for this repo. Supersedes the first-generation
-plan (`foregent` repo, `docs/PLAN.md` there) and the transition draft
-(`docs/PLAN-V2.md` there). CAO findings herein are from a code-level
-investigation of 2026-07-10 (CAO @ `45636f8`).
+Status: **source of truth** for this repo — design, decisions, and phase
+status. Rejected designs are summarized in §9; everything before it describes
+only the current one. Behavior marked *(verified)* was confirmed by driving
+herdr 0.7.5 (protocol 17) and Claude Code 2.1.220 directly.
 
 ## 1. Motivation
 
-Foregent's first generation (Bun/TS) built its own agent runtime: tmux
-driving, readiness detection via regex markers, launch/resume plumbing, crash
-detection. That layer was the persistent source of pain, and it is exactly
-the layer that existing open-source orchestrators have already built and
-maintain. This generation stands on an existing agent-orchestration platform
-and spends our effort on the parts nobody ships — webhook-driven dispatch
-through Linear/GitHub, workspace management, and project provisioning.
+Foregent runs a fleet of coding agents unattended on a dedicated machine per
+project, driven entirely through Linear and GitHub. The hard, boring layer —
+terminal driving, readiness detection, launch/resume plumbing, crash
+detection — is bought rather than built: **herdr** owns terminals and agent
+state, **Claude Code** is the agent, and foregent spends its effort on the
+parts nobody ships: webhook-driven dispatch, workspace management, and project
+provisioning.
 
 A second principle: **self-hosting from day one**. The first milestone is not
-the bridge — it is a provisioned VM where CAO-launched agents develop
+the bridge — it is a provisioned VM where foregent-launched agents develop
 foregent itself. Foregent's own development is the first foregent-managed
 project, initially hand-driven, progressively automated as features land.
 
-## 2. Platform decision
+## 2. Platform
 
-Surveyed (July 2026): awslabs/cli-agent-orchestrator, Gas Town, thurbox, Orca,
-superset, ruflo, Vibe Kanban, Sandcastle, claude-squad, agentbox, herdr.
+**herdr as the runtime substrate, Claude Code as the agent harness, foregent
+as the orchestrator.** Nothing sits between the bridge and the agents.
 
-**Base platform: awslabs/cli-agent-orchestrator (CAO)** — Apache-2.0, small
-active AWS Labs team, neutral governance.
+What that buys, all *(verified)* on a live box:
 
-- Best-in-class file-based agent profiles (provider / model / role / tool
-  allowlist / MCP servers / prompt per profile) — maps directly to our
-  task_supervisor / developer / reviewer personas (plus deferred/project ones).
-- Best-in-class async messaging: DB-backed inbox with idle-gated (or eager)
-  delivery into running sessions.
-- Real provider abstraction: Claude Code first-class (incl.
-  `--dangerously-skip-permissions` by default, `permissionMode` per profile),
-  Codex and 7 others behind the same interface.
-- Terminal backends: tmux (default) and **herdr** — an agent-state-aware
-  multiplexer with native working/idle/done/blocked status and process-death
-  events over a unix-socket API. We run herdr from the start (§5.10).
+- **Headless operation with attachable observability.**
+  `herdr --session <name> server` runs with no client attached, and
+  `workspace.create {cwd,label}` returns a workspace + tab + root pane at that
+  cwd in one call. An operator attaches later with `herdr --session foregent`
+  over SSH or `herdr --remote <ssh-target>` from a laptop.
+- **Session resume.** Claude Code accepts `--session-id <uuid>` at launch, so
+  foregent *assigns* the conversation id rather than scraping it, and
+  `--resume <uuid>` restores that conversation in a fresh process. Verified end
+  to end: seed a fact → `pkill` the process → relaunch with `--resume` in a new
+  pane → the fact is recalled. herdr learns the id independently too — its
+  Claude integration hook reports `session_id` + `transcript_path` via
+  `pane.report_agent_session`, surfaced as `AgentInfo.agent_session`.
+- **Crash authority.** A killed agent leaves `agent.list` immediately, and
+  herdr emits `pane_exited` / `pane_closed` on its event stream. Agent death is
+  a subscription, not a probe.
+- **An event stream, not a poll loop.** `events.subscribe` over the socket
+  delivers `pane_agent_status_changed`, `pane_exited`, `pane_closed`,
+  `pane_agent_detected`, plus workspace/tab/worktree events. Note that
+  `pane.agent_status_changed` subscriptions are per-pane (`pane_id` required);
+  the global firehose is `pane.updated`, whose `PaneInfo` payload carries
+  `agent_status`.
+- **A real status enum**: `idle | working | blocked | done | unknown`, driven
+  by a versioned, auto-updating detection manifest
+  (`~/.local/state/herdr/agent-detection/remote/claude.toml`) with rules for
+  permission prompts, selection forms, and the transcript viewer.
 
-Known CAO gaps we own: no webhook ingestion, no worktree isolation (open FR
-awslabs/cli-agent-orchestrator#100), no continuous loop (open FR #49),
-localhost-oriented server posture, git-only assumptions.
-
-Runner-up notes: Gas Town has the most complete autonomous machinery but a
-closed compile-time role set (no custom "cryptographer" without forking),
-an opinionated Beads/Dolt task system that would fight Linear-as-interface,
-and Codex as a second-class citizen. Thurbox is feature-close but bus-factor
-1. Herdr is not an orchestrator but is the best agent-state substrate seen.
-
-### Fork vs. supplement
-
-**Decision: supplement, don't fork** — confirmed by the code investigation
-(2026-07-10, CAO @ `45636f8`).
-
-- The REST surface is sufficient to drive CAO externally: launch with
-  profile + provider + arbitrary `working_directory` (always accepted on
-  `POST /sessions` / `POST /sessions/{name}/terminals`), inbox message send,
-  status + transcript reads, terminate. Events are poll-first (an SSE stream
-  exists behind `CAO_MCP_APPS_ENABLED`); polling is acceptable initially.
-- The capabilities we'd fork *for* — a blocked-on-external-event status,
-  generic crash detection — **do not exist inside CAO either** (see §5.6, §9),
-  so forking buys nothing; and we now design *with* CAO's grain rather than
-  against it: blocked agents park alive on CAO's native `WAITING_USER_ANSWER`
-  status (§5.6) and skills go through CAO's own catalog/`load_skill`
-  subsystem (§5.8), so there is no session-resume or skill-discovery layer to
-  fork for at all. Forking would only buy a standing rebase against a
-  fast-moving ~40k-LOC codebase (97 commits in 2 months).
-- CAO plugins are observe-only (4 lifecycle events); reaching further means
-  importing undocumented internals in-process. We avoid the plugin route and
-  keep all foregent logic in our own service.
-- **Fallback (option C)** if driving cao-server externally proves awkward:
-  vendor just `backends/` (~1.4k LOC, clean 17-method ABC over tmux/herdr)
-  plus the claude provider (~800 LOC of TUI status parsing) into the bridge
-  and drop cao-server entirely. The valuable, hard-to-rewrite part of CAO is
-  exactly those screen-scrapers and backend drivers, not the server around
-  them.
+The cost is that herdr is a hard dependency: 0.7.x, solo-maintained, protocol
+17. Contained by the AgentManager seam (§5.13), a protocol check at startup
+(`ping` returns the version), and a degraded fallback inside Claude Code
+itself (`claude -p --output-format stream-json`, or `--bg` with
+`claude agents`) at the cost of observability.
 
 ### Language
 
-**Python.** CAO is Python: we call `cao-server` with a typed client instead
-of shelling to the CLI, import its models/config where useful, and can vendor
-or fork components later without a language boundary. FastAPI for our own
-HTTP surface (webhooks), matching CAO's stack. The first-generation Bun/TS
-code is retired; what carries over is design: issue-keyed dispatch,
-release-and-re-dispatch, resume-pinned workspaces, manager-authority crash
-detection.
+**Python.** FastAPI for the webhook/HTTP surface, the official MCP SDK for the
+foregent MCP server. Nothing about herdr (a newline-delimited JSON unix
+socket) or Claude Code (a CLI) argues against it.
 
 ## 3. Goals
 
 1. Fully autonomous multi-agent development system on a dedicated machine/VM
-   per project; full permissions (`bypassPermissions` / equivalent).
+   per project; full permissions (`--permission-mode bypassPermissions`).
 2. Driven entirely through **Linear** (tasks) and **GitHub** (code review) —
    the operator interacts through those platforms only.
 3. **Bootstrap mode** for young projects: Linear-driven but pre-GitHub /
    pre-code-review — agents auto-merge to the local repo's main branch.
-4. Multiple agent profiles: a `task_supervisor` per issue delegating to
-   `developer`/`reviewer` workers; a deferred issue-scout; per-project extras
-   (e.g. binius `cryptographer`).
+4. One agent per issue, briefed by a foregent skill; how it decomposes the
+   work (including whether it spawns Claude Code subagents) is its business,
+   not foregent's.
 5. Ralph-style continuous operation: webhook-triggered plus a keep-things-
    moving loop; no human babysitting.
 6. Parallel tasks in isolated workspaces; **rebase-based, linear history** is
    a hard requirement. jj preferred, not mandatory.
 7. Multi-repo projects (binius = binius.xyz + binius64 + tracing-profile).
 8. One-command provisioning of a fresh machine (devbox VM or cloud VM) via
-   cloud-init, with project skills and profiles installed and kept in sync.
-9. SSH observability: watch agents (herdr/tmux attach), never interact.
-10. Claude Code as the initial provider; keep CAO's multi-provider door open.
+   cloud-init, with project skills installed and kept in sync.
+9. SSH observability: watch agents (`herdr --session foregent`), never
+   interact.
+10. Claude Code as the initial harness; the **AgentManager** abstraction
+    (§5.13) keeps other harnesses open — herdr already detects 15+ agent kinds.
 11. Track agents blocked on external events (PR review, issue update); park
-    them alive and wake them with an inbox message when the event arrives.
+    them alive and wake them with a prompt when the event arrives.
 12. Shared Rust build caching across parallel agents (sccache).
 
-Non-goals: local/desktop development UX; GUI; supporting non-CAO runtimes
-initially; self-learning/memory systems.
+Non-goals: local/desktop development UX; GUI; self-learning/memory systems.
 
 ## 4. Architecture overview
 
@@ -126,40 +104,29 @@ One machine (or VM) per project. Three layers:
   ┌───────────────────────────────────┴─────────────┐
   │ foregent bridge (Python/FastAPI, STATELESS)     │
   │  • webhook ingestion + event routing            │
+  │  • AgentManager (herdr+Claude Code impl)        │
   │  • issue↔agent↔workspace: in-memory cache only, │
-  │    rebuilt from CAO session names + Linear       │
-  │  • park-alive + inbox-wake of blocked agents    │
-  │  • workspace manager (worktrees/jj, multi-repo) │
-  │  • profile/skill install • policy (boot vs full)│
+  │    rebuilt from herdr agents + Linear           │
+  │  • park-alive + prompt-wake of blocked agents   │
+  │  • workspace manager (jj/worktrees, multi-repo) │
+  │  • skill install • policy (bootstrap vs full)   │
   └───────────────┬─────────────────────────────────┘
-                  │ REST / ops-MCP client calls
+                  │ unix socket (newline-delimited JSON)
                   ▼
   ┌─────────────────────────────────────────────────┐
-  │ cao-server (stock)                              │
-  │  profiles • terminals (herdr|tmux) • inbox      │
+  │ herdr server (headless, systemd, session         │
+  │ "foregent")  workspaces • panes • agent state    │
+  │ • event stream                                   │
   └───────────────┬─────────────────────────────────┘
                   ▼
-        Claude Code sessions in per-task workspaces
-        (observed via herdr/tmux attach over SSH)
+        Claude Code sessions in per-issue workspaces
+        (observed via `herdr --session foregent`, local or --remote)
 ```
 
-The bridge is **stateless** — it owns no database. It holds an in-memory
-cache of the issue↔agent↔workspace mapping and rebuilds it from two durable
-backends it already has, so a bridge restart loses nothing (see §5.11):
-- **CAO** is the persistent store for *live* agents. Each agent runs as a CAO
-  session named `foregent/<ISSUE-KEY>` with `working_directory` derived from
-  the issue key, so one `GET /sessions` on startup reconstructs every live
-  binding — no bridge-side persistence for running work.
-- **Linear** holds the durable per-issue metadata that outlives a session
-  (last agent/session, typed blocker, project mode) in an **Attachment
-  `metadata` JSON** upserted by a stable synthetic url (`foregent://issue/<KEY>`),
-  plus the ownership claim (assignee) and lifecycle state — including an
-  **Orphaned** state for in-flight issues whose agent is gone (§5.12).
-
-CAO is the muscle: it launches, supervises, and messages terminals. Agents
-talk back to the world through Linear/GitHub MCP tools, and to the bridge
-through a small foregent MCP server (assignment fetch, report-blocked,
-complete-task).
+herdr is the muscle: it owns panes, processes, and agent state. Foregent
+launches, prompts, and reaps agents through it. Agents talk back to the world
+through Linear/GitHub MCP tools, and to the bridge through a small foregent
+MCP server (`report_blocked`, `complete_task`).
 
 Webhook delivery: GitHub/Linear → public endpoint on the project VM (or a
 relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
@@ -170,70 +137,55 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
 - Receives Linear webhooks (issue created/updated/assigned/commented) and
   GitHub webhooks (PR review submitted, comments, checks, merges).
 - Maintains the issue ↔ agent ↔ workspace mapping as an **in-memory cache**,
-  rebuildable from CAO + Linear — the bridge owns no database (§5.11).
+  rebuildable from herdr + Linear — the bridge owns no database (§5.11).
 - Dispatch: ready issue → claim it (assignee + In Progress, §5.12) → acquire
-  workspace → launch CAO terminal `foregent/<KEY>` running the
-  `task_supervisor` profile (§5.2) with cwd = the workspace → deliver
-  assignment. The supervisor spawns `developer`/`reviewer` workers itself.
-- Wake: event matching a parked agent's blocker → inbox message to the
-  still-alive session (see 5.6).
-- Loop insurance: a periodic tick (CAO flow or internal scheduler) re-checks
-  Linear for stuck/unassigned work, so a missed webhook can't stall the
-  system (Ralph loop = webhooks + tick).
+  workspace (§5.7) → `AgentManager.launch()` → brief the agent with its issue
+  key and the `foregent-worker` skill.
+- Wake: event matching a parked agent's blocker → prompt delivered to the
+  still-alive agent (§5.6).
+- Loop insurance: a periodic tick re-checks Linear for stuck/unassigned work,
+  so a missed webhook can't stall the system (Ralph loop = webhooks + tick).
 
-### 5.2 Agent profiles
-- CAO profiles, one file per persona, adapted from CAO's default agent store
-  (`code_supervisor` → `task_supervisor`, plus `developer` and `reviewer`).
-- Live in the project's config repo/dir (see 5.8), `cao install`ed at
-  provision time and on sync (`scripts/install-profiles.sh`).
-- **The default set is three personas:**
-  - **`task_supervisor`** (CAO `role: supervisor`) — **what foregent launches
-    per Linear issue.** Owns one issue end to end: reads the issue, drives its
-    Linear status, decomposes the work, and delegates coding to `developer`
-    and review to `reviewer` via CAO handoff/assign, never writing code
-    itself. It is the **only** persona with outward MCP reach:
-    **foregent MCP** (lifecycle: `report_blocked`, `complete_task`),
-    **Linear MCP**, **GitHub MCP**, and **cao-mcp-server** (to spawn/message
-    workers).
-  - **`developer`** (CAO `role: developer`) — worker; implements in the
-    workspace. **cao-mcp-server only** (for `send_message` back to the
-    supervisor). No Linear/GitHub/foregent MCP.
-  - **`reviewer`** (CAO `role: reviewer`) — worker; reviews the developer's
-    diff. **cao-mcp-server only**. No Linear/GitHub/foregent MCP.
-- **MCP isolation is structural, not just convention.** CAO's `claude_code`
-  provider adds `--strict-mcp-config` (excluding the devbox's global
-  Linear/GitHub Claude Code plugins) **only when the profile declares
-  `mcpServers`**. So `developer`/`reviewer` must each declare
-  `mcpServers: {cao-mcp-server}` — that lone declaration is what locks the
-  outward plugins out. A profile with no `mcpServers` block would silently
-  inherit the global plugins (a leak). "No outward MCP" = "cao-mcp only,
-  strictly."
-- All Linear/GitHub/foregent communication for an issue therefore flows
-  through its `task_supervisor`; workers only talk to the supervisor.
-- Each profile carries a `skills:` filter (fnmatch patterns) scoping which of
-  CAO's installed skills appear in that persona's catalog (see 5.8).
-- Project-specific extras (e.g. binius **`cryptographer`**, a `developer`
-  variant) ship in the managed repo, not the default set.
+### 5.2 The issue agent
+**One Claude Code agent owns one Linear issue, end to end.** There is no
+supervisor/worker hierarchy: the agent reads the issue, drives its Linear
+status, writes the code, and closes it out. If it wants to fan work out to
+Claude Code subagents, it does so natively and foregent neither knows nor
+cares.
+
+- **Workflow lives in a skill.** `foregent-worker` (installed per §5.8)
+  explains the lifecycle: how to fetch its assignment, the bootstrap-vs-full
+  mode rules, how to report blocked, when to call `complete_task`, and the
+  rebase/linear-history requirement.
+- **Configuration is a launch spec**, a small structure foregent owns, rendered
+  to Claude Code flags by the AgentManager (§5.13): `--model`, `--effort`,
+  `--permission-mode bypassPermissions`, `--append-system-prompt`,
+  `--mcp-config` + `--strict-mcp-config`, `--allowedTools` /
+  `--disallowedTools`, `--settings`, `--add-dir`, `--session-id`,
+  `-n <display name>`, plus cwd and env.
+- **MCP set:** foregent (lifecycle tools), Linear, GitHub. `--strict-mcp-config`
+  keeps the box's global plugin config from drifting into an agent.
+- Project-specific variants (e.g. a binius agent with a cryptography skill and
+  a different model) are a different launch spec plus different skills.
 
 ### 5.3 Issue-scout agent (deferred)
-- A profile whose job is grooming: select, order, decompose, and assign
-  Linear issues; keep WIP bounded. It writes to Linear; the bridge reacts to
-  the resulting webhooks — the scout never dispatches work directly.
-- **Deferred to a later phase.** Initial development drives issues through the
-  `task_supervisor` only; until the scout exists, issue selection/sequencing
-  is the operator's job (or a simple bridge tick over ready issues).
+- An agent whose job is grooming: select, order, decompose, and assign Linear
+  issues; keep WIP bounded. It writes to Linear; the bridge reacts to the
+  resulting webhooks — the scout never dispatches work directly.
+- **Deferred to a later phase.** Until it exists, issue selection/sequencing is
+  the operator's job (or a simple bridge tick over ready issues).
 
 ### 5.4 Review-comment monitor
-- GitHub PR review / comment webhooks → triage: actionable now (deliver to
-  the PR's owning agent via inbox) vs follow-up (file a Linear issue).
-- Triage itself is a small agent invocation (cheap model) or rule-based to
-  start.
+- GitHub PR review / comment webhooks → triage: actionable now (prompt the
+  PR's owning agent) vs follow-up (file a Linear issue).
+- Triage itself is a small agent invocation (cheap model, `claude -p`) or
+  rule-based to start.
 
 ### 5.5 Project modes
 - **bootstrap**: no GitHub surface. Task lifecycle: Linear issue → bridge
-  claims it (assignee + In Progress, §5.12) → agent works in workspace →
-  rebase onto main → fast-forward main locally → issue done. Optional
-  self-review stage (reviewer profile) before merge.
+  claims it (§5.12) → agent works in workspace → rebase onto main →
+  fast-forward main locally → issue done. Optional self-review stage before
+  merge.
 - **full**: agent pushes branch → opens PR (GitHub MCP) → reviewer
   agent/human reviews → merge via queue with rebase semantics.
 - Same pipeline, stages toggled per project in the manifest. Bootstrap mode
@@ -242,114 +194,106 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
 ### 5.6 Blocked tracking + park-alive
 - Agent hits an external dependency → calls foregent MCP `report_blocked`
   with a typed blocker (`pr-review:binius64#123`, `issue-update:BIN-42`) →
-  bridge records the blocker. **The agent session stays alive and idle in its
+  bridge records the blocker. **The agent stays alive and idle in its
   workspace** — nothing is terminated, no context is captured or replayed.
-  This maps onto CAO's native `WAITING_USER_ANSWER` status: a parked agent is
-  simply one waiting for input.
-- Wake on matching webhook: the bridge posts the resolving event to the
-  agent's inbox (`POST /terminals/{id}/inbox/messages`). Context is intact
-  because the session never died and the workspace was never released — no
-  session-resume mechanism is needed, and CAO has none (confirmed: no
-  `--resume`/session-id code in `providers/`; `terminal restore` is a plain
-  shell + scrollback, not a provider session). Embracing this is what lets us
-  drive CAO entirely stock.
+  herdr reports it as `idle` (or `blocked` if it is sitting on a prompt).
+- Wake on matching webhook: the bridge delivers the resolving event with
+  `AgentManager.send()`. Context is intact because the process never died and
+  the workspace was never released.
+- Cold parking (terminate on block, `--resume` on wake) is technically viable
+  since resume works, but instant wake and a guaranteed-intact context beat the
+  memory savings for a small fleet. Resume is for *recovery* (§5.12), not
+  routine parking.
 - Trade-offs accepted:
-  - **Crash/reboot loses parked context.** A dead process or VM restart can't
-    be resumed — CAO can't, and we no longer try. Wake then degrades to
-    re-dispatch fresh (the same fallback crash recovery needs anyway).
+  - **Reboot costs a re-dispatch** — but not a *fresh* one: the conversation id
+    is durable (§5.11), so an orphaned issue resumes rather than restarts.
   - **Live sessions have a soft ceiling** (each holds a process + herdr pane —
-    memory/PIDs, not tokens; idle agents make no API calls). Fine for a small
-    fleet; a cap + reaper on long-parked sessions is a later refinement, not a
-    phase-2 concern.
-- Crash *detection* is still ours: a parked-alive session can die, and on the
-  tmux backend a dead `claude` process degrades to status `UNKNOWN` forever
-  (Claude's provider never emits `ERROR`), so the bridge runs its own liveness
-  probe as the exit authority. The herdr backend emits real `pane.closed`
-  events and is the structural fix — one more reason herdr is the default
-  (§5.10).
+    memory/PIDs, not tokens; idle agents make no API calls). A cap + reaper on
+    long-parked sessions is a later refinement; because resume works, the
+    reaper can cold-park rather than kill.
+- Crash *detection* is herdr's: a killed agent disappears from `agent.list` at
+  once and the bridge sees `pane_exited` / `pane_closed` on the event stream.
 
 ### 5.7 Workspace manager
 - Unit: **workspace = directory containing one checkout of each project
   repo** (multi-repo native; single-repo is the degenerate case).
+- **Foregent owns VCS; herdr is handed a cwd.** The manager creates the
+  checkouts (jj workspaces preferred, git worktrees as fallback — Q6), then
+  calls `workspace.create {cwd, label}`. herdr's own `worktree.create` is not
+  the primary path: it is git-only and one-repo-per-workspace, which would
+  foreclose Q6 and fight goal 7. `worktree.open` may be called afterward so
+  herdr's TUI shows repo/branch for the single-repo git case.
 - Pool of N workspaces per machine; issue-keyed acquisition. A parked-alive
-  agent holds its workspace for the duration of the block (§5.6), so its
-  context and cwd are exactly where it left them.
-- Isolation backend: jj workspaces preferred (natural rebase/linear-history
-  workflow, no branch-name juggling); git worktrees as fallback if tooling
-  friction appears (Q6). CAO is handed only a cwd, so it has no opinion —
-  the manager owns VCS entirely.
+  agent holds its workspace for the duration of the block (§5.6).
 - Sync: workspace refreshed (rebase onto main / trunk) before each dispatch.
 
 ### 5.8 Provisioning & skills sync
 - Per-project **manifest** (in the project's infra repo): repo list, mode,
-  profiles, skills, env, tokens (referenced, not stored), machine size.
-- cloud-init consumes the manifest: install tmux/herdr/uv/CAO/providers/
-  foregent-bridge, auth (Claude, GitHub app, Linear), clone repos, install
-  profiles + skills, systemd units for cao-server + bridge, start.
-- Targets: devbox-managed libvirt VMs (first, via `.devbox/mods/*.sh` appended
-  to devbox's base playbook) and cloud VMs from the same material.
-- Skills: use **CAO's own skill subsystem** (embrace, don't work around it).
-  CAO keeps a global skill store (`cao skills add <folder>`, into
-  `~/.aws/cli-agent-orchestrator/skills`) plus `extra_skill_dirs` (settings
-  key that can point directly at a repo's `.claude/skills/`, no copy). At
-  launch CAO injects a catalog of the installed skills into the system prompt
-  and the agent loads a skill's body via the `load_skill` MCP tool
-  (`cao-mcp-server`, wired in automatically because CAO builds the launch
-  command with `--mcp-config --strict-mcp-config`).
-- Why this beats native `.claude/skills/` discovery for foregent: profiles
-  carry a per-agent `skills:` filter (fnmatch patterns over skill names), so
-  each persona advertises only its relevant subset — `developer` sees dev
-  skills, `reviewer` sees review skills, `cryptographer` sees crypto skills —
-  which native tree-walk discovery (every agent sees every skill) can't do.
-- Two sources, both CAO-native: foregent's own skills are `cao skills add`ed
-  at provision/sync time (same shape as `install-profiles.sh` does for
-  profiles); a managed repo's project-shipped skills in its `.claude/skills/`
-  are picked up live by pointing `extra_skill_dirs` at that folder. Verify the
-  `claude_code` provider honors the injected catalog + `load_skill` in
-  phase 1.
+  skills, env, tokens (referenced, not stored), machine size.
+- cloud-init consumes the manifest: install uv/herdr/Claude Code/foregent,
+  auth (Claude, GitHub app, Linear), clone repos, install skills, systemd
+  units for the herdr server + bridge, start.
+- **Skills are installed into the box's Claude Code skill directory**
+  (`~/.claude/skills/`) at provision time and on sync. Foregent's own skills
+  (`foregent-worker`, plus workflow skills) ship in this repo; a managed repo's
+  project-shipped skills in its `.claude/skills/` are discovered natively from
+  the workspace cwd. Accepted consequence: every agent on the box sees every
+  installed skill — fine, since there is one agent kind per issue.
+- **Provisioning tasks that are dispatch blockers if missed:**
+  - *Clean environment for the herdr server.* Every pane inherits the server's
+    env. A server started from inside another Claude Code session leaks
+    `CLAUDECODE=1` / `CLAUDE_CODE_CHILD_SESSION=1` into the agent, which
+    **silently disables transcript saving** ("Transcript saving is off —
+    inherited CLAUDE_CODE_…") and breaks resume. The systemd unit must set an
+    explicit env, not inherit one.
+  - *Pre-accept the workspace trust dialog.* A fresh directory makes Claude
+    Code open `❯ 1. Yes, I trust this folder` before accepting any input, and
+    every per-issue workspace is a fresh directory. Pre-seed trust for the
+    workspace pool root rather than answering a modal per dispatch.
+  - *Install the herdr Claude integration* (`herdr integration install claude`)
+    so `SessionStart` reports session identity back to herdr.
+  - *Pin/record the herdr protocol version* (`ping` → `protocol: 17`) and fail
+    startup on mismatch.
 
 ### 5.9 Rust build caching
-- One sccache server per machine; `RUSTC_WRAPPER=sccache` in every profile's
+- One sccache server per machine; `RUSTC_WRAPPER=sccache` in every agent's
   env; per-workspace `CARGO_TARGET_DIR` (parallel agents must not share a
   target dir).
 - Later if needed: shared `CARGO_HOME` (registry/git caches, read-mostly),
   warm target-dir seeding via reflink copies.
 
 ### 5.10 Observability
-- herdr backend from the start (`terminal.backend: "herdr"` in CAO settings):
-  CAO labels it experimental, but the code tells a better story — a complete
-  853-LOC backend with no TODO stubs, ~2.6k LOC of dedicated tests, native
-  working/idle/done/blocked status, and real `pane.closed` process-death
-  events (the only true crash signal in CAO). tmux stays installed as the
-  fallback backend if herdr misbehaves (a settings flip, no re-provision).
-- Observe over SSH: `herdr --session cao` attaches the TUI (or
-  `tmux attach` on the fallback). CAO web dashboard stays localhost, reachable
-  over SSH port-forward.
+- One named herdr session (`foregent`) per box, run headless as a systemd user
+  unit; its socket lives at `~/.config/herdr/sessions/foregent/herdr.sock`.
+- Observe by attaching: `herdr --session foregent` over SSH, or
+  `herdr --remote <ssh-target> --session foregent` straight from a laptop.
+  Attaching is read-only by convention; never interact.
+- Per-agent inspection without attaching: `agent.list`, `agent.get`,
+  `agent.read {source: visible|recent|detection}`, `agent.explain` (why herdr
+  believes an agent is in a given state).
 - Bridge exposes a status CLI (`foregent status`): issues in flight, agent
   states, blockers, workspace pool.
 
 ### 5.11 Stateless bridge (no database)
 - The bridge owns **no persistent store**. Its issue↔agent↔workspace map is an
   in-memory cache; every fact in it is derivable from a durable backend the
-  system already runs, so a bridge crash/restart rebuilds full state and loses
-  nothing.
-- **Live agents ← CAO (source of truth).** cao-server is a separate,
-  SQLite-backed process that outlives the bridge. Convention: launch each
-  agent as a CAO session named `foregent/<ISSUE-KEY>` with
-  `working_directory = <pool>/<ISSUE-KEY>`. On startup the bridge does one
-  `GET /sessions`, parses the issue key from each session name, and
-  reconstructs every live binding (including parked-alive agents) — no
-  bridge-side persistence for running work at all.
-- **Durable per-issue metadata ← Linear.** The few facts that must outlive a
-  session (last agent/session id, typed blocker, project mode) live in a
-  Linear **Attachment `metadata`** JSON blob, one per issue, upserted by a
-  stable synthetic url `foregent://issue/<KEY>` (`attachmentCreate` updates in
-  place on url match rather than appending). Linear has no custom fields, so
-  attachment metadata is the store for per-issue foregent state. (Assignee is
-  used, but as an *ownership claim*, not agent identity — see §5.12.)
-- Startup reconciliation is the claim/orphan protocol in §5.12, not a blind
-  re-dispatch: in-flight issues with no live CAO session move to an **Orphaned**
-  state and wait for a scheduling decision.
+  system already runs, so a bridge crash/restart rebuilds full state.
+- **Live agents ← herdr (source of truth).** The herdr server is a separate
+  systemd unit that outlives the bridge. Convention: each agent is launched
+  with herdr agent name `fg-<issue-key-lowercased>` (herdr enforces
+  `[a-z][a-z0-9_-]{0,31}`, unique among live agents) in a workspace labeled
+  with the uppercase issue key. On startup the bridge does one `agent.list`,
+  parses the issue key out of each name, and reconstructs every live binding
+  (including parked-alive agents).
+- **Durable per-issue metadata ← Linear.** The facts that must outlive a
+  process (**Claude Code conversation id**, workspace path, typed blocker,
+  stage, project mode) live in a Linear **Attachment `metadata`** JSON blob,
+  one per issue, upserted by a stable synthetic url `foregent://issue/<KEY>`
+  (`attachmentCreate` updates in place on url match). Linear has no custom
+  fields, so attachment metadata is the store for per-issue foregent state.
+- The conversation id is **generated by foregent** (a UUID passed as
+  `--session-id`), not scraped, so it is known and recorded *before* the agent
+  starts — a crash between launch and first checkpoint is still recoverable.
 - **Constraints this imposes** (both real, designed-for from day one):
   - *Not the agent-facing MCP.* Attachment `metadata` and url-upsert are
     GraphQL-API features the agents' Linear MCP plugin does not expose; the
@@ -362,170 +306,234 @@ relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
 
 ### 5.12 Issue claiming & orphan reconciliation
 - **Assignee = ownership claim, not agent identity.** All foregent instances
-  share one Linear account, so assignee can't name an agent; it names "owned
-  by foregent." The durable definition of an owned, in-flight issue is
-  `assignee = foregent account ∧ state ∈ {In Progress, In Review, Orphaned}` —
-  a set fully recoverable from Linear on boot, which is what makes §5.11's
-  stateless reconstruction possible.
+  share one Linear account, so assignee names "owned by foregent." The durable
+  definition of an owned, in-flight issue is `assignee = foregent account ∧
+  state ∈ {In Progress, In Review, Orphaned}` — a set fully recoverable from
+  Linear on boot, which is what makes §5.11's reconstruction possible.
 - **Claim before work (Todo → In Progress).** The bridge starts an issue only
   after claiming it: set `assignee = foregent` *and* move it to In Progress in
-  one step. Nothing is dispatched without a durable ownership record, so a
-  crash mid-claim is unambiguous on the next boot.
+  one step. Nothing is dispatched without a durable ownership record.
 - **Orphaned is a real Linear workflow state.** On boot the bridge queries its
-  team for owned in-flight issues and, for each, looks up the CAO session
-  `foregent/<KEY>`:
-  - session alive → rebind the in-memory cache; keep working.
-  - session gone → transition the issue to **Orphaned** (keeping the
-    assignee), recording the prior stage (in-progress vs in-review) and last
-    blocker in the attachment metadata so a later re-dispatch resumes at the
-    right stage.
-- **Orphaned feeds the scheduler, never auto-re-dispatch.** Orphaned issues
-  are a queue the scheduler / issue-scout (or operator) decides on —
-  re-dispatch, defer, or escalate. Re-dispatch transitions Orphaned → In
-  Progress/In Review and launches a fresh `foregent/<KEY>` session, briefed
-  from the metadata.
+  team for owned in-flight issues and, for each, looks for the live herdr agent
+  `fg-<key>`:
+  - agent alive → rebind the in-memory cache; keep working.
+  - agent gone → transition the issue to **Orphaned** (keeping the assignee),
+    recording the prior stage and last blocker in the attachment metadata.
+- **Orphaned re-dispatch resumes, it does not restart.** Because the
+  conversation id and workspace path are in the attachment metadata, and
+  `--resume` works, re-dispatching an orphan relaunches the same conversation
+  in the same workspace and prompts it with what changed. Restart-from-scratch
+  is the fallback when the transcript is unusable.
+- **Orphaned feeds the scheduler, never auto-re-dispatch.** Orphaned issues are
+  a queue the scheduler / issue-scout (or operator) decides on.
 - **Partitioning assumption.** Because the account is shared, each issue must
   belong to exactly one foregent instance, enforced by Linear team/project
-  scoping; otherwise the shared assignee cannot disambiguate cross-instance
-  claims. Within one instance the bridge is the sole arbiter, so claims
+  scoping. Within one instance the bridge is the sole arbiter, so claims
   serialize without contention.
-- Requires an **Orphaned** workflow state to exist in each managed team
-  (provisioning/onboarding step).
+- Requires an **Orphaned** workflow state in each managed team (provisioning
+  step).
 
-## 6. What we deliberately reuse from the first generation (design, not code)
+### 5.13 The AgentManager abstraction
+Foregent owns *what an agent is for*; the AgentManager owns *how a harness is
+driven*. The seam exists so a second harness can be added without touching
+dispatch, and so the herdr dependency is contained in one module.
 
-- Issue-keyed, bridge-driven dispatch; a queue that drains without head-of-
-  line blocking. (v2 **departs** from v1's release-and-re-dispatch for blocked
-  agents: they now park alive on CAO's `WAITING_USER_ANSWER` rather than being
-  terminated and resumed — §5.6.)
-- Manager exit authority as the single source of truth on agent death
-  (reimplemented as the bridge's liveness probe / herdr `pane.closed`).
-- Base profile owning lifecycle, project skills owning workflow — the same
-  split, now expressed through CAO profiles + CAO's skill catalog (§5.8).
+```python
+@dataclass(frozen=True)
+class LaunchSpec:
+    label: str                     # "fg-jim-52" — the harness-level agent name
+    cwd: str
+    env: dict[str, str]
+    model: str | None
+    effort: str | None
+    system_prompt: str             # appended to the harness default
+    tools_allow: list[str]
+    tools_deny: list[str]
+    mcp_servers: dict              # foregent | linear | github
+    conversation_id: str | None    # foregent-generated UUID; None = new
+    resume: bool
 
-## 7. Phases
+class AgentStatus(StrEnum):
+    IDLE; WORKING; BLOCKED; DONE; UNKNOWN; GONE
 
-Ordered to reach **self-hosting** — CAO developing foregent inside a devbox —
-as fast as possible; everything after is developed (increasingly) by the
+class AgentManager(Protocol):
+    async def launch(self, spec: LaunchSpec) -> AgentRef
+    async def send(self, ref, text, *, when_idle: bool = True, timeout: float) -> None
+    async def status(self, ref) -> AgentStatus
+    async def wait(self, ref, until: set[AgentStatus], timeout: float) -> AgentStatus
+    async def read(self, ref, lines: int) -> str        # scrollback, for triage
+    async def stop(self, ref) -> None
+    async def list(self) -> list[AgentRecord]           # boot reconciliation (§5.11)
+    def events(self) -> AsyncIterator[AgentEvent]       # status_changed | exited
+```
+
+**`HerdrClaudeManager`** is the implementation we build: it renders
+`LaunchSpec` to a `claude` argv, calls `workspace.create` → `agent.start` →
+`agent.prompt`, and translates herdr's event stream into `AgentEvent`s.
+Requirements observed on live runs:
+
+- `launch()` must wait for `idle`/`interactive_ready` **and** let the TUI
+  settle before the first prompt; the first `agent.prompt` after `agent.start`
+  can fail with `agent_prompt_stalled` even when status already reads idle.
+- **Retry must not blind-resend.** A stalled prompt may still have been
+  delivered — a naive retry double-delivers. Check `state_change_seq` /
+  scrollback before re-sending.
+- `send(when_idle=True)` gates delivery: `wait(until={IDLE})` then `prompt`.
+  Queueing semantics are ours.
+- `GONE` is derived from an agent's absence from `agent.list` or a
+  `pane_exited` / `pane_closed` event.
+- Agents are addressable by herdr agent name, so no handle needs persisting
+  (§5.11).
+
+The interface is deliberately tolerant of harnesses with weaker eventing:
+`events()` may be implemented as a polling loop, and `GONE` is explicit rather
+than inferred from a status enum (see §9).
+
+## 6. Phases
+
+Ordered to reach **self-hosting** — agents developing foregent inside a devbox
+— as fast as possible; everything after is developed (increasingly) by the
 system itself.
 
-0. **Provisioning skeleton** *(in progress)*: `.devbox/config.toml` + the
-   `uv`/`herdr`/`cao` mods in `.devbox/mods/`, appended to devbox's base
-   playbook (which already ships Claude Code + github/linear plugins and jj):
-   installs uv, herdr, CAO (uv tool from git) + tmux, writes CAO settings
-   (herdr backend), cao-server systemd user unit + linger. Exit criteria:
-   `devbox create`
-   yields a box where `cao-server` is up, and a hand-launched
-   `cao launch --agent-profile developer` Claude terminal works in the
-   foregent checkout.
-1. **Self-hosting bootstrap**: this repo pushed into the box (devbox `push`
-   mode); the `task_supervisor` + `developer` + `reviewer` profiles (§5.2,
-   cao-mcp-only isolation on the workers); operator hand-launches a
-   `task_supervisor` per foregent task via `cao` CLI / inbox and observes via
-   `herdr --session cao`, confirming the supervisor delegates coding/review to
-   its workers. Agents commit with jj, rebase-to-main locally (bootstrap mode
-   by hand).
-   Also the validation spike, run on the box: inbox messaging (this is the
-   wake mechanism — §5.6), status transitions (including the parked agent
-   sitting at `WAITING_USER_ANSWER` and waking on an inbox message),
-   kill-the-process crash behavior (expect `UNKNOWN` on tmux / `pane.closed`
-   on herdr), CAO skill-catalog + `load_skill` working for the `claude_code`
-   provider with a per-profile `skills:` filter (§5.8), SSE stream
-   (`CAO_MCP_APPS_ENABLED`), and **wiring Linear/GitHub MCP into the
-   `task_supervisor` under `--strict-mcp-config`** — the supervisor must
-   declare cao-mcp-server (to spawn workers), which forces strict mode and
-   excludes the devbox's global Linear/GitHub plugins, so their remote
-   endpoints + auth (Linear OAuth, GitHub PAT) must be plumbed explicitly into
-   the profile (§5.2).
-2. **Bridge core**: FastAPI service, in-memory cache rebuilt from CAO session
-   names (no database — §5.11), CAO REST client, foregent MCP server
-   (get_assignment / report_blocked / complete_task), manual dispatch via CLI.
-   Single repo, bootstrap mode, no webhooks yet. From here on, foregent
-   development itself runs through the bridge.
-3. **Linear loop**: webhook ingestion + a bridge tick over ready issues (the
-   issue-scout profile stays deferred, §5.3); the
-   claim/orphan protocol (§5.12: claim-on-start, boot reconciliation, Orphaned
-   state + scheduler); the Linear-persistence spike (§5.11: attachment
-   `metadata` upsert-by-url, self-webhook actor filtering); the managed team
-   gains an **Orphaned** workflow state. Foregent development driven from
-   Linear end-to-end in bootstrap mode.
+0. **Provisioning skeleton** *(in progress)*: `.devbox/config.toml` + mods in
+   `.devbox/mods/` appended to devbox's base playbook (which already ships
+   Claude Code + github/linear plugins and jj): install uv + herdr, install the
+   herdr Claude integration, write the herdr systemd user unit for session
+   `foregent` **with an explicit clean env** (§5.8), enable linger, pre-accept
+   workspace trust for the pool root. Exit criteria: `devbox create` yields a
+   box where the headless herdr server is up and a hand-launched Claude Code
+   agent in a herdr workspace reaches `idle` and accepts a prompt.
+1. **Self-hosting bootstrap**: this repo pushed into the box; the
+   `foregent-worker` skill written and installed into `~/.claude/skills/`;
+   the operator hand-launches an agent per foregent task via the herdr CLI and
+   observes with `herdr --session foregent`. Agents commit with jj and rebase
+   to main locally (bootstrap mode by hand).
+   Spikes for this phase: Linear/GitHub MCP wired into the launch spec under
+   `--strict-mcp-config` (explicit endpoints + auth: Linear OAuth, GitHub PAT),
+   and skill discovery confirmed for both `~/.claude/skills/` and a workspace
+   repo's `.claude/skills/`.
+2. **Bridge core**: FastAPI service, `HerdrClaudeManager` (§5.13), in-memory
+   cache rebuilt from herdr agent names (no database — §5.11), foregent MCP
+   server (`get_assignment` / `report_blocked` / `complete_task`), manual
+   dispatch via CLI, event-stream consumer for status/death. Single repo,
+   bootstrap mode, no webhooks yet. From here on, foregent development itself
+   runs through the bridge.
+3. **Linear loop**: webhook ingestion + a bridge tick over ready issues; the
+   claim/orphan protocol (§5.12) including resume-based re-dispatch; the
+   Linear-persistence spike (§5.11: attachment `metadata` upsert-by-url,
+   self-webhook actor filtering); the managed team gains an **Orphaned**
+   workflow state. Foregent development driven from Linear end-to-end in
+   bootstrap mode.
 4. **Workspaces**: pool, jj-or-git decision executed (Q6), multi-repo layout,
    sccache wiring.
-5. **GitHub full mode**: PR flow, review-comment monitor,
-   park-alive on PR blockers + inbox wake. Foregent graduates from bootstrap
-   to full mode on its own repo.
+5. **GitHub full mode**: PR flow, review-comment monitor, park-alive on PR
+   blockers + prompt wake. Foregent graduates from bootstrap to full mode on
+   its own repo.
 6. **Provisioning generalization + hardening**: manifest + cloud-init for
-   cloud VMs; binius onboarded (multi-repo, cryptographer profile); crash
+   cloud VMs; binius onboarded (multi-repo, cryptography skills); crash
    recovery, missed-webhook reconciliation, cost/usage tracking.
 
-## 8. Risks
+## 7. Risks
 
-- **CAO control-surface gaps** force more vendoring than planned → mitigated
-  by the phase-1 validation spike before the bridge is built.
-- **CAO is ~1 year old, small team** → could stall or pivot; mitigated by the
-  bridge owning all orchestration logic while treating CAO as a swappable
-  runtime driven over REST (option C vendoring path as fallback).
-- **herdr is young and solo-maintained** → tmux fallback is a settings flip;
-  the CAO backend ABC keeps us backend-agnostic.
-- **Parked sessions accumulate / are lost on crash** → park-alive (§5.6)
-  means blocked agents hold a live process + herdr pane, and a crash or reboot
-  loses their context (unresumable). Mitigated by keeping the fleet small,
-  adding a cap + reaper on long-parked sessions later, and degrading wake to
-  re-dispatch-fresh when a session is gone.
+- **herdr is young and solo-maintained**, and is a hard dependency → contained
+  behind the AgentManager (§5.13); protocol version checked at startup;
+  degraded fallback is Claude Code's own headless modes at the cost of
+  observability.
+- **Agent-state detection is screen-scraping under the hood.** herdr's
+  `claude.toml` manifest auto-updates against Claude Code's TUI; a Claude Code
+  release can move faster than the manifest. Mitigations: the integration hook
+  (authoritative session identity), `agent.explain` for diagnosis, and pinning
+  a known-good manifest if a regression lands.
+- **Prompt delivery is TUI-mediated**, so it can stall or double-deliver
+  (§5.13). Mitigated by state-change verification in the manager; a future
+  option is Claude Code's stream-json input for machine-to-agent traffic.
+- **Parked sessions accumulate / are lost on reboot** → park-alive (§5.6) holds
+  a live process per blocked issue. Mitigated by a small fleet, a later
+  cap + cold-park reaper, and resume-based recovery (§5.12).
 - **Multi-repo + rebase automation** has sharp edges (cross-repo atomic
-  changes, conflict handling) → start with binius' real dependency shape,
-  keep cross-repo tasks single-owner.
+  changes, conflict handling) → start with binius' real dependency shape, keep
+  cross-repo tasks single-owner.
 - **Webhook exposure** of per-project VMs → prefer a relay (single hardened
   ingress fanning out to VMs) over N public endpoints (Q8).
 
-## 9. Open questions
+## 8. Open questions
 
-**CAO internals — resolved by the 2026-07-10 investigation (CAO @ `45636f8`):**
-- **Q1 — Session resume: absent, and we no longer need it.** No
-  `--resume`/`--continue`/session-id capture anywhere in `providers/`;
-  `terminal restore` = plain shell + scrollback replay; the workflow-journal
-  "resume" the team is building is step-DAG replay with fresh terminals, not
-  conversational continuity. → Sidestepped by park-alive: a blocked agent
-  keeps its live session and workspace and is woken by an inbox message
-  (§5.6), so there is nothing to resume. Crash/reboot loss is the accepted
-  trade-off.
-- **Q2 — Crash/exit authority: absent on tmux.** Status enum is
-  `UNKNOWN/IDLE/PROCESSING/COMPLETED/WAITING_USER_ANSWER/ERROR`, but the
-  Claude provider never emits `ERROR`; a dead process reads `UNKNOWN`
-  forever. No agent self-report tool, no "blocked on external event" state.
-  herdr backend is the exception: real `pane.closed` events.
-  → Bridge owns liveness (§5.6); herdr default (§5.10).
-- **Q3 — Control surface: sufficient.** Launch with profile + provider +
-  arbitrary cwd, inbox send, status/output reads, delete — all REST (and
-  mirrored 1:1 in ops-MCP). Eventing is poll-first; SSE exists behind
-  `CAO_MCP_APPS_ENABLED`. Web UI fully decoupled. → Supplement path viable.
-- **Q4 — Plugins: observe-only** (4 lifecycle events, no status events, no
-  veto). Deeper reach = importing undocumented in-process internals.
-  → Not our extension route; everything lives in the bridge.
-- **Q5 — herdr backend: more mature than its "experimental" label** —
-  complete implementation, no stubs, ~2.6k LOC of tests, native status +
-  process-death events. One legacy wart: DB columns are tmux-named.
-  → Adopted as default backend from phase 0; tmux fallback retained.
-
-**Ours to decide:**
-- **Q6 — jj workspaces vs git worktrees** for the workspace pool: does jj
-  colocation stay friction-free when agents run inside CAO-launched
-  sessions? Decide during phase 4 with a spike; the hard requirement is
-  rebase/linear history, not jj itself.
-- **Q7 — Multi-repo task semantics.** Is one Linear issue ever cross-repo?
-  If yes: one workspace, one agent, N repos, ordered pushes — or forbid and
-  decompose? Start by forbidding cross-repo issues; revisit with binius data.
+- **Q6 — jj workspaces vs git worktrees** for the workspace pool. Decide during
+  phase 4 with a spike; the hard requirement is rebase/linear history, not jj
+  itself.
+- **Q7 — Multi-repo task semantics.** Is one Linear issue ever cross-repo? Start
+  by forbidding cross-repo issues; revisit with binius data.
 - **Q8 — Webhook ingress.** Public endpoint per VM vs a single relay
-  (Cloudflare tunnel / small cloud relay fanning out over SSH/WireGuard) vs
-  MCP-delivery (webhook events queued and served to agents/bridge via MCP).
-  Relay preferred on current thinking. Moot until phase 3 for devbox VMs
-  (host can reach them directly; Linear/GitHub cannot).
-- **Q9 — Reviewer agents in bootstrap mode**: is there a lightweight
-  self-review stage before auto-merge, or is speed the point?
-- **Q10 — Task-manager authority bounds.** Can it close/reprioritize
+  (Cloudflare tunnel / small cloud relay fanning out over SSH/WireGuard).
+  Relay preferred on current thinking. Moot until phase 3 for devbox VMs.
+- **Q9 — Reviewer stage in bootstrap mode**: is there a lightweight self-review
+  pass before auto-merge, or is speed the point? A question about the skill's
+  workflow, not about a second agent.
+- **Q10 — Agent authority bounds.** Can an agent close/reprioritize
   human-created issues, or propose-only?
 - **Q11 — Cost controls.** Per-issue/per-day token budgets, and what happens
   when exceeded (park + Linear comment?).
-- ~~**Q12 — Repo residency.**~~ Resolved: this repo (`foregent-v2` on disk,
-  "foregent" as the project name); the first-generation repo is retired in
-  place.
+- **Q12 — Agent self-identification.** herdr injects `HERDR_PANE_ID`,
+  `HERDR_WORKSPACE_ID`, and `HERDR_SOCKET_PATH` into every pane, so the
+  foregent MCP server could identify the calling agent from its environment
+  instead of trusting an issue key passed as a tool argument. Worth doing in
+  phase 2 if it is cheap.
+
+## 9. Alternative designs
+
+### CAO-centric (rejected 2026-07-25)
+
+The prior design made **awslabs/cli-agent-orchestrator (CAO)** the base
+platform: the bridge drove `cao-server` over REST, agents were CAO sessions
+launched from file-based CAO profiles, herdr appeared only as CAO's terminal
+backend, and work was split across three personas — a `task_supervisor` per
+issue delegating to `developer` and `reviewer` workers over `cao-mcp-server`,
+with MCP allowlists as the isolation boundary.
+
+Why it lost:
+
+- **Its two known gaps were structural.** CAO has no session resume (no
+  `--resume`/session-id handling in its providers) and no crash authority on
+  the tmux backend (a dead `claude` process reads `UNKNOWN` forever). Both are
+  native to herdr + Claude Code, and both were load-bearing for park/wake and
+  orphan recovery.
+- **Everything else it supplied is a thin layer we own better.** Profiles → a
+  launch spec rendered to `claude` flags; the idle-gated inbox → `agent.wait`
+  + `agent.prompt`; the skill catalog with per-profile filters → Claude Code's
+  native skills; the session registry → `agent.list`.
+- **The persona hierarchy was solving a CAO-shaped problem.** Worker spawning
+  and the `--strict-mcp-config` isolation trick existed because CAO models
+  multi-agent work. One Claude Code agent per issue, briefed by a skill, does
+  the same job and decides its own decomposition.
+- **CAO's own escape hatch pointed here.** The documented fallback was to
+  vendor CAO's `backends/` plus its Claude provider — the screen-scraping and
+  terminal driving — which is precisely what herdr already is, with an event
+  stream CAO's tmux backend cannot produce.
+
+What survives: the AgentManager seam (§5.13) is shaped so a `CaoManager` could
+be added without touching dispatch — it would render `LaunchSpec` to a CAO
+profile plus `POST /sessions`, map CAO's status enum
+(`IDLE/PROCESSING/COMPLETED/WAITING_USER_ANSWER/ERROR/UNKNOWN`) onto
+`AgentStatus`, use the inbox for `send()`, and implement `events()` as a poller
+(or CAO's SSE stream behind `CAO_MCP_APPS_ENABLED`). That possibility is why
+`events()` may poll and why `GONE` is explicit. It is documented, not built.
+
+Artifacts retired by this decision: `src/foregent/cao.py`, `tests/test_cao*.py`,
+`profiles/*.md` (CAO frontmatter), and `scripts/install-profiles.sh`.
+
+### Other options considered
+
+- **Cold parking instead of park-alive** — terminate a blocked agent and
+  `--resume` it on wake. Viable now that resume is verified, and it removes the
+  live-session ceiling; rejected for routine use because instant wake with a
+  guaranteed-intact context is worth more at this fleet size (§5.6). Retained
+  as the mechanism for orphan recovery and a future reaper.
+- **herdr-owned workspaces** — `worktree.create` builds the checkout and opens
+  it as a workspace in one call, with lifecycle events. Rejected as the primary
+  path: git-only and one repo per workspace, which forecloses jj (Q6) and the
+  multi-repo requirement (goal 7). `worktree.open` remains available for TUI
+  niceness (§5.7).
+- **Bridge-orchestrated roles** — no agent-side judgment at all; the bridge
+  sequences a developer agent, then a reviewer agent, per issue. Cheapest and
+  most deterministic, but it moves decomposition into bridge code, which is the
+  work the agent is better at.
