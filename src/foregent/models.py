@@ -1,10 +1,9 @@
 """Core domain types for foregent-managed issues.
 
-These mirror, at a skeleton level, the lifecycle described in ``docs/PLAN.md``:
-an issue is claimed, worked by a ``task_supervisor`` agent, possibly parked
-while blocked on an external event, reviewed, and completed. Richer per-issue
-metadata (agent/session id, workspace, typed blocker) will attach here as the
-bridge lands.
+These mirror the lifecycle described in ``docs/PLAN.md``: an issue is claimed,
+worked by an agent, possibly parked while blocked on an external event,
+reviewed, and completed. The per-issue metadata that must outlive a process
+(§5.11) will attach here as the Linear-side store lands.
 """
 
 from __future__ import annotations

@@ -1,9 +1,8 @@
 """In-memory store of the issues foregent is tracking.
 
 The bridge is stateless (``docs/PLAN.md`` §5.11): the authoritative record of
-live work lives in CAO and Linear, and this store is only an in-memory cache
-rebuilt from those backends. In this skeleton it starts empty and is never
-populated — the rebuild path lands with the bridge.
+live work lives in the agent harness and in Linear, and this store is only an
+in-memory cache rebuilt from those backends on startup.
 """
 
 from __future__ import annotations
