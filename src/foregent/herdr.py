@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+from collections.abc import Iterator
 from pathlib import Path
 
 # Protocol version this client is written against. herdr is a hard
@@ -142,6 +143,62 @@ class HerdrClient:
         except OSError as exc:
             raise HerdrTransportError(f"herdr {method}: {exc}") from exc
         return _unwrap(method, payload)
+
+    def subscribe(
+        self,
+        subscriptions: list[dict],
+        tick: float | None = None,
+    ) -> Iterator[dict | None]:
+        """Yield event envelopes from a long-lived subscription.
+
+        Unlike :meth:`call`, this holds its connection open and blocks
+        between events — an idle fleet is silent for hours — so it gets its
+        own socket. With ``tick`` set, a quiet period that long yields
+        ``None`` instead of blocking on, which gives the caller a chance to
+        act on time rather than only on traffic. The server's subscription
+        acknowledgement is swallowed; only ``{event, data}`` envelopes are
+        yielded. Returns when the server hangs up.
+        """
+        with self.connect() as connection:
+            connection.settimeout(tick)
+            request = json.dumps(
+                {
+                    "id": "subscribe",
+                    "method": "events.subscribe",
+                    "params": {"subscriptions": subscriptions},
+                }
+            )
+            try:
+                connection.sendall(request.encode() + b"\n")
+                buffer = b""
+                while True:
+                    try:
+                        chunk = connection.recv(65536)
+                    except TimeoutError:
+                        yield None
+                        continue
+                    if not chunk:
+                        return
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line, buffer = buffer.split(b"\n", 1)
+                        if not line.strip():
+                            continue
+                        message = json.loads(line)
+                        error = message.get("error")
+                        if error is not None:
+                            raise HerdrAPIError(
+                                error.get("code", "unknown"),
+                                error.get("message", ""),
+                            )
+                        if "event" in message:
+                            yield message
+            except OSError as exc:
+                raise HerdrTransportError(f"herdr subscription: {exc}") from exc
+            except ValueError as exc:
+                raise HerdrTransportError(
+                    f"herdr subscription sent invalid JSON: {exc}"
+                ) from exc
 
     def ping(self) -> dict:
         """Return herdr's ``{version, protocol, capabilities}`` banner."""
