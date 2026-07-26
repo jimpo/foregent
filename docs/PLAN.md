@@ -43,11 +43,14 @@ What that buys, all *(verified)* on a live box:
   herdr emits `pane_exited` / `pane_closed` on its event stream. Agent death is
   a subscription, not a probe.
 - **An event stream, not a poll loop.** `events.subscribe` over the socket
-  delivers `pane_agent_status_changed`, `pane_exited`, `pane_closed`,
-  `pane_agent_detected`, plus workspace/tab/worktree events. Note that
-  `pane.agent_status_changed` subscriptions are per-pane (`pane_id` required);
-  the global firehose is `pane.updated`, whose `PaneInfo` payload carries
-  `agent_status`.
+  delivers agent status changes, `pane_exited`, `pane_closed`,
+  `workspace_closed`, `pane_agent_detected`, plus workspace/tab/worktree
+  events. Three details of that stream shape the consumer (§5.13): status
+  changes are **per-pane** subscriptions and the global `pane.updated` is not
+  a substitute (its `PaneInfo.agent_status` lags — it reports an agent idle
+  while it is working); stopping an agent by closing its workspace emits only
+  `workspace_closed`, with no pane event; and herdr spells that one event
+  dotted (`pane.agent_status_changed`) where every other name is underscored.
 - **A real status enum**: `idle | working | blocked | done | unknown`, driven
   by a versioned, auto-updating detection manifest
   (`~/.local/state/herdr/agent-detection/remote/claude.toml`) with rules for

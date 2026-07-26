@@ -9,12 +9,19 @@ from __future__ import annotations
 
 import json
 import unittest
-from collections.abc import Callable
+from itertools import islice
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from unittest import mock
 
 from foregent import herdr
-from foregent.agents import AgentError, AgentRef, AgentStatus, LaunchSpec
+from foregent.agents import (
+    AgentError,
+    AgentEventKind,
+    AgentRef,
+    AgentStatus,
+    LaunchSpec,
+)
 from foregent.agents.herdr_claude import HerdrClaudeManager, render_args
 
 WORKSPACE = {
@@ -37,6 +44,18 @@ READY_AGENT = {
 
 
 _BASE = LaunchSpec(label="fg-jim-85", cwd="/ws/JIM-85")
+
+
+def status_changed(pane_id: str, status: str, event: str = "pane.agent_status_changed") -> dict:
+    """A herdr status-change envelope, as it arrives on the wire.
+
+    herdr sends this one dotted, unlike the underscored names it uses for
+    every other event.
+    """
+    return {
+        "event": event,
+        "data": {"pane_id": pane_id, "agent": "claude", "agent_status": status},
+    }
 
 
 def spec(**overrides) -> LaunchSpec:
@@ -66,6 +85,8 @@ class FakeClient:
         self.calls: list[tuple[str, dict]] = []
         self.responses: dict[str, Answer] = responses or {}
         self.errors = errors or {}
+        # A canned event stream; a None entry stands for a quiet tick.
+        self.stream: list[dict | None] = []
 
     def call(self, method: str, params: dict | None = None, **kwargs) -> dict:
         self.calls.append((method, params or {}))
@@ -73,6 +94,13 @@ class FakeClient:
             raise self.errors[method]
         answer: Answer = self.responses.get(method, _DEFAULTS.get(method, {}))
         return answer if isinstance(answer, dict) else answer(params or {})
+
+    def subscribe(
+        self, subscriptions: list[dict], tick: float | None = None
+    ) -> Iterator[dict | None]:
+        """Replay canned event envelopes, then end the stream."""
+        self.calls.append(("events.subscribe", {"subscriptions": subscriptions}))
+        yield from self.stream
 
     def params_for(self, method: str) -> dict:
         """Params of the first call to ``method``."""
@@ -442,6 +470,185 @@ class ListAgentsTests(unittest.TestCase):
             }
         )
         self.assertIsNone(manager(client).list_agents()[0].ref.conversation_id)
+
+
+class EventTests(unittest.TestCase):
+    """Translating herdr's pane events into agent events."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch("foregent.agents.herdr_claude.RECONNECT_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def client_with(
+        self, stream: list[dict | None], agents: list[dict] | None = None
+    ):
+        listed = (
+            agents
+            if agents is not None
+            else [{"name": "fg-jim-87", "pane_id": "w1:p1", "workspace_id": "w1"}]
+        )
+        client = FakeClient({"agent.list": {"agents": listed}})
+        client.stream = stream
+        return client
+
+    def events(self, client, count: int) -> list:
+        """The first ``count`` events, without waiting on the reconnect loop."""
+        return list(islice(manager(client).events(), count))
+
+    def test_status_changes_are_subscribed_per_pane(self) -> None:
+        # The global pane.updated event carries a PaneInfo whose status lags
+        # the agent, so it cannot be used for this.
+        client = self.client_with([status_changed("w1:p1", "working")])
+        self.events(client, 1)
+        subscriptions = client.params_for("events.subscribe")["subscriptions"]
+        self.assertIn(
+            {"type": "pane.agent_status_changed", "pane_id": "w1:p1"}, subscriptions
+        )
+
+    def test_a_status_change_names_the_agent_not_the_pane(self) -> None:
+        client = self.client_with([status_changed("w1:p1", "working")])
+        [event] = self.events(client, 1)
+        self.assertEqual(event.kind, AgentEventKind.STATUS_CHANGED)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+        self.assertEqual(event.status, AgentStatus.WORKING)
+
+    def test_both_spellings_of_an_event_name_are_understood(self) -> None:
+        # herdr sends status changes dotted and everything else underscored;
+        # matching one spelling only is how every status update went missing.
+        for name in ("pane.agent_status_changed", "pane_agent_status_changed"):
+            client = self.client_with([status_changed("w1:p1", "working", name)])
+            [event] = self.events(client, 1)
+            self.assertEqual(event.status, AgentStatus.WORKING)
+
+    def test_a_repeated_status_is_dropped(self) -> None:
+        client = self.client_with(
+            [
+                status_changed("w1:p1", "working"),
+                status_changed("w1:p1", "working"),
+                status_changed("w1:p1", "idle"),
+            ]
+        )
+        statuses = [event.status for event in self.events(client, 2)]
+        self.assertEqual(statuses, [AgentStatus.WORKING, AgentStatus.IDLE])
+
+    def test_a_closed_pane_is_an_exit(self) -> None:
+        client = self.client_with(
+            [{"event": "pane_closed", "data": {"pane_id": "w1:p1"}}]
+        )
+        [event] = self.events(client, 1)
+        self.assertEqual(event.kind, AgentEventKind.EXITED)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+        self.assertEqual(event.status, AgentStatus.GONE)
+
+    def test_an_exited_pane_is_an_exit(self) -> None:
+        client = self.client_with(
+            [{"event": "pane_exited", "data": {"pane_id": "w1:p1"}}]
+        )
+        self.assertEqual(self.events(client, 1)[0].kind, AgentEventKind.EXITED)
+
+    def test_a_closed_workspace_is_an_exit(self) -> None:
+        # Stopping an agent closes its workspace, and that emits no pane
+        # event at all — without this the bridge would never see its own
+        # teardowns, or an operator closing a workspace by hand.
+        client = self.client_with(
+            [{"event": "workspace_closed", "data": {"workspace_id": "w1"}}]
+        )
+        [event] = self.events(client, 1)
+        self.assertEqual(event.kind, AgentEventKind.EXITED)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+
+    def test_panes_that_are_not_ours_are_ignored(self) -> None:
+        # An operator's own pane in the same session must not look like a
+        # foregent agent dying.
+        client = self.client_with(
+            [
+                status_changed("w9:p9", "working"),
+                {"event": "pane_closed", "data": {"pane_id": "w9:p9"}},
+                status_changed("w1:p1", "idle"),
+            ]
+        )
+        [event] = self.events(client, 1)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+
+    def test_a_new_agent_triggers_a_fresh_subscription(self) -> None:
+        # Per-pane subscriptions are fixed when the subscription opens, so an
+        # agent that starts later can only be watched by re-subscribing.
+        client = self.client_with(
+            [
+                {"event": "pane_agent_detected", "data": {"pane_id": "w2:p1"}},
+                status_changed("w2:p1", "working"),
+            ]
+        )
+        # The agent does not exist when the subscription opens; it is there by
+        # the time herdr reports having detected it.
+        listings = [{"agents": []}]
+        later = {"agents": [{"name": "fg-jim-87", "pane_id": "w2:p1", "workspace_id": "w2"}]}
+        client.responses["agent.list"] = lambda params: (
+            listings.pop(0) if listings else later
+        )
+        [event] = self.events(client, 1)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+        self.assertGreaterEqual(client.methods().count("events.subscribe"), 2)
+
+    def test_an_agent_detected_before_it_is_named_is_still_picked_up(self) -> None:
+        # herdr announces a detected agent before `agent.start` has finished
+        # registering its name, so the refresh that announcement triggers can
+        # come back empty. Recording the fleet as up to date at that point
+        # would leave the agent's status unwatched for its entire life, with
+        # nothing left to notice: the periodic check would see no difference.
+        client = FakeClient()
+        calls = {"count": 0}
+        named = {"agents": [{"name": "fg-jim-87", "pane_id": "w2:p1", "workspace_id": "w2"}]}
+
+        def listing(params: dict) -> dict:
+            calls["count"] += 1
+            # Nameless while the agent is starting, named shortly after.
+            return {"agents": []} if calls["count"] <= 2 else named
+
+        client.responses["agent.list"] = listing
+        client.stream = [
+            {"event": "pane_agent_detected", "data": {"pane_id": "w2:p1"}},
+            None,  # a quiet tick
+            status_changed("w2:p1", "working"),
+        ]
+        [event] = self.events(client, 1)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+        self.assertEqual(event.status, AgentStatus.WORKING)
+
+    def test_someone_elses_agent_does_not_force_a_re_subscription(self) -> None:
+        # Resubscribing on every detected agent would churn the connection
+        # for panes the bridge will never watch.
+        client = self.client_with(
+            [
+                {"event": "pane_agent_detected", "data": {"pane_id": "w9:p9"}},
+                status_changed("w1:p1", "idle"),
+            ]
+        )
+        [event] = self.events(client, 1)
+        self.assertEqual(event.ref.label, "fg-jim-87")
+        self.assertEqual(client.methods().count("events.subscribe"), 1)
+
+    def test_the_stream_is_re_established_after_it_drops(self) -> None:
+        # A bridge that stopped listening would stop noticing agents dying.
+        client = self.client_with([status_changed("w1:p1", "working")])
+        self.assertEqual(len(self.events(client, 2)), 2)
+        self.assertEqual(client.methods().count("events.subscribe"), 2)
+
+    def test_a_broken_stream_does_not_end_the_iterator(self) -> None:
+        client = self.client_with([status_changed("w1:p1", "working")])
+        calls = {"count": 0}
+        original = client.subscribe
+
+        def subscribe(subscriptions, tick=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise herdr.HerdrTransportError("socket died")
+            yield from original(subscriptions, tick)
+
+        client.subscribe = subscribe
+        [event] = self.events(client, 1)
+        self.assertEqual(event.status, AgentStatus.WORKING)
 
 
 if __name__ == "__main__":

@@ -11,12 +11,14 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Generator, Iterator
 from dataclasses import replace
 
 from foregent import herdr
 from foregent.agents.base import (
     AgentError,
+    AgentEvent,
+    AgentEventKind,
     AgentRecord,
     AgentRef,
     AgentStatus,
@@ -60,6 +62,33 @@ RETRY_SECONDS = 2.0
 # herdr's own five-second stall window, or the wait expires before the check
 # it exists to run can report.
 CONFIRM_MS = 15_000
+
+# The events every subscription carries, whatever agents exist: the three
+# ways an agent can end — which are the bridge's crash authority
+# (docs/PLAN.md §5.6) — plus the arrival of a new one.
+#
+# `workspace.closed` is not redundant. Stopping an agent closes its whole
+# workspace, and that emits only `workspace_closed`; no pane event follows.
+GLOBAL_SUBSCRIPTIONS = [
+    {"type": "pane.exited"},
+    {"type": "pane.closed"},
+    {"type": "workspace.closed"},
+    {"type": "pane.agent_detected"},
+]
+
+# Pause before re-subscribing after the stream drops. A missed window means
+# missed deaths, so this is short.
+RECONNECT_SECONDS = 2.0
+
+# How often a quiet subscription checks whether the fleet has changed. Status
+# is watched per pane, so an agent that started since the subscription opened
+# is invisible until it is re-subscribed — and herdr's `pane_agent_detected`
+# can arrive before the agent has a name, so it cannot be the only trigger.
+# The consequence is a short window after a launch in which that agent's
+# status changes are not reported; its death still is, since those
+# subscriptions are global. `agent.list` over a unix socket is cheap enough
+# to run this often.
+TICK_SECONDS = 2.0
 
 # herdr error codes this manager reacts to rather than propagates.
 _NOT_FOUND = "agent_not_found"
@@ -305,6 +334,116 @@ class HerdrClaudeManager:
             f"could not deliver a prompt to {ref.label} in {PROMPT_ATTEMPTS} "
             f"attempts; last screen:\n{self.read(ref, lines=20)}"
         )
+
+    def events(self) -> Iterator[AgentEvent]:
+        """Yield agent changes, re-subscribing for as long as it is consumed.
+
+        The stream dropping is not an ending: a bridge that stopped listening
+        would stop noticing agents dying, so this reconnects and keeps going.
+        Events name panes, not agents, so labels are resolved through a map
+        rebuilt on subscribe and whenever an unfamiliar pane appears.
+        """
+        while True:
+            immediate = False
+            try:
+                immediate = yield from self._events_once()
+            except (herdr.HerdrError, AgentError):
+                pass
+            if not immediate:
+                time.sleep(RECONNECT_SECONDS)
+
+    def _events_once(self) -> Generator[AgentEvent, None, bool]:
+        """One subscription's worth of events; True to re-subscribe at once.
+
+        Status changes are per-pane subscriptions, which is the only place
+        they can be read reliably: the global `pane.updated` carries a
+        `PaneInfo` whose `agent_status` lags — it reported an agent idle
+        while it was working — because it describes the pane, not the agent.
+        The cost is that a pane arriving later needs a new subscription,
+        which is what the return value asks for.
+        """
+        panes, workspaces = self._agent_labels()
+        subscriptions = GLOBAL_SUBSCRIPTIONS + [
+            {"type": "pane.agent_status_changed", "pane_id": pane_id}
+            for pane_id in panes
+        ]
+        seen: dict[str, AgentStatus] = {}
+        for message in self.client.subscribe(subscriptions, tick=TICK_SECONDS):
+            if message is None:
+                # A quiet moment: pick up agents that appeared since this
+                # subscription opened, whose status nothing is watching yet.
+                live, _ = self._agent_labels()
+                if set(live) != set(panes):
+                    return True
+                continue
+            # herdr is inconsistent about how it spells event names on the
+            # wire: most arrive underscored, as the schema's EventKind lists
+            # them, but a per-pane status change arrives as the dotted
+            # subscription type (`pane.agent_status_changed`). Normalizing
+            # means a spelling change cannot silently drop events — which is
+            # exactly how status updates were lost before.
+            kind = str(message.get("event", "")).replace(".", "_")
+            data = message.get("data") or {}
+            if kind == "pane_agent_status_changed":
+                pane_id = data.get("pane_id")
+                label = panes.get(pane_id) if pane_id else None
+                if label is None or pane_id is None:
+                    continue
+                status = _status_of(data)
+                if seen.get(pane_id) == status:
+                    continue
+                seen[pane_id] = status
+                yield AgentEvent(
+                    AgentEventKind.STATUS_CHANGED, AgentRef(label), status
+                )
+            elif kind in ("pane_exited", "pane_closed"):
+                pane_id = data.get("pane_id")
+                label = panes.pop(pane_id, None) if pane_id else None
+                seen.pop(pane_id, None)
+                if label is not None:
+                    yield AgentEvent(
+                        AgentEventKind.EXITED, AgentRef(label), AgentStatus.GONE
+                    )
+            elif kind == "workspace_closed":
+                workspace_id = data.get("workspace_id")
+                label = workspaces.pop(workspace_id, None) if workspace_id else None
+                if label is not None:
+                    yield AgentEvent(
+                        AgentEventKind.EXITED, AgentRef(label), AgentStatus.GONE
+                    )
+            elif kind == "pane_agent_detected":
+                pane_id = data.get("pane_id")
+                if pane_id is None or pane_id in panes:
+                    continue
+                # Someone else's agent in this session is not worth a new
+                # subscription; ours needs one, and only a fresh subscription
+                # can carry a per-pane entry.
+                #
+                # `panes` is deliberately left alone unless we resubscribe:
+                # recording an agent here that nothing is yet subscribed to
+                # would make the tick below see no change and never catch up,
+                # silently losing that agent's status for its whole life.
+                if pane_id in self._agent_labels()[0]:
+                    return True
+        return False
+
+    def _agent_labels(self) -> tuple[dict[str, str], dict[str, str]]:
+        """Agent labels keyed by pane and by workspace.
+
+        Events name panes and workspaces; the bridge speaks in labels, and
+        only `agent.list` joins the two.
+        """
+        panes: dict[str, str] = {}
+        workspaces: dict[str, str] = {}
+        for agent in self._call("agent.list").get("agents", []):
+            label = agent.get("name")
+            if not label or issue_key_from_label(label) is None:
+                continue
+            if agent.get("pane_id"):
+                panes[agent["pane_id"]] = label
+            if agent.get("workspace_id"):
+                workspaces[agent["workspace_id"]] = label
+        return panes, workspaces
 
     def _await_interactive(self, label: str) -> None:
         """Block until herdr reports the agent's TUI can accept input."""

@@ -20,22 +20,32 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import uuid
 from pathlib import Path
 
 from foregent import herdr
-from foregent.agents import AgentError, AgentStatus, LaunchSpec
+from foregent.agents import (
+    AgentError,
+    AgentEvent,
+    AgentEventKind,
+    AgentStatus,
+    LaunchSpec,
+)
+from foregent.agents import herdr_claude
 from foregent.agents.herdr_claude import HerdrClaudeManager
 
 _HERDR = shutil.which("herdr")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _AGENT_TESTS = os.environ.get("FOREGENT_HERDR_AGENT_TESTS") == "1"
 
-# Scratch session per test process, so a run never touches the operator's
-# own sessions (the real deployment uses the session named "foregent").
-_SESSION = f"foregent-inttest-{os.getpid()}"
+# Scratch session per test class, so a run never touches the operator's own
+# sessions (the real deployment uses the session named "foregent") and no
+# class inherits another's server, socket or leftover agents.
+def _session_name(suffix: str) -> str:
+    return f"fg-test-{os.getpid()}-{suffix}"
 
 _READY_TIMEOUT = 20  # seconds to wait for the server to accept connections
 _AGENT_START_MS = 90_000  # herdr's own budget for bringing an agent up
@@ -57,16 +67,16 @@ def _clean_env() -> dict[str, str]:
     }
 
 
-def _start_server() -> subprocess.Popen:
+def _start_server(session: str) -> subprocess.Popen:
     """Start the scratch herdr server and wait for its socket to answer."""
     process = subprocess.Popen(
-        [str(_HERDR), "--session", _SESSION, "server"],
+        [str(_HERDR), "--session", session, "server"],
         env=_clean_env(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    client = herdr.HerdrClient(session=_SESSION)
+    client = herdr.HerdrClient(session=session)
     deadline = time.monotonic() + _READY_TIMEOUT
     while time.monotonic() < deadline:
         try:
@@ -75,13 +85,13 @@ def _start_server() -> subprocess.Popen:
         except herdr.HerdrError:
             time.sleep(0.2)
     process.kill()
-    raise AssertionError(f"herdr session {_SESSION} did not come up")
+    raise AssertionError(f"herdr session {session} did not come up")
 
 
-def _stop_server(process: subprocess.Popen) -> None:
+def _stop_server(process: subprocess.Popen, session: str) -> None:
     """Stop the scratch server and delete its session directory."""
     try:
-        herdr.HerdrClient(session=_SESSION).call("server.stop", timeout=10)
+        herdr.HerdrClient(session=session).call("server.stop", timeout=10)
     except herdr.HerdrError:
         pass
     try:
@@ -89,7 +99,7 @@ def _stop_server(process: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
     subprocess.run(
-        [str(_HERDR), "session", "delete", _SESSION],
+        [str(_HERDR), "session", "delete", session],
         env=_clean_env(),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -103,12 +113,13 @@ class HerdrIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.process = _start_server()
-        cls.client = herdr.HerdrClient(session=_SESSION)
+        cls.session = _session_name("socket")
+        cls.process = _start_server(cls.session)
+        cls.client = herdr.HerdrClient(session=cls.session)
 
     @classmethod
     def tearDownClass(cls) -> None:
-        _stop_server(cls.process)
+        _stop_server(cls.process, cls.session)
 
     def workspace(self, cwd: str, label: str) -> dict:
         """Create a workspace that is closed again when the test ends."""
@@ -170,12 +181,13 @@ class AgentIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.process = _start_server()
-        cls.client = herdr.HerdrClient(session=_SESSION)
+        cls.session = _session_name("agent")
+        cls.process = _start_server(cls.session)
+        cls.client = herdr.HerdrClient(session=cls.session)
 
     @classmethod
     def tearDownClass(cls) -> None:
-        _stop_server(cls.process)
+        _stop_server(cls.process, cls.session)
 
     def test_agent_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -241,12 +253,13 @@ class ManagerIntegrationTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.process = _start_server()
-        cls.manager = HerdrClaudeManager(herdr.HerdrClient(session=_SESSION))
+        cls.session = _session_name("manager")
+        cls.process = _start_server(cls.session)
+        cls.manager = HerdrClaudeManager(herdr.HerdrClient(session=cls.session))
 
     @classmethod
     def tearDownClass(cls) -> None:
-        _stop_server(cls.process)
+        _stop_server(cls.process, cls.session)
 
     def test_launch_list_and_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -314,6 +327,58 @@ class ManagerIntegrationTests(unittest.TestCase):
             self.manager.send(ref, "Reply with just the word PONG.")
             self.manager.wait(ref, {AgentStatus.IDLE, AgentStatus.DONE}, 120)
             self.assertIn("PONG", self.manager.read(ref, lines=40))
+
+    def test_events_report_work_and_death(self) -> None:
+        # The bridge's crash authority: agent death arrives as an event
+        # rather than being discovered by a probe (docs/PLAN.md §5.6).
+        seen: list[AgentEvent] = []
+        failure: list[BaseException] = []
+
+        def consume() -> None:
+            try:
+                for event in self.manager.events():
+                    seen.append(event)
+            except BaseException as exc:  # surfaced by wait_for below
+                failure.append(exc)
+
+        threading.Thread(target=consume, daemon=True).start()
+
+        label = f"fg-events-{os.getpid()}"
+        ref = self.manager.launch(
+            LaunchSpec(label=label, cwd=str(_REPO_ROOT), model="haiku")
+        )
+        self.addCleanup(self.manager.stop, ref)
+
+        def wait_for(predicate, what: str, timeout: float = 60) -> None:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if any(predicate(event) for event in list(seen)):
+                    return
+                time.sleep(0.2)
+            self.fail(
+                f"no {what} event; saw {[(e.kind, e.status) for e in seen]}"
+                + f"; live agents: {self.manager.list_agents()}"
+                + f"; session {self.session}"
+                + (f"; consumer died: {failure[0]!r}" if failure else "")
+            )
+
+        # Status is watched per pane, so a just-launched agent is picked up
+        # only on the consumer's next refresh. herdr reports the agent's
+        # current status as soon as that subscription opens, which is the
+        # signal that it is being watched — prompting before it would race.
+        wait_for(lambda e: e.ref.label == label, "subscription")
+
+        self.manager.send(ref, "Reply with just the word PONG.")
+        wait_for(
+            lambda e: e.ref.label == label and e.status is AgentStatus.WORKING,
+            "working",
+        )
+
+        self.manager.stop(ref)
+        wait_for(
+            lambda e: e.ref.label == label and e.kind is AgentEventKind.EXITED,
+            "exit",
+        )
 
     def test_a_second_launch_for_one_issue_is_refused(self) -> None:
         # The deterministic label is what makes a double dispatch impossible
