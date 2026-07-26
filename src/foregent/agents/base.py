@@ -19,10 +19,19 @@ server runs them in a threadpool, as it already does for the Linear client.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
+
+# Agent labels are the bridge's own persistence scheme (docs/PLAN.md §5.11):
+# an issue's agent is found again after a restart by name alone. The form is
+# the lowest common denominator across harnesses — herdr requires
+# `[a-z][a-z0-9_-]{0,31}`, and tmux-backed runtimes forbid "/" — so the same
+# label works whoever runs the agent.
+LABEL_PREFIX = "fg-"
+_LABEL = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
 
 class AgentError(Exception):
@@ -32,6 +41,29 @@ class AgentError(Exception):
     never catches (say) a socket error from one runtime or an HTTP error
     from another.
     """
+
+
+def label_for(issue_key: str) -> str:
+    """Agent label for ``issue_key`` — deterministic, so a retry collides.
+
+    Launching twice for one issue must be impossible rather than merely
+    unlikely: the second launch asks the harness for a name that is already
+    taken and is refused (docs/PLAN.md §5.11).
+    """
+    label = f"{LABEL_PREFIX}{issue_key.lower()}"
+    if not _LABEL.fullmatch(label):
+        raise AgentError(
+            f"issue key {issue_key!r} yields the unusable agent label {label!r}"
+        )
+    return label
+
+
+def issue_key_from_label(label: str) -> str | None:
+    """Issue key inside ``label``, or ``None`` if foregent did not launch it."""
+    if not label.startswith(LABEL_PREFIX):
+        return None
+    key = label[len(LABEL_PREFIX) :]
+    return key.upper() or None
 
 
 class AgentStatus(StrEnum):

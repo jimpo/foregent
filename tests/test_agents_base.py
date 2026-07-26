@@ -11,6 +11,7 @@ import unittest
 from collections.abc import Collection, Iterator
 
 from foregent.agents import (
+    AgentError,
     AgentEvent,
     AgentEventKind,
     AgentManager,
@@ -18,6 +19,8 @@ from foregent.agents import (
     AgentRef,
     AgentStatus,
     LaunchSpec,
+    issue_key_from_label,
+    label_for,
 )
 
 
@@ -91,6 +94,33 @@ class TypeTests(unittest.TestCase):
         )
         self.assertEqual(event.kind, AgentEventKind.EXITED)
         self.assertEqual(event.status, AgentStatus.GONE)
+
+
+class LabelTests(unittest.TestCase):
+    """The naming convention the bridge rebuilds its state from (§5.11)."""
+
+    def test_label_is_derived_from_the_issue_key(self) -> None:
+        self.assertEqual(label_for("JIM-52"), "fg-jim-52")
+
+    def test_labels_round_trip_back_to_issue_keys(self) -> None:
+        self.assertEqual(issue_key_from_label(label_for("JIM-52")), "JIM-52")
+
+    def test_labels_are_deterministic(self) -> None:
+        # A retry after a half-finished launch must ask for the name that is
+        # already taken, so the harness refuses it instead of running a
+        # second agent on one issue.
+        self.assertEqual(label_for("JIM-52"), label_for("JIM-52"))
+
+    def test_foreign_labels_are_not_ours(self) -> None:
+        self.assertIsNone(issue_key_from_label("scratch"))
+        self.assertIsNone(issue_key_from_label("fg-"))
+
+    def test_an_unusable_key_is_rejected_at_the_source(self) -> None:
+        # Better to fail where the key is known than to have the harness
+        # reject an opaque name mid-dispatch.
+        for key in ["JIM 52", "JIM/52", "JIM.52", "J" * 40]:
+            with self.assertRaises(AgentError):
+                label_for(key)
 
 
 if __name__ == "__main__":

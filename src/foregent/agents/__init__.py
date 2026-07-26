@@ -13,6 +13,8 @@ from foregent.agents.base import (
     AgentRef,
     AgentStatus,
     LaunchSpec,
+    issue_key_from_label,
+    label_for,
 )
 
 __all__ = [
@@ -24,4 +26,6 @@ __all__ = [
     "AgentRef",
     "AgentStatus",
     "LaunchSpec",
+    "issue_key_from_label",
+    "label_for",
 ]
