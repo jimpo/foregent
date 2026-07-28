@@ -102,11 +102,11 @@ One machine (or VM) per project. Three layers:
 
 ```
             Linear / GitHub  (cloud)
-                 │ webhooks            ▲ comments, PRs, issue updates
+                 │ polled              ▲ comments, PRs, issue updates
                  ▼                     │ (written by agents via MCP)
   ┌───────────────────────────────────┴─────────────┐
   │ foregent bridge (Python/FastAPI, STATELESS)     │
-  │  • webhook ingestion + event routing            │
+  │  • event tick + routing                         │
   │  • AgentManager (herdr+Claude Code impl)        │
   │  • issue↔agent↔workspace: in-memory cache only, │
   │    rebuilt from herdr agents + Linear           │
@@ -131,23 +131,37 @@ launches, prompts, and reaps agents through it. Agents talk back to the world
 through Linear/GitHub MCP tools, and to the bridge through a small foregent
 MCP server (`report_blocked`, `complete_task`).
 
-Webhook delivery: GitHub/Linear → public endpoint on the project VM (or a
-relay/tunnel — see Q8) → bridge routes by event type + issue/PR mapping.
+Event delivery: the bridge **polls** Linear and GitHub for changes on the
+issues it is tracking, then routes by event type + issue/PR mapping. Foregent
+is never publicly reachable and receives nothing inbound (Q8, resolved
+2026-07-28).
 
 ## 5. Feature set
 
 ### 5.1 Event bridge (the core)
-- Receives Linear webhooks (issue created/updated/assigned/commented) and
-  GitHub webhooks (PR review submitted, comments, checks, merges).
+- A **periodic tick** asks Linear what changed on the issues the bridge is
+  tracking (comments, status, assignment), and later GitHub the same (PR
+  review submitted, comments, checks, merges). One query per source covers
+  the whole fleet, keyed on the in-flight issues, so cost scales with work in
+  progress rather than with workspace size.
+- **Events are foregent's own shape**, not a provider payload. The transport
+  is a source feeding one matcher; that seam is what makes push an additive
+  change later rather than a rewrite.
 - Maintains the issue ↔ agent ↔ workspace mapping as an **in-memory cache**,
   rebuildable from herdr + Linear — the bridge owns no database (§5.11).
 - Dispatch: ready issue → claim it (assignee + In Progress, §5.12) → acquire
   workspace (§5.7) → `AgentManager.launch()` → brief the agent with its issue
   key and the `foregent-worker` skill.
-- Wake: event matching a parked agent's blocker → prompt delivered to the
-  still-alive agent (§5.6).
-- Loop insurance: a periodic tick re-checks Linear for stuck/unassigned work,
-  so a missed webhook can't stall the system (Ralph loop = webhooks + tick).
+- Wake: an event on a parked agent's own issue → prompt delivered to the
+  still-alive agent (§5.6). Matching is `wakes(event) -> key`, a lookup rather
+  than a scan, because the event names the issue it is about.
+- **Never wake on foregent's own writes.** Claiming an issue assigns it and
+  moves its state, and agents comment through the Linear MCP under the same
+  account; both come back as changes. `wakes()` drops them by actor identity,
+  and polling can drop most of them a step earlier, server-side
+  (`user: { id: { neq: $viewerId } }`).
+- The tick is also loop insurance: it re-checks Linear for stuck/unassigned
+  work, so nothing missed can stall the system (Ralph loop).
 
 ### 5.2 The issue agent
 **One Claude Code agent owns one Linear issue, end to end.** There is no
@@ -227,8 +241,8 @@ cares.
   parked agent was holding its slot the whole time.
 - **An event wakes the agent that owns the issue the event is about**, and the
   blocker is never read (`foregent/events.py`, a pure `wakes(event) -> key` so
-  it is testable without a server, a webhook or a live agent — webhook
-  ingestion, §5.11, then becomes a trigger for machinery that already works).
+  it is testable without a server, a transport or a live agent — the tick
+  (§5.1) then becomes a trigger for machinery that already works).
   Three kinds wake an agent, and nothing else does:
   - a comment or reply on the agent's own Linear issue;
   - a review or comment on the pull request linked to that issue, inline or
@@ -551,12 +565,13 @@ system itself.
    cache rebuilt from herdr agent names (no database — §5.11), foregent MCP
    server (`get_assignment` / `report_blocked` / `complete_task`), manual
    dispatch via CLI, event-stream consumer for status/death. Single repo,
-   bootstrap mode, no webhooks yet. From here on, foregent development itself
-   runs through the bridge.
-3. **Linear loop**: webhook ingestion + a bridge tick over ready issues; the
-   claim/orphan protocol (§5.12) including resume-based re-dispatch; the
+   bootstrap mode, no event delivery yet. From here on, foregent development
+   itself runs through the bridge.
+3. **Linear loop**: the wake path (unblock + prompt an agent, blocker matching)
+   and the tick that feeds it over tracked and ready issues; the claim/orphan
+   protocol (§5.12) including resume-based re-dispatch; the
    Linear-persistence spike (§5.11: attachment `metadata` upsert-by-url,
-   self-webhook actor filtering); the managed team gains an **Orphaned**
+   self-event actor filtering); the managed team gains an **Orphaned**
    workflow state. Foregent development driven from Linear end-to-end in
    bootstrap mode.
 4. **Workspaces**: pool, jj-or-git decision executed (Q6), multi-repo layout,
@@ -566,7 +581,7 @@ system itself.
    its own repo.
 6. **Provisioning generalization + hardening**: manifest + cloud-init for
    cloud VMs; binius onboarded (multi-repo, cryptography skills); crash
-   recovery, missed-webhook reconciliation, cost/usage tracking.
+   recovery, cost/usage tracking.
 
 ## 7. Risks
 
@@ -588,8 +603,11 @@ system itself.
 - **Multi-repo + rebase automation** has sharp edges (cross-repo atomic
   changes, conflict handling) → start with binius' real dependency shape, keep
   cross-repo tasks single-owner.
-- **Webhook exposure** of per-project VMs → prefer a relay (single hardened
-  ingress fanning out to VMs) over N public endpoints (Q8).
+- **Event latency and API budget** replace webhook exposure as the delivery
+  risk, now that the bridge polls and is never publicly reachable (Q8). Linear
+  allows 2,500 requests/hour per key; a 30-second tick spends under 5% of it,
+  and the ceiling is the tick rate rather than the fleet size. A push
+  transport, if one is ever needed, is the mitigation.
 
 ## 8. Open questions
 
@@ -598,9 +616,18 @@ system itself.
   itself.
 - **Q7 — Multi-repo task semantics.** Is one Linear issue ever cross-repo? Start
   by forbidding cross-repo issues; revisit with binius data.
-- **Q8 — Webhook ingress.** Public endpoint per VM vs a single relay
-  (Cloudflare tunnel / small cloud relay fanning out over SSH/WireGuard).
-  Relay preferred on current thinking. Moot until phase 3 for devbox VMs.
+- ~~**Q8 — Webhook ingress.**~~ **Resolved 2026-07-28 (JIM-102): poll, don't
+  receive.** Bridges sit on private networks with no inbound port, and every
+  push option pays for that with infrastructure — a Cloudflare named tunnel
+  (domain + daemon + DNS + subscription lifecycle) or a Lambda/SQS relay (AWS
+  credentials on every box). What they buy is latency: sub-second against a
+  30-second tick, when every consumer is a human replying to a review.
+  Decisive point: §5.1 commits to a periodic tick regardless, so push would be
+  built *on top of* the loop rather than instead of it — and polling's failure
+  mode is lateness where push's is silence. Revisit when latency is genuinely
+  felt (→ Cloudflare tunnel) or when one endpoint serves many bridges and lost
+  events stop being acceptable (→ Lambda + SQS, whose buffer earns its keep
+  there). Both stay cheap to add because the event shape is foregent's own.
 - **Q9 — Reviewer stage in bootstrap mode**: is there a lightweight self-review
   pass before auto-merge, or is speed the point? A question about the skill's
   workflow, not about a second agent.

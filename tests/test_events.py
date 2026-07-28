@@ -1,7 +1,7 @@
 """Tests for deciding which parked agent an event wakes (JIM-101).
 
 Matching is a pure function over the event (``docs/PLAN.md`` §5.6), so none of
-this needs a server, a webhook, or a live agent — which is the point of
+this needs a server, a transport, or a live agent — which is the point of
 keeping it pure.
 """
 
@@ -70,7 +70,7 @@ class WakesTests(unittest.TestCase):
         )
 
 
-class SelfWebhookTests(unittest.TestCase):
+class SelfEventTests(unittest.TestCase):
     """Foregent must not wake agents with its own writes."""
 
     def test_foregents_own_comment_wakes_nobody(self) -> None:

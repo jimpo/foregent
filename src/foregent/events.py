@@ -11,10 +11,10 @@ it. The blocker the agent reported is never read: it says what the agent was
 waiting for, in whatever words it chose, and is for the operator reading
 ``foregent status``.
 
-Webhook ingestion — receiving the payloads, verifying them, and resolving a
-pull request back to the Linear issue it is linked to — lands separately
-(§5.11). Keeping this pure is what lets it be tested without a server, a
-webhook, or a live agent.
+Ingestion — the periodic tick that asks Linear and GitHub what changed, and
+resolving a pull request back to the Linear issue it is linked to — lands
+separately (§5.1). Keeping this pure is what lets it be tested without a
+server, a transport, or a live agent.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ class Event:
     wakes nobody.
 
     Deliberately flat: a per-platform payload hierarchy would put the work of
-    understanding two webhook formats into every consumer instead of into
+    understanding two payload formats into every consumer instead of into
     ingestion alone. The fields matching does not read (``repo``, ``number``,
     ``author``, ``body``) are what :func:`wake_message` hands the agent, so it
     can act on the event rather than go re-read the issue to find out what
@@ -83,7 +83,7 @@ def wakes(event: Event, viewer: str = "") -> str:
     ``viewer`` is foregent's own account id on the event's platform. Foregent
     writes to Linear as that account on every dispatch (assignee + In
     Progress), and so does every agent posting through the Linear MCP, so
-    those writes come straight back as webhooks; without dropping them the
+    those writes come straight back as events; without dropping them the
     bridge wakes agents with their own writes, and a wake that triggers
     another write is a loop. The filter is on **actor identity, not
     content**. An event with no actor is never foregent's own.
