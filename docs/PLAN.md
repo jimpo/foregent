@@ -166,8 +166,14 @@ cares.
   `--mcp-config` + `--strict-mcp-config`, `--allowedTools` /
   `--disallowedTools`, `--settings`, `--add-dir`, `--session-id`,
   `-n <display name>`, plus cwd and env.
-- **MCP set:** foregent (lifecycle tools), Linear, GitHub. `--strict-mcp-config`
-  keeps the box's global plugin config from drifting into an agent.
+- **MCP set:** foregent (lifecycle tools), Linear, GitHub. Declaring servers
+  and excluding the machine's own configuration are separate decisions:
+  `--mcp-config` adds foregent's tools, and `--strict-mcp-config` is what stops
+  the box's global plugin config from drifting into an agent. The destination
+  is strict, so an agent's reach is a property of its launch spec rather than
+  of the machine — but strict can only be turned on once Linear and GitHub are
+  declared explicitly, with their own credentials. Until then agents carry
+  foregent's server and inherit the rest.
 - Project-specific variants (e.g. a binius agent with a cryptography skill and
   a different model) are a different launch spec plus different skills.
 

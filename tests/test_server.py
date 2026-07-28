@@ -102,6 +102,23 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(spec.cwd, "/ws/JIM-88")
         self.assertEqual(spec.label, "fg-jim-88")
 
+    def test_dispatch_gives_the_agent_foregents_own_tools(self) -> None:
+        # Without these an agent cannot report itself blocked or done, so the
+        # bridge never learns the outcome of the work it dispatched.
+        self.queue()
+        server.dispatch()
+        spec = self.manager.launched[0]
+        self.assertIn("foregent", spec.mcp_servers)
+        self.assertTrue(spec.mcp_servers["foregent"]["url"].endswith("/mcp"))
+
+    def test_dispatch_leaves_the_machines_mcp_config_in_place(self) -> None:
+        # Agents still reach Linear through the machine's own configuration;
+        # excluding it before declaring Linear explicitly (JIM-93) would cut
+        # them off from the issue tracker entirely.
+        self.queue()
+        server.dispatch()
+        self.assertFalse(self.manager.launched[0].strict_mcp)
+
     def test_dispatch_briefs_the_agent_and_records_it(self) -> None:
         self.queue()
         server.dispatch()

@@ -143,6 +143,20 @@ def brief_for(key: str) -> str:
     )
 
 
+def agent_mcp_servers() -> dict[str, dict]:
+    """The MCP servers a dispatched agent is given.
+
+    Foregent's own lifecycle tools, served from this process — without them
+    an agent cannot report that it is blocked or done, so the bridge never
+    learns the outcome of the work it dispatched.
+
+    Linear and GitHub are deliberately absent: agents reach them through the
+    machine's own MCP configuration until JIM-93 declares them explicitly
+    with their own credentials and turns `strict_mcp` on.
+    """
+    return {"foregent": {"type": "http", "url": f"{config.api_url()}/mcp"}}
+
+
 def dispatch() -> None:
     """Launch an agent for the oldest Queued issue, capacity allowing.
 
@@ -171,7 +185,11 @@ def dispatch() -> None:
     try:
         linear.claim_issue(issue.key)
         ref = _adopt(label) or manager.launch(
-            LaunchSpec(label=label, cwd=issue.directory)
+            LaunchSpec(
+                label=label,
+                cwd=issue.directory,
+                mcp_servers=agent_mcp_servers(),
+            )
         )
         manager.send(ref, brief_for(issue.key))
     except linear.LinearError as exc:
