@@ -142,17 +142,10 @@ def _record(issue: Issue) -> dict[str, str]:
 def brief_for(key: str) -> str:
     """The opening message an agent is given for issue ``key``.
 
-    Names the skill outright rather than trusting the harness to surface it:
-    the lifecycle foregent expects — how to report blocked, when to call
-    `complete_task` — lives there, and an agent that never loads it will do
-    the work and then simply stop, telling foregent nothing.
+    Invoking the skill by name leaves the lifecycle in one place — the skill —
+    instead of half-restating it here, where the two would drift.
     """
-    return (
-        f"You are assigned Linear issue {key}. "
-        "Use the foregent-worker skill, which describes how foregent expects "
-        "you to work an issue, then read the issue via the Linear MCP and "
-        "drive it to completion."
-    )
+    return f"/foregent-worker {key}"
 
 
 def agent_mcp_servers() -> dict[str, dict]:
