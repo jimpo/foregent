@@ -1,6 +1,6 @@
 ---
 name: foregent-worker
-description: "How to work a Linear issue as a foregent agent — the lifecycle foregent expects of you, from reading your assignment to landing the change and reporting done. Activate when your opening message assigns you a Linear issue, or when you need to report yourself blocked or complete. Covers the foregent MCP lifecycle tools, bootstrap vs full mode, and the linear-history rule."
+description: "How to work a Linear issue as a foregent agent — the lifecycle foregent expects of you, from reading your assignment to landing the change and reporting done. Activate when your opening message assigns you a Linear issue, or when you need to report yourself blocked or complete. Covers the foregent MCP lifecycle tools, bootstrap vs GitHub mode, and the linear-history rule."
 ---
 
 # Working an issue for foregent
@@ -28,6 +28,10 @@ middle. Anything you meant to do afterwards will not happen.
 
 ## The lifecycle
 
+0. **Read `FOREGENT.md`** at the root of your workspace, if it is there. It is
+   the project's own rules — which labels mean what, how it wants work scoped —
+   and it wins over this skill wherever the two differ. No such file means no
+   project-specific rules.
 1. **Read the issue** through the Linear MCP. Establish what "done" means from
    its description and acceptance criteria before touching code. If the issue
    is ambiguous, decide the most reasonable reading and say so in a Linear
@@ -51,7 +55,7 @@ finishing.
 no pull request. Rebase onto `main`, fast-forward `main` locally, and you are
 done.
 
-**Full mode**: push a branch and open a PR through the GitHub MCP, then report
+**GitHub mode**: push a branch and open a PR through the GitHub MCP, then report
 yourself blocked on the review (`pr-review:<repo>#<number>`) rather than
 waiting.
 
@@ -60,7 +64,7 @@ If nothing tells you which mode you are in, assume bootstrap.
 ### History is linear, always
 
 Rebase; never merge. Every project foregent manages requires linear history —
-bootstrap mode exists to produce history clean enough to graduate to full mode
+bootstrap mode exists to produce history clean enough to graduate to GitHub mode
 later, and a merge commit spoils that.
 
 Version control is Jujutsu (`jj`), colocated with git. In a `jj` repo, drive it
@@ -87,7 +91,8 @@ over costs everything you have worked out so far.
 
 If you are blocked in a way no event will ever resolve — the issue is
 incoherent, or the work is impossible as specified — say so in a Linear comment
-and report blocked on `human:` with the reason. Do not close the issue.
+and report blocked on `human:` with the reason. Do not close an issue you are
+merely stuck on; that is a decision for the person who filed it.
 
 ## Working in the foregent repo
 
