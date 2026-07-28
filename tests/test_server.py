@@ -124,6 +124,9 @@ class DispatchTests(unittest.TestCase):
         server.dispatch()
         ref, text = self.manager.sent[0]
         self.assertIn("JIM-88", text)
+        # The brief names the skill outright: an agent that never loads it
+        # does the work and then stops, telling foregent nothing.
+        self.assertIn("foregent-worker", text)
         issue = server.store.get("JIM-88")
         assert issue is not None and issue.agent is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
