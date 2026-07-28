@@ -8,6 +8,7 @@ A thin client over the foregent API server (:mod:`foregent.server`). The
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -171,6 +172,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
+def serve_log_config() -> dict:
+    """uvicorn's logging config, extended to carry foregent's own records.
+
+    uvicorn configures only its own loggers, so without this everything the
+    bridge logs below WARNING — which session it resolved, which skills it
+    installed, which agent it adopted — reaches no handler and is dropped.
+    Passed to `uvicorn.run` rather than set up here, because `--dev` runs the
+    server in a reloader subprocess that configures logging from this config
+    alone.
+    """
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config["root"] = {"handlers": ["default"], "level": "INFO"}
+    return config
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the API server on the host/port from the configured API URL."""
     import uvicorn
@@ -181,6 +199,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         host=url.hostname or "127.0.0.1",
         port=url.port or 8577,
         reload=args.dev,
+        log_config=serve_log_config(),
     )
     return 0
 
