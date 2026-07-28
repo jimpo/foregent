@@ -16,7 +16,7 @@ from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 from unittest import mock
 
-from foregent import server
+from foregent import herdr, server
 from foregent.agents import (
     AgentError,
     AgentEvent,
@@ -247,6 +247,25 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(
             [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
         )
+
+
+class CheckHerdrProtocolTests(unittest.TestCase):
+    """Refusing to start on a herdr protocol drift (docs/PLAN.md §5.8)."""
+
+    def check(self, client: mock.Mock) -> None:
+        with mock.patch.object(server.herdr, "HerdrClient", return_value=client):
+            server.check_herdr_protocol()
+
+    def test_a_matching_protocol_does_not_raise(self) -> None:
+        client = mock.Mock()
+        self.check(client)
+        client.check_protocol.assert_called_once()
+
+    def test_a_protocol_drift_stops_startup(self) -> None:
+        client = mock.Mock()
+        client.check_protocol.side_effect = herdr.HerdrError("drift")
+        with self.assertRaises(herdr.HerdrError):
+            self.check(client)
 
 
 class RebuildStoreTests(unittest.TestCase):

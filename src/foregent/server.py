@@ -22,7 +22,7 @@ from fastapi import Body, FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import config, linear, skills
+from foregent import config, herdr, linear, skills
 from foregent.agents import (
     AgentError,
     AgentEventKind,
@@ -49,6 +49,7 @@ async def lifespan(_app: FastAPI):
     # so say it once at startup: everything after this — dispatch, recovery,
     # the operator's `herdr --session` — depends on it being the intended one.
     logger.info("running agents in %s", manager.describe())
+    await run_in_threadpool(check_herdr_protocol)
     await run_in_threadpool(rebuild_store)
     watch_agents()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
@@ -70,6 +71,19 @@ store = IssueStore()
 # The harness foregent runs agents on. One process-wide manager, swapped
 # wholesale to change harness (docs/PLAN.md §5.13).
 manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
+
+
+def check_herdr_protocol() -> None:
+    """Refuse to start if herdr speaks a different protocol (docs/PLAN.md §5.8).
+
+    herdr is a hard dependency (§7): every later call assumes the protocol
+    this client was built against, so a drift raises here and stops the
+    bridge outright instead of surfacing as a mystery error mid-dispatch.
+    Talks to herdr directly rather than through ``manager`` — the dispatch
+    path is harness-agnostic (§5.13), but this check is inherently herdr-
+    specific.
+    """
+    herdr.HerdrClient(session=config.herdr_session()).check_protocol()
 
 
 def rebuild_store() -> None:
