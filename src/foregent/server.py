@@ -327,6 +327,38 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
     return _record(issue)
 
 
+@app.post("/issues/{key}/wake")
+def wake_issue(key: str, message: Annotated[str, Body(embed=True)]) -> dict[str, str]:
+    """Deliver ``message`` to issue ``key``'s parked agent and unblock it.
+
+    The counterpart to :func:`block_issue` (docs/PLAN.md §5.6): the event the
+    agent parked on has arrived, its process never died, and prompting it is
+    the whole of waking it up. Capacity does not change and nothing is
+    dispatched — the agent held its slot for the duration of the block.
+
+    409 if the issue is not parked. That covers two cases: it is not BLOCKED
+    at all, and it is BLOCKED with no agent recorded — ``block()`` upserts an
+    unknown key, so an issue can carry a blocker with nothing to prompt.
+
+    **Sends first, unblocks second**, so a harness failure leaves the issue
+    BLOCKED with no rollback path to get wrong and a retry is safe. It is
+    also the truthful order: an agent that has not received the message is
+    not awake yet, and ``send`` can sit waiting for the harness for a while
+    before it lands.
+    """
+    issue = store.get(key)
+    if issue is None or issue.status is not IssueStatus.BLOCKED:
+        status = issue.status if issue is not None else "not tracked"
+        raise HTTPException(status_code=409, detail=f"{key} is {status}, not blocked")
+    if issue.agent is None:
+        raise HTTPException(status_code=409, detail=f"{key} has no agent to wake")
+    try:
+        manager.send(issue.agent, message)
+    except AgentError as exc:
+        raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
+    return _record(store.unblock(key) or issue)
+
+
 @mcp.tool()
 async def complete_task(issue_key: str) -> str:
     """Record ``issue_key`` as Done and shut down its agent."""

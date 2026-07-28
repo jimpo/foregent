@@ -84,6 +84,26 @@ class IssueStore:
         self._issues[key] = issue
         return issue
 
+    def unblock(self, key: str) -> Issue | None:
+        """Return issue ``key`` to In Progress, clearing its blocker.
+
+        The counterpart to :meth:`block`: the event the agent was parked on
+        has arrived, and its still-live process is about to be prompted with
+        it (docs/PLAN.md §5.6). Capacity does not change, because a parked
+        agent was holding its slot the whole time.
+
+        Only a BLOCKED issue can be unblocked; everything else returns
+        ``None`` and is left alone, in the shape of :meth:`orphan`'s guard.
+        Waking an issue that was never parked is not a state to correct — it
+        is a message with nowhere to go, and the caller answers for it.
+        """
+        existing = self._issues.get(key)
+        if existing is None or existing.status is not IssueStatus.BLOCKED:
+            return None
+        issue = replace(existing, status=IssueStatus.IN_PROGRESS, blocker="")
+        self._issues[key] = issue
+        return issue
+
     def orphan(self, key: str) -> Issue | None:
         """Mark issue ``key`` Orphaned; its agent is gone (docs/PLAN.md §5.12).
 

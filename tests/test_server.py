@@ -261,6 +261,80 @@ class DispatchTests(unittest.TestCase):
         )
 
 
+class WakeTests(unittest.TestCase):
+    """Prompting a parked agent with the event that resolved it (JIM-101)."""
+
+    def setUp(self) -> None:
+        server.store = IssueStore()
+        self.manager = FakeManager()
+        patcher = mock.patch.object(server, "manager", self.manager)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.ref = AgentRef("fg-jim-88", "conversation-1")
+
+    def park(self, blocker: str = "human:design-review") -> None:
+        server.store.add(
+            Issue(
+                key="JIM-88",
+                title="",
+                status=IssueStatus.BLOCKED,
+                blocker=blocker,
+                agent=self.ref,
+            )
+        )
+
+    def test_waking_sends_the_message_and_resumes_the_issue(self) -> None:
+        self.park()
+        record = server.wake_issue("JIM-88", "AJ commented: ship it")
+        self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
+        self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
+        self.assertEqual(record["blocker"], "")
+
+    def test_waking_does_not_dispatch_anything_else(self) -> None:
+        # The woken agent held its capacity slot the whole time it was parked
+        # (docs/PLAN.md §5.6), so waking it frees nothing.
+        self.park()
+        server.store.queue("JIM-89", "/ws/JIM-89")
+        server.wake_issue("JIM-88", "go on")
+        self.assertEqual(self.manager.launched, [])
+
+    def test_waking_an_issue_that_is_not_blocked_is_a_conflict(self) -> None:
+        server.store.add(
+            Issue(key="JIM-88", title="", status=IssueStatus.IN_PROGRESS, agent=self.ref)
+        )
+        with self.assertRaises(server.HTTPException) as caught:
+            server.wake_issue("JIM-88", "go on")
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_waking_an_untracked_issue_is_a_conflict(self) -> None:
+        with self.assertRaises(server.HTTPException) as caught:
+            server.wake_issue("JIM-88", "go on")
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_waking_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
+        # `block()` upserts an unknown key, so an issue can carry a blocker
+        # with nothing to prompt.
+        server.store.block("JIM-88", "human:design-review")
+        with self.assertRaises(server.HTTPException) as caught:
+            server.wake_issue("JIM-88", "go on")
+        self.assertEqual(caught.exception.status_code, 409)
+
+    def test_a_harness_failure_leaves_the_issue_blocked(self) -> None:
+        # So a retry is safe: nothing was delivered, and the blocker is still
+        # recorded to match the next event against.
+        self.park()
+        self.manager.fail_send = AgentError("prompt never landed")
+        with self.assertRaises(server.HTTPException) as caught:
+            server.wake_issue("JIM-88", "go on")
+        self.assertEqual(caught.exception.status_code, 502)
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.BLOCKED)
+        self.assertEqual(issue.blocker, "human:design-review")
+
+
 class CheckHerdrProtocolTests(unittest.TestCase):
     """Refusing to start on a herdr protocol drift (docs/PLAN.md §5.8)."""
 

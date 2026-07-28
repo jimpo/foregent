@@ -223,7 +223,14 @@ cares.
   herdr reports it as `idle` (or `blocked` if it is sitting on a prompt).
 - Wake on matching webhook: the bridge delivers the resolving event with
   `AgentManager.send()`. Context is intact because the process never died and
-  the workspace was never released.
+  the workspace was never released. Capacity does not change either — the
+  parked agent was holding its slot the whole time.
+- `POST /issues/{key}/wake` is the seam ingestion will call, and is drivable
+  with `curl` on its own. It **sends before it unblocks**, so a harness
+  failure leaves the issue BLOCKED with no rollback path to get wrong and a
+  retry is safe — and because an agent that has not received the message is
+  not awake yet. A blocked issue with no agent recorded is a 409, like one
+  that was never parked.
 - Cold parking (terminate on block, `--resume` on wake) is technically viable
   since resume works, but instant wake and a guaranteed-intact context beat the
   memory savings for a small fleet. Resume is for *recovery* (§5.12), not
