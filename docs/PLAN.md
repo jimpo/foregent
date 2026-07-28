@@ -217,8 +217,8 @@ cares.
 
 ### 5.6 Blocked tracking + park-alive
 - Agent hits an external dependency → calls foregent MCP `report_blocked`
-  with a typed blocker (`pr-review:binius64#123`, `issue-update:BIN-42`) →
-  bridge records the blocker. **The agent stays alive and idle in its
+  with a plain-language blocker (`a review of the PR`) → bridge records it.
+  **The agent stays alive and idle in its
   workspace** — nothing is terminated, no context is captured or replayed.
   herdr reports it as `idle` (or `blocked` if it is sitting on a prompt).
 - Wake on matching webhook: the bridge delivers the resolving event with
@@ -398,7 +398,7 @@ cares.
   parses the issue key out of each name, and reconstructs every live binding
   (including parked-alive agents).
 - **Durable per-issue metadata ← Linear.** The facts that must outlive a
-  process (**Claude Code conversation id**, workspace path, typed blocker,
+  process (**Claude Code conversation id**, workspace path, blocker,
   stage, project mode) live in a Linear **Attachment `metadata`** JSON blob,
   one per issue, upserted by a stable synthetic url `foregent://issue/<KEY>`
   (`attachmentCreate` updates in place on url match). Linear has no custom

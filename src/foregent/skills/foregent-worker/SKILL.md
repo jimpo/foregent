@@ -56,8 +56,9 @@ no pull request. Rebase onto `main`, fast-forward `main` locally, and you are
 done.
 
 **GitHub mode**: push a branch and open a PR through the GitHub MCP, then report
-yourself blocked on the review (`pr-review:<repo>#<number>`) rather than
-waiting.
+yourself blocked on the review rather than waiting. Push the branch Linear
+names on the issue, so the PR is linked to it and foregent can find you when
+the review lands.
 
 If nothing tells you which mode you are in, assume bootstrap.
 
@@ -77,21 +78,28 @@ Blocked means something outside your workspace has to change first: a PR needs
 review, another issue must land, a credential is missing. It does not mean the
 work is hard.
 
-Call `report_blocked` with a **typed** blocker so foregent can match the event
-that resolves it:
-
-- `pr-review:binius64#123` — waiting on a review of that PR
-- `issue-update:BIN-42` — waiting on another issue
-- `human:<what you need>` — waiting on a person
+Call `report_blocked` with a short plain-language blocker — what you are
+waiting for, in your own words (`a review of the PR`, `the API key for
+staging`). It is read by the operator watching your issue, not parsed, so
+write it for a person.
 
 Then stop and wait. **Do not poll, do not busy-wait, do not exit.** You stay
 alive in this workspace with everything you have learned, and foregent prompts
-you with the resolving event when it arrives. Waiting costs nothing; starting
-over costs everything you have worked out so far.
+you when something happens. Waiting costs nothing; starting over costs
+everything you have worked out so far.
+
+What wakes you is activity on **your own issue**: a comment or reply on it, or
+a review, comment, or new conflict with `main` on the pull request linked to
+it. Foregent finds that pull request itself — Linear links it off your branch
+name — so you never have to report which PR is yours.
+
+The corollary: nothing that happens on a *different* issue will ever wake you.
+If you are waiting on another ticket to land, say so in a comment on your own
+issue so the operator knows to nudge you when it does.
 
 If you are blocked in a way no event will ever resolve — the issue is
 incoherent, or the work is impossible as specified — say so in a Linear comment
-and report blocked on `human:` with the reason. Do not close an issue you are
+and report blocked with that reason. Do not close an issue you are
 merely stuck on; that is a decision for the person who filed it.
 
 ## Working in the foregent repo

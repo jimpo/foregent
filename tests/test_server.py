@@ -246,7 +246,7 @@ class DispatchTests(unittest.TestCase):
         # it must keep occupying capacity.
         self.queue()
         server.dispatch()
-        server.store.block("JIM-88", "pr-review:foregent#1")
+        server.store.block("JIM-88", "a review of the PR")
         self.queue("JIM-89", "/ws/JIM-89")
         server.dispatch()
         self.assertEqual(len(self.manager.launched), 1)
@@ -272,7 +272,7 @@ class WakeTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.ref = AgentRef("fg-jim-88", "conversation-1")
 
-    def park(self, blocker: str = "human:design-review") -> None:
+    def park(self, blocker: str = "a review of the PR") -> None:
         server.store.add(
             Issue(
                 key="JIM-88",
@@ -316,7 +316,7 @@ class WakeTests(unittest.TestCase):
     def test_waking_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
         # `block()` upserts an unknown key, so an issue can carry a blocker
         # with nothing to prompt.
-        server.store.block("JIM-88", "human:design-review")
+        server.store.block("JIM-88", "a review of the PR")
         with self.assertRaises(server.HTTPException) as caught:
             server.wake_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
@@ -332,7 +332,7 @@ class WakeTests(unittest.TestCase):
         issue = server.store.get("JIM-88")
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.BLOCKED)
-        self.assertEqual(issue.blocker, "human:design-review")
+        self.assertEqual(issue.blocker, "a review of the PR")
 
 
 class CheckHerdrProtocolTests(unittest.TestCase):
