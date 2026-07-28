@@ -27,6 +27,9 @@ from foregent.agents import (
 class StubManager:
     """The smallest thing that claims to be an AgentManager."""
 
+    def describe(self) -> str:
+        return "a stub harness"
+
     def launch(self, spec: LaunchSpec) -> AgentRef:
         return AgentRef(spec.label, spec.conversation_id)
 

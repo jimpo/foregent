@@ -157,6 +157,15 @@ class AgentEvent:
 class AgentManager(Protocol):
     """Drives one agent harness on behalf of the bridge."""
 
+    def describe(self) -> str:
+        """One line naming where this manager runs agents, for the log.
+
+        Every harness is pointed at something — a session, a socket, a
+        service — and which one can depend on how the bridge was started, so
+        it is stated at startup rather than left to be inferred from an error.
+        """
+        ...
+
     def launch(self, spec: LaunchSpec) -> AgentRef:
         """Start an agent for ``spec`` and return its ref, ready for input."""
         ...

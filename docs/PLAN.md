@@ -299,6 +299,18 @@ cares.
 ### 5.10 Observability
 - One named herdr session (`foregent`) per box, run headless as a systemd user
   unit; its socket lives at `~/.config/herdr/sessions/foregent/herdr.sock`.
+- **Which session the bridge drives is resolved, not compiled in**:
+  `FOREGENT_HERDR_SESSION` first, then the session the bridge process is
+  itself running in (herdr injects `HERDR_SOCKET_PATH` into every pane it
+  owns, so this is herdr's own signal rather than an inference), then herdr's
+  default session. The order is what keeps deployment deterministic: the
+  systemd unit runs outside any pane, so it **must set the variable** or it
+  would land in the default session — the operator's interactive one — rather
+  than the dedicated session that exists to be attached to read-only. A dev
+  box sets nothing and reaches whichever session its shell already lives in.
+  An inherited socket path that is dead fails loudly instead of falling back;
+  talking to a different session than the environment names is the worse
+  outcome. Startup logs the session and socket it resolved to.
 - Observe by attaching: `herdr --session foregent` over SSH, or
   `herdr --remote <ssh-target> --session foregent` straight from a laptop.
   Attaching is read-only by convention; never interact.

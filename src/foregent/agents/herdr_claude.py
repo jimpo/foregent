@@ -155,7 +155,14 @@ class HerdrClaudeManager:
         *,
         session: str | None = None,
     ) -> None:
+        # ``session=None`` is not "no session": it hands the choice to the
+        # client, which reads the one herdr put in this process's environment
+        # and otherwise takes the default session.
         self.client = client or herdr.HerdrClient(session=session)
+
+    def describe(self) -> str:
+        """Which herdr session agents run in, and the socket it resolved to."""
+        return self.client.describe()
 
     def launch(self, spec: LaunchSpec) -> AgentRef:
         """Open a workspace at ``spec.cwd`` and start an agent in it.

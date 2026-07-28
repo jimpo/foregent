@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 
 DEFAULT_API_URL = "http://127.0.0.1:8577"
-DEFAULT_HERDR_SESSION = "foregent"
 
 
 def api_url() -> str:
@@ -18,11 +17,21 @@ def api_url() -> str:
     return os.environ.get("FOREGENT_API_URL", DEFAULT_API_URL)
 
 
-def herdr_session() -> str:
-    """Name of the herdr session foregent runs its agents in.
+def herdr_session() -> str | None:
+    """Name of the herdr session foregent runs its agents in, if pinned.
 
-    One named session per box, run headless as a systemd unit and attached to
-    for observation (``docs/PLAN.md`` §5.10). Overridable so a test or a
-    second instance never touches it.
+    ``FOREGENT_HERDR_SESSION`` names one outright; ``None`` hands the choice
+    to the client, which then takes the session this process was started in —
+    herdr injects ``HERDR_SOCKET_PATH`` into every pane it owns, so a bridge
+    launched from a pane inherits its own session — and falls back to herdr's
+    default session (:func:`foregent.herdr.socket_path`).
+
+    Deployment pins it, and the ordering is why. The systemd unit runs outside
+    any herdr pane, so with only the fallbacks it would land in the *default*
+    session, putting foregent's agents in the operator's interactive one
+    instead of the dedicated session that exists to be attached to read-only
+    (``docs/PLAN.md`` §5.10). A dev box sets nothing and works anyway.
     """
-    return os.environ.get("FOREGENT_HERDR_SESSION", DEFAULT_HERDR_SESSION)
+    # Empty means unset: an exported-but-blank variable is not a session name,
+    # and treating it as one asks herdr for a socket nobody chose.
+    return os.environ.get("FOREGENT_HERDR_SESSION") or None

@@ -45,6 +45,9 @@ class FakeManager:
         # to have finished by then rather than merely around then.
         self.at_launch: Callable[[], None] | None = None
 
+    def describe(self) -> str:
+        return "a fake harness"
+
     def launch(self, spec: LaunchSpec) -> AgentRef:
         if self.at_launch:
             self.at_launch()

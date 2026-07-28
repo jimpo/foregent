@@ -64,6 +64,11 @@ def socket_path(session: str | None = None) -> str:
     then ``HERDR_SOCKET_PATH``, then ``HERDR_SESSION``, then the default
     session. The env vars matter because herdr injects them into every pane
     it owns, so an agent-side caller inherits the right socket for free.
+
+    A ``HERDR_SOCKET_PATH`` pointing at a dead socket is returned as-is rather
+    than falling back: connecting then fails naming that path, which says what
+    is wrong, where quietly talking to a *different* session than the
+    environment claims would not.
     """
     if session is None:
         explicit = os.environ.get("HERDR_SOCKET_PATH")
@@ -73,6 +78,20 @@ def socket_path(session: str | None = None) -> str:
     if not session or session == "default":
         return str(CONFIG_DIR / "herdr.sock")
     return str(CONFIG_DIR / "sessions" / session / "herdr.sock")
+
+
+def describe_session(session: str | None, path: str) -> str:
+    """One line naming the session and socket a client resolved to.
+
+    Which herdr foregent talks to depends on how its process was started, so
+    startup says which session it landed on outright — otherwise an operator
+    infers it from a socket path in whatever error comes later.
+    """
+    if session:
+        return f"herdr session {session!r} at {path}"
+    if os.environ.get("HERDR_SOCKET_PATH") or os.environ.get("HERDR_SESSION"):
+        return f"the herdr session this process runs in, at {path}"
+    return f"herdr's default session at {path}"
 
 
 def timeout_for_wait(timeout_ms: int | None) -> float:
@@ -110,7 +129,16 @@ class HerdrClient:
     """
 
     def __init__(self, session: str | None = None, path: str | None = None) -> None:
+        self.session = session
         self.path = path or socket_path(session)
+
+    def describe(self) -> str:
+        """One line naming the session and socket this client resolved to.
+
+        Kept here because this is where both facts are known: a caller that
+        passed no session cannot otherwise say which one it ended up on.
+        """
+        return describe_session(self.session, self.path)
 
     def connect(self, timeout: float = TIMEOUT) -> socket.socket:
         """Open a connection to the server, for callers that hold it open."""

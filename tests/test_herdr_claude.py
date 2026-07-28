@@ -8,6 +8,7 @@ is covered by ``ManagerIntegrationTests`` in ``tests.test_herdr_integration``.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from itertools import islice
 from collections.abc import Callable, Iterator
@@ -88,6 +89,9 @@ class FakeClient:
         # A canned event stream; a None entry stands for a quiet tick.
         self.stream: list[dict | None] = []
 
+    def describe(self) -> str:
+        return "a fake herdr"
+
     def call(self, method: str, params: dict | None = None, **kwargs) -> dict:
         self.calls.append((method, params or {}))
         if method in self.errors:
@@ -115,6 +119,41 @@ class FakeClient:
 
 def manager(client: FakeClient) -> HerdrClaudeManager:
     return HerdrClaudeManager(client)  # ty: ignore[invalid-argument-type]
+
+
+class SessionTests(unittest.TestCase):
+    """Which herdr the manager talks to, given what it was constructed with."""
+
+    def test_a_named_session_gets_that_sessions_socket(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": "/tmp/other.sock"}, clear=True
+        ):
+            client = HerdrClaudeManager(session="foregent").client
+        self.assertEqual(
+            client.path,
+            str(herdr.CONFIG_DIR / "sessions" / "foregent" / "herdr.sock"),
+        )
+
+    def test_no_session_means_the_one_this_process_runs_in(self) -> None:
+        # herdr injects HERDR_SOCKET_PATH into every pane it owns, so a bridge
+        # started from a pane finds its own session without being told.
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": "/tmp/inherited.sock"}, clear=True
+        ):
+            runner = HerdrClaudeManager()
+            self.assertEqual(runner.client.path, "/tmp/inherited.sock")
+            self.assertIn("this process runs in", runner.describe())
+
+    def test_nothing_at_all_falls_back_to_the_default_session(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            runner = HerdrClaudeManager()
+            self.assertEqual(runner.client.path, str(herdr.CONFIG_DIR / "herdr.sock"))
+            self.assertIn("default", runner.describe())
+
+    def test_the_description_comes_from_the_client(self) -> None:
+        # The client resolved the socket, so it is the only thing that can say
+        # which session that was.
+        self.assertEqual(manager(FakeClient()).describe(), "a fake herdr")
 
 
 class RenderArgsTests(unittest.TestCase):

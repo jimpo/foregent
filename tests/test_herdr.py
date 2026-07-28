@@ -117,6 +117,44 @@ class SocketPathTests(unittest.TestCase):
         client = herdr.HerdrClient(session="foregent", path="/tmp/given.sock")
         self.assertEqual(client.path, "/tmp/given.sock")
 
+    def test_a_stale_inherited_path_is_not_swapped_for_the_default(self) -> None:
+        # Failing to connect names the socket the environment asked for;
+        # falling back would silently talk to a different session.
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": "/tmp/nonexistent.sock"}, clear=True
+        ):
+            self.assertEqual(herdr.socket_path(), "/tmp/nonexistent.sock")
+
+
+class DescribeSessionTests(unittest.TestCase):
+    """The startup line, which says which of the three rules fired."""
+
+    def test_a_named_session_is_named(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            described = herdr.describe_session("foregent", "/sock")
+        self.assertIn("foregent", described)
+        self.assertIn("/sock", described)
+
+    def test_an_inherited_session_says_so(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"HERDR_SOCKET_PATH": "/inherited.sock"}, clear=True
+        ):
+            described = herdr.describe_session(None, "/inherited.sock")
+        self.assertIn("this process runs in", described)
+        self.assertIn("/inherited.sock", described)
+
+    def test_the_default_session_is_called_out(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            described = herdr.describe_session(None, "/default.sock")
+        self.assertIn("default", described)
+        self.assertIn("/default.sock", described)
+
+    def test_a_client_describes_what_it_resolved(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            client = herdr.HerdrClient(session="foregent")
+        self.assertIn("foregent", client.describe())
+        self.assertIn(client.path, client.describe())
+
 
 class WaitTimeoutTests(unittest.TestCase):
     def test_wait_budget_exceeds_the_server_side_wait(self) -> None:

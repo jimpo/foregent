@@ -45,6 +45,10 @@ mcp = FastMCP("foregent", stateless_http=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # Where agents will run is now resolved, not fixed (docs/PLAN.md §5.10),
+    # so say it once at startup: everything after this — dispatch, recovery,
+    # the operator's `herdr --session` — depends on it being the intended one.
+    logger.info("running agents in %s", manager.describe())
     await run_in_threadpool(rebuild_store)
     watch_agents()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
