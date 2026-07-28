@@ -134,13 +134,12 @@ def render_args(spec: LaunchSpec) -> list[str]:
     if spec.tools_deny:
         argv += ["--disallowedTools", *spec.tools_deny]
     if spec.mcp_servers:
-        # --strict-mcp-config keeps the box's global MCP config out of the
-        # agent, so what foregent declares is exactly what the agent gets.
-        argv += [
-            "--mcp-config",
-            json.dumps({"mcpServers": dict(spec.mcp_servers)}),
-            "--strict-mcp-config",
-        ]
+        argv += ["--mcp-config", json.dumps({"mcpServers": dict(spec.mcp_servers)})]
+    if spec.strict_mcp:
+        # Independent of the declaration above: this one says to ignore
+        # whatever MCP config the machine already has, so what foregent
+        # declares is exactly what the agent gets.
+        argv += ["--strict-mcp-config"]
     # Display name in the TUI, /resume picker and terminal title — what an
     # attached operator reads to tell agents apart.
     argv += ["-n", spec.label]

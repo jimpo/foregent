@@ -100,6 +100,11 @@ class LaunchSpec:
     tools_allow: tuple[str, ...] = ()
     tools_deny: tuple[str, ...] = ()
     mcp_servers: Mapping[str, Mapping] = field(default_factory=dict)
+    # Whether the agent may use only the MCP servers declared above, ignoring
+    # whatever the machine is configured with. Off by default, and separate
+    # from `mcp_servers` on purpose: foregent can add its own tools without
+    # yet having to supply everything else an agent needs.
+    strict_mcp: bool = False
     # Foregent-generated, so it is recorded before the process exists and a
     # crash between launch and first checkpoint is still recoverable.
     conversation_id: str | None = None

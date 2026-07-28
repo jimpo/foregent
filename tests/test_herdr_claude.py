@@ -137,16 +137,27 @@ class RenderArgsTests(unittest.TestCase):
         args = render_args(spec())
         self.assertEqual(args[args.index("--permission-mode") + 1], "bypassPermissions")
 
-    def test_mcp_servers_are_declared_strictly(self) -> None:
+    def test_mcp_servers_are_declared(self) -> None:
         args = render_args(spec(mcp_servers={"foregent": {"type": "http"}}))
-        # Strict mode is what keeps the box's global MCP config out of the
-        # agent, so it must accompany every --mcp-config.
-        self.assertIn("--strict-mcp-config", args)
-        config = json.loads(args[args.index("--mcp-config") + 1])
-        self.assertEqual(config, {"mcpServers": {"foregent": {"type": "http"}}})
+        declared = json.loads(args[args.index("--mcp-config") + 1])
+        self.assertEqual(declared, {"mcpServers": {"foregent": {"type": "http"}}})
 
-    def test_no_mcp_servers_means_no_strict_flag(self) -> None:
-        self.assertNotIn("--strict-mcp-config", render_args(spec()))
+    def test_declaring_servers_does_not_exclude_the_machines_own(self) -> None:
+        # The two flags are independent: foregent can add its own tools
+        # without also having to supply everything else the agent needs.
+        args = render_args(spec(mcp_servers={"foregent": {"type": "http"}}))
+        self.assertNotIn("--strict-mcp-config", args)
+
+    def test_strict_mode_is_asked_for_explicitly(self) -> None:
+        args = render_args(
+            spec(mcp_servers={"foregent": {"type": "http"}}, strict_mcp=True)
+        )
+        self.assertIn("--strict-mcp-config", args)
+
+    def test_no_mcp_servers_means_no_mcp_config(self) -> None:
+        args = render_args(spec())
+        self.assertNotIn("--mcp-config", args)
+        self.assertNotIn("--strict-mcp-config", args)
 
     def test_optional_fields_are_omitted_when_unset(self) -> None:
         args = render_args(spec())
