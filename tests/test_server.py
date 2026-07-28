@@ -142,9 +142,10 @@ class DispatchTests(unittest.TestCase):
         self.assertTrue(spec.mcp_servers["foregent"]["url"].endswith("/mcp"))
 
     def test_dispatch_leaves_the_machines_mcp_config_in_place(self) -> None:
-        # Agents still reach Linear through the machine's own configuration;
-        # excluding it before declaring Linear explicitly (JIM-93) would cut
-        # them off from the issue tracker entirely.
+        # Agents reach Linear and GitHub through the machine's own
+        # configuration, which `foregent setup` provisions (JIM-93). Strict
+        # mode would cut them off from the issue tracker entirely, and would
+        # buy nothing the box does not already give the operator's sessions.
         self.queue()
         server.dispatch()
         self.assertFalse(self.manager.launched[0].strict_mcp)
@@ -277,6 +278,41 @@ class CheckHerdrProtocolTests(unittest.TestCase):
         client.check_protocol.side_effect = herdr.HerdrError("drift")
         with self.assertRaises(herdr.HerdrError):
             self.check(client)
+
+
+class CheckAgentMCPTests(unittest.TestCase):
+    """Saying at startup that agents will have no issue tracker (JIM-93)."""
+
+    def test_an_unprovisioned_box_is_warned_about(self) -> None:
+        with mock.patch.object(server.mcp_servers, "configured", return_value=set()):
+            with mock.patch.dict(
+                os.environ, {"LINEAR_API_KEY": "k", "GITHUB_TOKEN": "t"}
+            ):
+                with self.assertLogs(server.logger, "WARNING") as logs:
+                    server.check_agent_mcp()
+        self.assertIn("foregent setup", "".join(logs.output))
+
+    def test_a_configured_server_with_no_credential_is_warned_about(self) -> None:
+        # Configured but unauthenticated: the agent launches, then discovers
+        # mid-issue that it cannot read Linear.
+        with mock.patch.object(
+            server.mcp_servers, "configured", return_value={"linear", "github"}
+        ):
+            with mock.patch.dict(os.environ, {"LINEAR_API_KEY": "k"}):
+                os.environ.pop("GITHUB_TOKEN", None)
+                with self.assertLogs(server.logger, "WARNING") as logs:
+                    server.check_agent_mcp()
+        self.assertIn("GITHUB_TOKEN", "".join(logs.output))
+
+    def test_a_provisioned_box_says_nothing(self) -> None:
+        with mock.patch.object(
+            server.mcp_servers, "configured", return_value={"linear", "github"}
+        ):
+            with mock.patch.dict(
+                os.environ, {"LINEAR_API_KEY": "k", "GITHUB_TOKEN": "t"}
+            ):
+                with self.assertNoLogs(server.logger, "WARNING"):
+                    server.check_agent_mcp()
 
 
 class RebuildStoreTests(unittest.TestCase):

@@ -166,14 +166,29 @@ cares.
   `--mcp-config` + `--strict-mcp-config`, `--allowedTools` /
   `--disallowedTools`, `--settings`, `--add-dir`, `--session-id`,
   `-n <display name>`, plus cwd and env.
-- **MCP set:** foregent (lifecycle tools), Linear, GitHub. Declaring servers
-  and excluding the machine's own configuration are separate decisions:
-  `--mcp-config` adds foregent's tools, and `--strict-mcp-config` is what stops
-  the box's global plugin config from drifting into an agent. The destination
-  is strict, so an agent's reach is a property of its launch spec rather than
-  of the machine — but strict can only be turned on once Linear and GitHub are
-  declared explicitly, with their own credentials. Until then agents carry
-  foregent's server and inherit the rest.
+- **MCP set:** foregent (lifecycle tools), Linear, GitHub — but split by
+  lifetime, not bundled. Foregent's own server is per-run (its URL is this
+  bridge's), so it is declared in the launch spec via `--mcp-config`. Linear
+  and GitHub are per-machine, so they are provisioned once into the box's
+  user-level Claude Code config by `foregent setup` (§5.8) and inherited.
+  `--strict-mcp-config` stays **off** (decided 2026-07-28, JIM-93).
+  - Rejected: declaring Linear/GitHub in the launch spec under strict mode.
+    It would have made an agent's reach a property of its launch spec rather
+    than of the machine, which is the stronger isolation story — but on a
+    one-project-per-box design the machine *is* the boundary, and strict mode
+    buys that isolation by breaking the operator: hand-launched sessions
+    (§5.10, the whole phase-1 workflow) would keep needing a separate manual
+    `claude mcp add`, configured twice and drifting apart. One provisioned
+    config serving agents and operator alike is the simpler invariant.
+  - The cost accepted: an unprovisioned box dispatches agents that cannot read
+    their own issue. Mitigated by `foregent setup` being the one installer for
+    both halves, and by the bridge warning at startup when the servers or
+    their credentials are absent rather than discovering it mid-issue.
+  - Credentials are never written to disk: the stored header is the literal
+    `${LINEAR_API_KEY}` / `${GITHUB_TOKEN}`, expanded per session by Claude
+    Code from the herdr server's env (§5.8). Revisit strict mode if a box ever
+    hosts more than one project, or if agent and operator need different
+    identities.
 - Project-specific variants (e.g. a binius agent with a cryptography skill and
   a different model) are a different launch spec plus different skills.
 
@@ -270,9 +285,18 @@ cares.
   it. And **concurrent dispatches race**, so each file is staged in its
   destination directory and renamed into place — an agent never loads a
   half-written `SKILL.md`.
-- Knowing that skills live in `~/.claude/skills/` is a Claude Code detail
-  leaking through the `AgentManager` seam (§5.13). Accepted while there is one
-  harness; a second one makes the ensure step a manager method.
+- **`foregent setup` also provisions the shared MCP servers** (`foregent/
+  mcp_servers.py`, JIM-93): Linear and GitHub, at Claude Code's *user* scope —
+  the only scope that applies in a fresh per-issue workspace. Written through
+  `claude mcp add-json -s user` rather than by editing `~/.claude.json`
+  directly: every running session rewrites that file, so foregent reads it to
+  decide and lets Claude Code's own writer do the writing. Gap-filling only,
+  unlike skills — re-adding a server would discard an OAuth login foregent
+  cannot recreate, and setup must stay safe to re-run after every upgrade.
+- Knowing that skills live in `~/.claude/skills/` and MCP servers in
+  `~/.claude.json` is a Claude Code detail leaking through the `AgentManager`
+  seam (§5.13). Accepted while there is one harness; a second one makes the
+  ensure step a manager method.
 - **Provisioning tasks that are dispatch blockers if missed:**
   - *Clean environment for the herdr server.* Every pane inherits the server's
     env. A server started from inside another Claude Code session leaks
@@ -288,6 +312,10 @@ cares.
     so `SessionStart` reports session identity back to herdr.
   - *Pin/record the herdr protocol version* (`ping` → `protocol: 17`) and fail
     startup on mismatch.
+  - *`LINEAR_API_KEY` / `GITHUB_TOKEN` in the herdr server's env.* The MCP
+    config stores the variable, not the token (§5.2), so a server missing its
+    variable is configured, looks installed, and fails to authenticate once an
+    agent is already working. The bridge warns about both at startup.
 
 ### 5.9 Rust build caching
 - One sccache server per machine; `RUSTC_WRAPPER=sccache` in every agent's
@@ -476,10 +504,11 @@ system itself.
    an agent per foregent task via the herdr CLI and
    observes with `herdr --session foregent`. Agents commit with jj and rebase
    to main locally (bootstrap mode by hand).
-   Spikes for this phase: Linear/GitHub MCP wired into the launch spec under
-   `--strict-mcp-config` (explicit endpoints + auth: Linear OAuth, GitHub PAT),
-   and skill discovery confirmed for both `~/.claude/skills/` and a workspace
-   repo's `.claude/skills/`.
+   Spikes for this phase: Linear/GitHub MCP provisioning — **resolved
+   2026-07-28 (JIM-93)**: installed per machine by `foregent setup` at user
+   scope and inherited by agents, not declared per launch spec under
+   `--strict-mcp-config` (§5.2 records why) — and skill discovery confirmed for
+   both `~/.claude/skills/` and a workspace repo's `.claude/skills/`.
 2. **Bridge core**: FastAPI service, `HerdrClaudeManager` (§5.13), in-memory
    cache rebuilt from herdr agent names (no database — §5.11), foregent MCP
    server (`get_assignment` / `report_blocked` / `complete_task`), manual

@@ -22,7 +22,7 @@ from fastapi import Body, FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import config, herdr, linear, skills
+from foregent import config, herdr, linear, mcp_servers, skills
 from foregent.agents import (
     AgentError,
     AgentEventKind,
@@ -50,6 +50,7 @@ async def lifespan(_app: FastAPI):
     # the operator's `herdr --session` — depends on it being the intended one.
     logger.info("running agents in %s", manager.describe())
     await run_in_threadpool(check_herdr_protocol)
+    await run_in_threadpool(check_agent_mcp)
     await run_in_threadpool(rebuild_store)
     watch_agents()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
@@ -167,13 +168,34 @@ def agent_mcp_servers() -> dict[str, dict]:
 
     Foregent's own lifecycle tools, served from this process — without them
     an agent cannot report that it is blocked or done, so the bridge never
-    learns the outcome of the work it dispatched.
+    learns the outcome of the work it dispatched. This one is per-run, which
+    is why it is declared here rather than installed on the machine.
 
-    Linear and GitHub are deliberately absent: agents reach them through the
-    machine's own MCP configuration until JIM-93 declares them explicitly
-    with their own credentials and turns `strict_mcp` on.
+    Linear and GitHub are deliberately absent, and `strict_mcp` stays off:
+    they are provisioned once per box by `foregent setup`
+    (:mod:`foregent.mcp_servers`) and inherited, so one configuration serves
+    agents and the operator's own sessions alike (JIM-93, docs/PLAN.md §5.2).
     """
     return {"foregent": {"type": "http", "url": f"{config.api_url()}/mcp"}}
+
+
+def check_agent_mcp() -> None:
+    """Warn if the box cannot give its agents Linear and GitHub (JIM-93).
+
+    Agents inherit these from the machine, so an unprovisioned box dispatches
+    agents that cannot read the issue they were sent to work — expensively,
+    and only discovered once one is already running. A warning rather than a
+    refusal: the fix is `foregent setup`, and a bridge that will not start is
+    a worse way to say so.
+    """
+    absent = sorted(set(mcp_servers.SERVERS) - mcp_servers.configured())
+    if absent:
+        logger.warning(
+            "%s MCP not configured on this machine; run `foregent setup`",
+            ", ".join(absent),
+        )
+    for variable in mcp_servers.missing_credentials():
+        logger.warning("%s is not set; agents cannot authenticate with it", variable)
 
 
 def ensure_skills() -> None:

@@ -39,3 +39,7 @@ foregent-launched agents develop foregent from inside the box.
   machine and again after upgrading foregent. The bridge also writes any
   missing skill before it launches an agent, so a box that never had setup run
   still dispatches correctly (`docs/PLAN.md` §5.8).
+- `foregent setup` also adds the Linear and GitHub MCP servers to the box's
+  user-level Claude Code config, so agents *and* your own sessions reach them
+  from any directory. The tokens themselves stay in the environment
+  (`LINEAR_API_KEY`, `GITHUB_TOKEN`) — the config only references them.
