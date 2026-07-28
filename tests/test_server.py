@@ -84,6 +84,17 @@ class FakeManager:
         return iter(self.stream)
 
 
+def drain_events(manager: FakeManager) -> None:
+    """Run the event consumer against ``manager`` until its stream runs out."""
+    with mock.patch.object(server, "manager", manager):
+        server.watch_agents()
+        # The consumer runs in a daemon thread; the fake stream is finite,
+        # so it ends on its own.
+        for thread in threading.enumerate():
+            if thread.name == "foregent-agent-events":
+                thread.join(timeout=5)
+
+
 class DispatchTests(unittest.TestCase):
     def setUp(self) -> None:
         server.store = IssueStore()
@@ -310,13 +321,7 @@ class WatchAgentsTests(unittest.TestCase):
         server.store = IssueStore()
 
     def watch(self, manager: FakeManager) -> None:
-        with mock.patch.object(server, "manager", manager):
-            server.watch_agents()
-            # The consumer runs in a daemon thread; the fake stream is finite,
-            # so it ends on its own.
-            for thread in threading.enumerate():
-                if thread.name == "foregent-agent-events":
-                    thread.join(timeout=5)
+        drain_events(manager)
 
     def test_an_exited_agent_orphans_its_issue(self) -> None:
         server.store.add(
@@ -353,6 +358,45 @@ class WatchAgentsTests(unittest.TestCase):
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
 
+    def test_a_completed_issue_is_not_orphaned_by_its_own_teardown(self) -> None:
+        # Foregent stops the agent itself once the issue completes (JIM-100),
+        # and the harness reports that as the same EXITED event as a crash.
+        # The issue's own status is what tells them apart.
+        server.store.add(
+            Issue(
+                key="JIM-88",
+                title="",
+                status=IssueStatus.DONE,
+                agent=AgentRef("fg-jim-88"),
+            )
+        )
+        manager = FakeManager()
+        manager.stream = [
+            AgentEvent(AgentEventKind.EXITED, AgentRef("fg-jim-88"), AgentStatus.GONE)
+        ]
+        with self.assertNoLogs(server.logger, "WARNING"):
+            self.watch(manager)
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.DONE)
+
+    def test_orphaning_is_a_no_op_for_issues_with_no_agent_to_lose(self) -> None:
+        # Nothing to transition out of, so nothing is recorded and the
+        # operator is not warned twice about one dead agent.
+        server.store.add(Issue(key="JIM-88", title="", status=IssueStatus.ORPHANED))
+        manager = FakeManager()
+        manager.stream = [
+            AgentEvent(AgentEventKind.EXITED, AgentRef("fg-jim-88"), AgentStatus.GONE),
+            # An agent for an issue foregent is not tracking at all.
+            AgentEvent(AgentEventKind.EXITED, AgentRef("fg-jim-99"), AgentStatus.GONE),
+        ]
+        with self.assertNoLogs(server.logger, "WARNING"):
+            self.watch(manager)
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.ORPHANED)
+        self.assertIsNone(server.store.get("JIM-99"))
+
     def test_an_orphaned_issue_frees_capacity(self) -> None:
         # A dead agent must not go on holding the only slot.
         server.store.add(
@@ -370,6 +414,31 @@ class WatchAgentsTests(unittest.TestCase):
         self.watch(manager)
         occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
         self.assertFalse(any(i.status in occupied for i in server.store))
+
+
+class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
+    """The agent-facing completion tool, teardown included (docs/PLAN.md §5.6)."""
+
+    async def test_completion_survives_the_teardown_it_triggers(self) -> None:
+        # The whole loop in order (JIM-100): the tool marks the issue Done and
+        # deliberately stops its agent, the harness reports that stop as an
+        # exit like any other, and the consumer must leave the Done issue
+        # alone rather than orphaning a completed one.
+        server.store = IssueStore()
+        ref = AgentRef("fg-jim-88", "conversation-1")
+        server.store.add(
+            Issue(key="JIM-88", title="", status=IssueStatus.IN_PROGRESS, agent=ref)
+        )
+        manager = FakeManager()
+        with mock.patch.object(server, "manager", manager):
+            await server.complete_task("JIM-88")
+        self.assertEqual(manager.stopped, [ref])
+
+        manager.stream = [AgentEvent(AgentEventKind.EXITED, ref, AgentStatus.GONE)]
+        drain_events(manager)
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.DONE)
 
 
 if __name__ == "__main__":

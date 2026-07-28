@@ -12,6 +12,10 @@ from dataclasses import replace
 
 from foregent.models import Issue, IssueStatus
 
+# An issue with a live agent working it, whether or not that agent is busy.
+# These are the states an issue can be orphaned out of (docs/PLAN.md §5.12).
+_IN_FLIGHT = (IssueStatus.IN_PROGRESS, IssueStatus.IN_REVIEW, IssueStatus.BLOCKED)
+
 
 class IssueStore:
     """A mutable, in-memory collection of issues keyed by issue key.
@@ -83,11 +87,18 @@ class IssueStore:
     def orphan(self, key: str) -> Issue | None:
         """Mark issue ``key`` Orphaned; its agent is gone (docs/PLAN.md §5.12).
 
-        Unknown keys are ignored rather than upserted: an agent dying for an
-        issue foregent is not tracking says nothing worth recording.
+        Only an *in-flight* issue can be orphaned, which is what §5.12 defines
+        Orphaned as. Everything else returns ``None`` and is left alone:
+
+        - Unknown keys are ignored rather than upserted: an agent dying for an
+          issue foregent is not tracking says nothing worth recording.
+        - Done is not overwritten. Foregent stops an agent itself once its
+          issue completes, and the harness reports that deliberate teardown as
+          the same event as a crash; the issue's own status is the only thing
+          that tells them apart, and ``complete()`` has already run by then.
         """
         existing = self._issues.get(key)
-        if existing is None:
+        if existing is None or existing.status not in _IN_FLIGHT:
             return None
         issue = replace(existing, status=IssueStatus.ORPHANED, agent=None)
         self._issues[key] = issue

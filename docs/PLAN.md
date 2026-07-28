@@ -365,6 +365,13 @@ cares.
   - agent alive → rebind the in-memory cache; keep working.
   - agent gone → transition the issue to **Orphaned** (keeping the assignee),
     recording the prior stage and last blocker in the attachment metadata.
+- **Only an in-flight issue can be orphaned** — In Progress, In Review or
+  Blocked. The event stream cannot tell a crash from foregent's own teardown
+  (both are `workspace_closed`, §2), and foregent stops an agent itself the
+  moment its issue completes; the issue's status is what distinguishes them,
+  and it is already Done by the time that event arrives. So orphaning is a
+  transition *out of* an in-flight state, never a status a Done, already-
+  orphaned, or never-dispatched issue can be moved into.
 - **Orphaned re-dispatch resumes, it does not restart.** Because the
   conversation id and workspace path are in the attachment metadata, and
   `--resume` works, re-dispatching an orphan relaunches the same conversation
