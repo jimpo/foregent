@@ -8,9 +8,12 @@ Code is. Linear is stubbed too — its own client is covered by
 
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 import unittest
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
+from pathlib import Path
 from unittest import mock
 
 from foregent import server
@@ -38,8 +41,13 @@ class FakeManager:
         self.stream: list[AgentEvent] = []
         self.fail_launch: Exception | None = None
         self.fail_send: Exception | None = None
+        # Observes the world as the agent starts, for the things dispatch has
+        # to have finished by then rather than merely around then.
+        self.at_launch: Callable[[], None] | None = None
 
     def launch(self, spec: LaunchSpec) -> AgentRef:
+        if self.at_launch:
+            self.at_launch()
         if self.fail_launch:
             raise self.fail_launch
         self.launched.append(spec)
@@ -83,6 +91,14 @@ class DispatchTests(unittest.TestCase):
         claim = mock.patch.object(server.linear, "claim_issue")
         self.claim = claim.start()
         self.addCleanup(claim.stop)
+        # Dispatch installs foregent's skills into the box's Claude Code
+        # config directory; point that somewhere disposable so running the
+        # tests never writes into the real ~/.claude.
+        self.config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config)})
+        )
+        self.skill = self.config / "skills" / "foregent-worker" / "SKILL.md"
 
     def queue(self, key: str = "JIM-88", directory: str = "/ws/JIM-88") -> None:
         server.store.queue(key, directory)
@@ -133,6 +149,37 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(issue.agent, ref)
         # The conversation id is the half that outlives the process (§5.11).
         self.assertEqual(issue.agent.conversation_id, "conversation-1")
+
+    def test_dispatch_installs_a_missing_skill_before_the_agent_starts(self) -> None:
+        # Claude Code only watches skill directories that existed when the
+        # session started, so a skill written after agent.start is invisible
+        # to that agent for its whole life (JIM-91).
+        present_at_launch: list[bool] = []
+        self.manager.at_launch = lambda: present_at_launch.append(self.skill.is_file())
+        self.queue()
+        server.dispatch()
+        self.assertEqual(present_at_launch, [True])
+        self.assertIn("foregent-worker", self.skill.read_text())
+
+    def test_dispatch_leaves_an_existing_skill_alone(self) -> None:
+        # The safety net only fills gaps: `foregent setup` is the one
+        # deliberate updater, so an operator's edit survives every dispatch.
+        self.skill.parent.mkdir(parents=True)
+        self.skill.write_text("hand edited\n")
+        self.queue()
+        server.dispatch()
+        self.assertEqual(self.skill.read_text(), "hand edited\n")
+
+    def test_dispatch_survives_a_skill_directory_it_cannot_write(self) -> None:
+        # An agent working the issue without foregent's instructions beats no
+        # agent at all, so a broken skill directory must not block dispatch.
+        (self.config / "not-a-directory").write_text("")
+        with mock.patch.dict(
+            os.environ, {"CLAUDE_CONFIG_DIR": str(self.config / "not-a-directory")}
+        ):
+            self.queue()
+            server.dispatch()
+        self.assertEqual(len(self.manager.launched), 1)
 
     def test_a_failed_claim_leaves_the_issue_queued(self) -> None:
         self.claim.side_effect = server.linear.LinearError("no such issue")

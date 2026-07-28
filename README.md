@@ -34,5 +34,8 @@ foregent-launched agents develop foregent from inside the box.
 
   The agent owns the issue end to end; if it wants to fan work out to
   subagents, that is its call, not foregent's (`docs/PLAN.md` §5.2).
-- Agent workflow lives in the `foregent-worker` skill, installed into
-  `~/.claude/skills/` at provision time (§5.8) — not in a profile file.
+- Agent workflow lives in the `foregent-worker` skill, not in a profile file.
+  `foregent setup` installs it into `~/.claude/skills/`; run it once per
+  machine and again after upgrading foregent. The bridge also writes any
+  missing skill before it launches an agent, so a box that never had setup run
+  still dispatches correctly (`docs/PLAN.md` §5.8).

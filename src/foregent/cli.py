@@ -16,7 +16,7 @@ import urllib.request
 from collections.abc import Sequence
 from urllib.parse import quote, urlparse
 
-from foregent import __version__
+from foregent import __version__, skills
 from foregent.config import api_url
 from foregent.models import Issue, IssueStatus
 
@@ -57,6 +57,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Working directory for the agent (default: current directory).",
     )
     queue.set_defaults(func=cmd_queue)
+
+    setup = subparsers.add_parser(
+        "setup",
+        help="Install foregent's skills into this machine's Claude Code skill directory.",
+        description=(
+            "Copy every skill foregent ships into the user-level Claude Code "
+            "skill directory, where agents on this machine load it from. Run "
+            "once per machine, and again after upgrading foregent."
+        ),
+    )
+    setup.set_defaults(func=cmd_setup)
 
     serve = subparsers.add_parser(
         "serve",
@@ -148,6 +159,15 @@ def cmd_queue(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"{record['key']}: {record['status']}")
+    return 0
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Install foregent's packaged skills, reporting what each one did."""
+    root = skills.skills_root()
+    print(f"Installing foregent's skills into {root}")
+    for name, outcome in skills.install(root):
+        print(f"  {outcome:<9}  {name}")
     return 0
 
 

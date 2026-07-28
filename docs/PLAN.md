@@ -243,11 +243,36 @@ cares.
   auth (Claude, GitHub app, Linear), clone repos, install skills, systemd
   units for the herdr server + bridge, start.
 - **Skills are installed into the box's Claude Code skill directory**
-  (`~/.claude/skills/`) at provision time and on sync. Foregent's own skills
-  (`foregent-worker`, plus workflow skills) ship in this repo; a managed repo's
-  project-shipped skills in its `.claude/skills/` are discovered natively from
-  the workspace cwd. Accepted consequence: every agent on the box sees every
-  installed skill — fine, since there is one agent kind per issue.
+  (`~/.claude/skills/`, or `$CLAUDE_CONFIG_DIR/skills` where that is set).
+  Foregent's own skills (`foregent-worker`, plus workflow skills) ship *inside
+  the installed package* (`foregent/skills/<name>/SKILL.md`), so they travel
+  with a `uv tool install` rather than only existing in a repo checkout; a
+  managed repo's project-shipped skills in its `.claude/skills/` are discovered
+  natively from the workspace cwd. Accepted consequence: every agent on the box
+  sees every installed skill — fine, since there is one agent kind per issue.
+- **Two paths put them there**, both over `foregent/skills.py` so they cannot
+  drift:
+  - `foregent setup` — run at provision time and again after every foregent
+    upgrade. Copies every packaged skill, overwriting stale ones, and reports
+    per skill whether it installed, updated, or changed nothing, so an
+    operator whose edits were replaced is told rather than left to find out.
+  - **The server writes any missing skill before it launches an agent.** A box
+    where setup was never run still dispatches correctly, instead of briefing
+    an agent to use a skill that is not on disk. It only fills gaps — updating
+    stays setup's job, so a deliberately edited skill survives every dispatch.
+    The cost is that a skill left over from an older foregent persists
+    silently; the fix is making setup part of provisioning, not making
+    dispatch overwrite files mid-flight.
+- Two constraints the implementation turns on. **The write must complete
+  before `agent.start`, not alongside it**: Claude Code picks up edits to a
+  skills directory live, but only one that existed when the session started,
+  so on a fresh box the skill has to be there first or that agent never sees
+  it. And **concurrent dispatches race**, so each file is staged in its
+  destination directory and renamed into place — an agent never loads a
+  half-written `SKILL.md`.
+- Knowing that skills live in `~/.claude/skills/` is a Claude Code detail
+  leaking through the `AgentManager` seam (§5.13). Accepted while there is one
+  harness; a second one makes the ensure step a manager method.
 - **Provisioning tasks that are dispatch blockers if missed:**
   - *Clean environment for the herdr server.* Every pane inherits the server's
     env. A server started from inside another Claude Code session leaks
@@ -427,8 +452,9 @@ system itself.
    box where the headless herdr server is up and a hand-launched Claude Code
    agent in a herdr workspace reaches `idle` and accepts a prompt.
 1. **Self-hosting bootstrap**: this repo pushed into the box; the
-   `foregent-worker` skill written and installed into `~/.claude/skills/`;
-   the operator hand-launches an agent per foregent task via the herdr CLI and
+   `foregent-worker` skill written, shipped in the package, and installed into
+   `~/.claude/skills/` by `foregent setup` (§5.8); the operator hand-launches
+   an agent per foregent task via the herdr CLI and
    observes with `herdr --session foregent`. Agents commit with jj and rebase
    to main locally (bootstrap mode by hand).
    Spikes for this phase: Linear/GitHub MCP wired into the launch spec under

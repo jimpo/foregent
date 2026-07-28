@@ -22,7 +22,7 @@ from fastapi import Body, FastAPI, HTTPException
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import config, linear
+from foregent import config, linear, skills
 from foregent.agents import (
     AgentError,
     AgentEventKind,
@@ -165,6 +165,36 @@ def agent_mcp_servers() -> dict[str, dict]:
     return {"foregent": {"type": "http", "url": f"{config.api_url()}/mcp"}}
 
 
+def ensure_skills() -> None:
+    """Install any packaged skill this machine is missing, before a launch.
+
+    `foregent setup` is the deliberate installer; this is the safety net that
+    keeps a box where it was never run from briefing an agent to use a skill
+    that is not there. It only fills gaps — updating is setup's job.
+
+    **Must complete before `manager.launch`, never alongside it.** Claude Code
+    watches skill directories live, but only ones that existed when the
+    session started: on a fresh box with no `~/.claude/skills/`, a skill
+    written after the agent starts is invisible to that agent for its whole
+    life.
+
+    Best-effort. A box foregent cannot write skills to still gets its agent,
+    working the issue without foregent's lifecycle instructions, which beats
+    not dispatching at all.
+
+    Knowing where a Claude Code session looks for skills is a harness detail
+    leaking through the `AgentManager` seam (docs/PLAN.md §5.13). Acceptable
+    while there is one harness; a second one makes this a manager method.
+    """
+    try:
+        installed = skills.ensure()
+    except OSError as exc:
+        logger.warning("could not install foregent's skills: %s", exc)
+        return
+    for name in installed:
+        logger.info("installed the %s skill into %s", name, skills.skills_root())
+
+
 def dispatch() -> None:
     """Launch an agent for the oldest Queued issue, capacity allowing.
 
@@ -173,7 +203,9 @@ def dispatch() -> None:
     launch, the issue is claimed directly in Linear (assignee + In Progress
     state, docs/PLAN.md §5.11-5.12) — no agent runs without a durable
     ownership record. On a Linear or harness failure the issue stays Queued
-    and the caller's request fails with 502.
+    and the caller's request fails with 502. Foregent's skills are installed
+    first (:func:`ensure_skills`), because the agent cannot pick up one that
+    appears after it starts.
 
     Dispatch is not atomic, and the deterministic agent label is what makes
     that survivable. If the brief fails to send after the agent starts, a
@@ -190,6 +222,7 @@ def dispatch() -> None:
     if issue is None:
         return
     label = label_for(issue.key)
+    ensure_skills()
     try:
         linear.claim_issue(issue.key)
         ref = _adopt(label) or manager.launch(
