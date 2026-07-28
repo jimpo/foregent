@@ -225,6 +225,37 @@ cares.
   `AgentManager.send()`. Context is intact because the process never died and
   the workspace was never released. Capacity does not change either — the
   parked agent was holding its slot the whole time.
+- **An event wakes the agent that owns the issue the event is about**, and the
+  blocker is never read (`foregent/events.py`, a pure `wakes(event) -> key` so
+  it is testable without a server, a webhook or a live agent — webhook
+  ingestion, §5.11, then becomes a trigger for machinery that already works).
+  Three kinds wake an agent, and nothing else does:
+  - a comment or reply on the agent's own Linear issue;
+  - a review or comment on the pull request linked to that issue, inline or
+    PR-level;
+  - that pull request ceasing to merge cleanly as main advances.
+- **The blocker is a note, not a key.** An earlier design had the agent report
+  a *typed* blocker (`pr-review:<repo>#<n>`, `issue-update:<KEY>`,
+  `human:<what you need>`) that the bridge matched events against. Rejected
+  (2026-07-28, JIM-101): every typed form reduces to "something happened on my
+  ticket" once the PR is linked, so the typing bought a parsing vocabulary and
+  a scan over parked agents in exchange for nothing. The blocker stays as
+  free text — what the agent was waiting for, for the operator reading
+  `foregent status`.
+  - **Linking is Linear's job, not the agent's.** A worker that pushes its
+    branch gets the PR linked to the ticket by Linear itself, off the branch
+    name, so the bridge resolves PR → issue server-side and the agent never
+    reports a PR number to be findable.
+  - Consequence accepted: an agent waiting on a *different* ticket to land has
+    no automatic wake, since activity there never touches its own ticket. The
+    operator comments on the parked ticket instead — a person deciding the
+    dependency is satisfied, rather than the bridge guessing it from a state
+    change.
+  - Linear *field* updates deliberately do not wake: a priority tweak or a
+    label change is not an answer to the question the agent asked.
+- The wake message **carries the event**, not merely "you are unblocked": the
+  agent has to act on the feedback, and re-reading the issue to find out what
+  it was is a round trip it does not need.
 - `POST /issues/{key}/wake` is the seam ingestion will call, and is drivable
   with `curl` on its own. It **sends before it unblocks**, so a harness
   failure leaves the issue BLOCKED with no rollback path to get wrong and a
