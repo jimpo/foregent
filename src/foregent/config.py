@@ -11,10 +11,28 @@ import os
 
 DEFAULT_API_URL = "http://127.0.0.1:8577"
 
+# Seconds between event polls. Linear allows 2,500 requests an hour, so one
+# query every 30 seconds spends under 5% of the budget; every consumer today
+# is a human replying to a review, who does not feel the difference (JIM-102).
+DEFAULT_POLL_INTERVAL = 30.0
+
 
 def api_url() -> str:
     """Base URL of the foregent server (``FOREGENT_API_URL`` or the default)."""
     return os.environ.get("FOREGENT_API_URL", DEFAULT_API_URL)
+
+
+def poll_interval() -> float:
+    """Seconds between event polls (``FOREGENT_POLL_INTERVAL`` or the default).
+
+    An unreadable value falls back to the default rather than stopping the
+    bridge: a typo in a unit file is not worth losing event delivery over, and
+    the tick logs the interval it settled on when it starts.
+    """
+    try:
+        return float(os.environ["FOREGENT_POLL_INTERVAL"])
+    except (KeyError, ValueError):
+        return DEFAULT_POLL_INTERVAL
 
 
 def herdr_session() -> str | None:

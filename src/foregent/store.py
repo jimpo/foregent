@@ -124,6 +124,15 @@ class IssueStore:
         self._issues[key] = issue
         return issue
 
+    def in_flight(self) -> list[Issue]:
+        """Every issue with a live agent working it, busy or parked.
+
+        What the event tick polls Linear about (docs/PLAN.md §5.1): activity
+        only matters on issues foregent has an agent for, and only those cost
+        anything to watch.
+        """
+        return [i for i in self.list_issues() if i.status in _IN_FLIGHT]
+
     def list_issues(self) -> list[Issue]:
         """Return all issues, sorted by key for stable output."""
         return sorted(self._issues.values(), key=lambda issue: issue.key)

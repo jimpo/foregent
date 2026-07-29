@@ -4,7 +4,9 @@ Owns the authoritative :class:`~foregent.store.IssueStore` and exposes it over
 HTTP so the CLI can stay a thin client (``docs/PLAN.md`` §2, Bridge core).
 Queued issues are dispatched to agents as capacity allows, through the
 :class:`~foregent.agents.AgentManager` seam (§5.13) rather than to any one
-harness. Also mounts the foregent MCP server (``complete_task``,
+harness, and a periodic tick asks Linear what changed on the issues it is
+tracking, so a parked agent is woken by activity on its own issue (§5.1).
+Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
 HTTP.
@@ -14,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException
@@ -33,6 +37,7 @@ from foregent.agents import (
     label_for,
 )
 from foregent.agents.herdr_claude import HerdrClaudeManager
+from foregent.events import Event, wake_message, wakes
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 
@@ -53,6 +58,7 @@ async def lifespan(_app: FastAPI):
     await run_in_threadpool(check_agent_mcp)
     await run_in_threadpool(rebuild_store)
     watch_agents()
+    poll_linear()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -143,6 +149,79 @@ def watch_agents() -> None:
                 logger.warning("agent for %s exited; issue orphaned", key)
 
     threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
+
+
+def deliver(event: Event, viewer: str) -> None:
+    """Wake whichever parked agent ``event`` was for, if any (docs/PLAN.md §5.6).
+
+    Goes through :func:`wake_issue` rather than the store directly, so that
+    parked-ness, send-before-unblock, and the 409 for an issue nobody is
+    waiting on all stay decided in one place. An event with nowhere to go is
+    the normal case, not an error: the tick polls every in-flight issue, and
+    most of them have a working agent that this ticket does not deliver to.
+    """
+    key = wakes(event, viewer)
+    if not key:
+        return
+    try:
+        wake_issue(key, wake_message(event))
+    except HTTPException as exc:
+        logger.debug("event on %s woke nobody: %s", key, exc.detail)
+        return
+    logger.info("woke %s on activity by %s", key, event.author or "someone")
+
+
+def poll_tick(cursor: str, viewer: str) -> tuple[str, str]:
+    """Ask Linear what changed since ``cursor``, and deliver it. One pass.
+
+    Returns the cursor and viewer to run the next pass with; both are held by
+    the caller's loop rather than in module state, which is what lets a test
+    drive a tick without a thread or a clock.
+
+    The cursor only ever advances past comments this pass has served
+    (:func:`~foregent.linear.poll_comments`), so a failure anywhere here
+    leaves the window intact and the next pass re-reads it. **The viewer is
+    resolved before anything is polled and the pass is abandoned without it**:
+    a poll that cannot recognize foregent's own writes wakes agents with them,
+    and a wake that causes a write is a loop.
+    """
+    try:
+        viewer = viewer or linear.viewer_id()
+        events, cursor = linear.poll_comments(
+            [issue.key for issue in store.in_flight()], cursor, viewer
+        )
+    except linear.LinearError as exc:
+        # Lateness is polling's failure mode and it is self-healing: the
+        # cursor did not move, so the next tick asks for the same window.
+        logger.warning("event poll failed, retrying next tick: %s", exc)
+        return cursor, viewer
+    for event in events:
+        deliver(event, viewer)
+    return cursor, viewer
+
+
+def poll_linear() -> None:
+    """Run :func:`poll_tick` forever, on its own thread (docs/PLAN.md §5.1).
+
+    A daemon thread, like :func:`watch_agents`: it holds nothing the process
+    would miss at exit, and its state is a cursor it can rebuild from the
+    clock on the next boot.
+
+    The first cursor is the clock — the only time it legitimately is one.
+    Foregent has no durable record of what it has already delivered (§5.11),
+    so a restart starts watching from now rather than replaying a backlog of
+    comments its agents have most likely already acted on.
+    """
+    interval = config.poll_interval()
+    logger.info("polling Linear for events every %gs", interval)
+
+    def tick() -> None:
+        cursor, viewer = datetime.now(UTC).isoformat(), ""
+        while True:
+            time.sleep(interval)
+            cursor, viewer = poll_tick(cursor, viewer)
+
+    threading.Thread(target=tick, name="foregent-linear-poll", daemon=True).start()
 
 
 def _record(issue: Issue) -> dict[str, str]:

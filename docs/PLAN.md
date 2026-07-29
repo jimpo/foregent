@@ -140,10 +140,32 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
 
 ### 5.1 Event bridge (the core)
 - A **periodic tick** asks Linear what changed on the issues the bridge is
-  tracking (comments, status, assignment), and later GitHub the same (PR
-  review submitted, comments, checks, merges). One query per source covers
-  the whole fleet, keyed on the in-flight issues, so cost scales with work in
-  progress rather than with workspace size.
+  tracking (comments today; later GitHub the same, for PR review submitted,
+  comments, checks, merges). One query per source covers the whole fleet,
+  keyed on the in-flight issues, so cost scales with work in progress rather
+  than with workspace size. Built in JIM-36: `linear.poll_comments()` plus
+  `server.poll_tick()` on a daemon thread, `FOREGENT_POLL_INTERVAL` seconds
+  apart (default 30 — under 5% of Linear's 2,500 requests an hour).
+  - **The tick tracks a cursor, not a clock.** The next window starts at the
+    `createdAt` of the last comment actually served, so a tick that runs late,
+    or a restart, cannot skip a window — and a comment written while the
+    query was in flight is not stranded in the gap. A quiet window advances
+    nothing. The comment the cursor names is never re-served, because `gt` is
+    compared against a timestamp Linear itself issued; that plus a single
+    poller thread is the whole of idempotence. Only a cold start reads the
+    clock: with no durable record of what was delivered (§5.11), a reboot
+    watches from now rather than replaying a backlog its agents have already
+    acted on.
+  - Linear returns comments **newest-first**, so the query asks for `last: N`,
+    not `first: N`: `first` would serve the newest page of an oversized
+    window and the cursor would skip everything older that did not fit.
+    `last` serves the oldest page, ascending, and the next tick collects the
+    remainder.
+  - Every **in-flight** issue is polled, not only the parked ones. Events for
+    a working agent are dropped (delivering to one is a later ticket), but
+    polling them is what keeps the cursor honest: watching only blocked
+    issues would hand a newly parked one a cursor from before it existed, and
+    wake it with comments that predate its own block.
 - **Events are foregent's own shape**, not a provider payload. The transport
   is a source feeding one matcher; that seam is what makes push an additive
   change later rather than a rewrite.
@@ -158,10 +180,14 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
 - **Never wake on foregent's own writes.** Claiming an issue assigns it and
   moves its state, and agents comment through the Linear MCP under the same
   account; both come back as changes. `wakes()` drops them by actor identity,
-  and polling can drop most of them a step earlier, server-side
-  (`user: { id: { neq: $viewerId } }`).
+  and the poll drops them a step earlier, server-side
+  (`user: { id: { neq: $viewerId } }`). The viewer id is resolved once, from
+  Linear itself, and **a tick that cannot resolve it does not poll at all** —
+  a wake that causes a write is a loop.
 - The tick is also loop insurance: it re-checks Linear for stuck/unassigned
-  work, so nothing missed can stall the system (Ralph loop).
+  work, so nothing missed can stall the system (Ralph loop). **Not built
+  yet** — that is a second query, over *ready* issues rather than tracked
+  ones, and it belongs with the scheduler that would act on the answer.
 
 ### 5.2 The issue agent
 **One Claude Code agent owns one Linear issue, end to end.** There is no
