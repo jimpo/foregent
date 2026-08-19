@@ -169,6 +169,12 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
 - **Events are foregent's own shape**, not a provider payload. The transport
   is a source feeding one matcher; that seam is what makes push an additive
   change later rather than a rewrite.
+- **`POST /webhooks/linear` receives what Linear pushes, and logs it** (built
+  in JIM-128). It authenticates the delivery — HMAC-SHA256 over the raw body,
+  keyed on `LINEAR_WEBHOOK_SECRET`, against the `Linear-Signature` header —
+  and stops there: nothing is mapped to an `Event` and nobody is woken, so
+  the tick is still the only delivery path. It is a place to read real
+  payloads while the ingress transport is undecided (§8, Q8).
 - Maintains the issue ↔ agent ↔ workspace mapping as an **in-memory cache**,
   rebuildable from herdr + Linear — the bridge owns no database (§5.11).
 - Dispatch: ready issue → claim it (assignee + In Progress, §5.12) → acquire
@@ -642,18 +648,22 @@ system itself.
   itself.
 - **Q7 — Multi-repo task semantics.** Is one Linear issue ever cross-repo? Start
   by forbidding cross-repo issues; revisit with binius data.
-- ~~**Q8 — Webhook ingress.**~~ **Resolved 2026-07-28 (JIM-102): poll, don't
-  receive.** Bridges sit on private networks with no inbound port, and every
-  push option pays for that with infrastructure — a Cloudflare named tunnel
-  (domain + daemon + DNS + subscription lifecycle) or a Lambda/SQS relay (AWS
-  credentials on every box). What they buy is latency: sub-second against a
-  30-second tick, when every consumer is a human replying to a review.
-  Decisive point: §5.1 commits to a periodic tick regardless, so push would be
-  built *on top of* the loop rather than instead of it — and polling's failure
-  mode is lateness where push's is silence. Revisit when latency is genuinely
-  felt (→ Cloudflare tunnel) or when one endpoint serves many bridges and lost
-  events stop being acceptable (→ Lambda + SQS, whose buffer earns its keep
-  there). Both stay cheap to add because the event shape is foregent's own.
+- **Q8 — Webhook ingress.** Resolved 2026-07-28 (JIM-102) as *poll, don't
+  receive*; **reopened 2026-08-19 (JIM-128)**, which adds an authenticated
+  `/webhooks/linear` that logs the delivery and does nothing else (§5.1). What
+  that settles is the handler and the payloads; what stays open is the part
+  polling won on. Bridges sit on private networks with no inbound port, and
+  every push option pays for that with infrastructure — a Cloudflare named
+  tunnel (domain + daemon + DNS + subscription lifecycle) or a Lambda/SQS
+  relay (AWS credentials on every box). What they buy is latency: sub-second
+  against a 30-second tick, when every consumer is a human replying to a
+  review. §5.1 commits to a periodic tick regardless, so push is built *on top
+  of* the loop rather than instead of it — and polling's failure mode is
+  lateness where push's is silence. Decide the transport when latency is
+  genuinely felt (→ Cloudflare tunnel) or when one endpoint serves many
+  bridges and lost events stop being acceptable (→ Lambda + SQS, whose buffer
+  earns its keep there). Both stay cheap to add because the event shape is
+  foregent's own.
 - **Q9 — Reviewer stage in bootstrap mode**: is there a lightweight self-review
   pass before auto-merge, or is speed the point? A question about the skill's
   workflow, not about a second agent.

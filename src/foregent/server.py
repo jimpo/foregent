@@ -6,6 +6,7 @@ Queued issues are dispatched to agents as capacity allows, through the
 :class:`~foregent.agents.AgentManager` seam (§5.13) rather than to any one
 harness, and a periodic tick asks Linear what changed on the issues it is
 tracking, so a parked agent is woken by activity on its own issue (§5.1).
+``/webhooks/linear`` receives what Linear pushes, and logs it (§8, Q8).
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -22,7 +23,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException, Request
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
@@ -436,6 +437,39 @@ def wake_issue(key: str, message: Annotated[str, Body(embed=True)]) -> dict[str,
     except AgentError as exc:
         raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
     return _record(store.unblock(key) or issue)
+
+
+@app.post("/webhooks/linear")
+async def linear_webhook(request: Request) -> dict[str, str]:
+    """Authenticate a webhook delivery from Linear and log it (JIM-128).
+
+    A sink, not a source: the periodic tick is what delivers events to agents
+    (docs/PLAN.md §5.1), and this endpoint wakes nobody. It exists so the
+    transport question (§8, Q8) can be decided against deliveries that really
+    arrived, and so their payloads can be read before anything maps one to an
+    :class:`~foregent.events.Event`.
+
+    Logs the body whole, for the same reason: nothing here understands a
+    Linear payload yet, and a summary would be a guess at which part matters.
+
+    Reads the raw bytes rather than a parsed body, because that is what the
+    signature covers (:func:`~foregent.linear.webhook_authentic`). 401 for a
+    delivery that does not prove it came from Linear, absent signature
+    included; 503 when this bridge holds no secret to check one against, which
+    is an operator's misconfiguration and not the caller's fault.
+    """
+    body = await request.body()
+    try:
+        authentic = linear.webhook_authentic(
+            body, request.headers.get(linear.SIGNATURE_HEADER, "")
+        )
+    except linear.LinearError as exc:
+        logger.error("cannot authenticate Linear webhooks: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not authentic:
+        raise HTTPException(status_code=401, detail="signature does not match")
+    logger.info("Linear webhook: %s", body.decode("utf-8", "replace"))
+    return {"status": "ok"}
 
 
 @mcp.tool()

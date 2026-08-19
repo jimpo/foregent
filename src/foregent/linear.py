@@ -1,14 +1,20 @@
-"""Minimal Linear GraphQL client.
+"""Minimal Linear client.
 
 Linear ships no first-party client library either, so this is a thin
 wrapper, built on the ``gql`` library, over the little foregent needs of
 Linear directly: claiming an issue, and asking what changed on the issues it
 is tracking. This is the bridge's own direct Linear access, separate from the
 agent-facing Linear MCP (docs/PLAN.md §5.12).
+
+Traffic in the other direction — deliveries Linear makes to the bridge — is
+here too, as the one thing a receiver has to do before reading a payload:
+:func:`webhook_authentic`.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
 
 from gql import Client, gql
@@ -20,6 +26,9 @@ from foregent.events import Event, EventKind
 # Cap on each Linear call: claim_issue runs inside a foregent request
 # handler, so a wedged Linear API must fail the request (502), not hang.
 TIMEOUT = 30
+
+# The header Linear signs every webhook delivery with (:func:`webhook_authentic`).
+SIGNATURE_HEADER = "Linear-Signature"
 
 # Comments read per tick. A window with more than this is served oldest-first
 # across consecutive ticks rather than truncated; see :func:`poll_comments`.
@@ -147,6 +156,24 @@ def viewer_id() -> str:
     to leave its own writes alone (docs/PLAN.md §5.1).
     """
     return _request(_VIEWER_QUERY, {})["viewer"]["id"]
+
+
+def webhook_authentic(body: bytes, signature: str) -> bool:
+    """Whether ``signature`` proves ``body`` is a delivery from Linear.
+
+    Linear signs the exact bytes it sent, keyed on the webhook's signing
+    secret, so the caller has to hand over the body it received rather than a
+    re-serialization of a parse of it — a round trip through JSON moves the
+    whitespace and the digest stops matching.
+
+    Raises :class:`LinearError` when ``LINEAR_WEBHOOK_SECRET`` is unset. A
+    bridge that cannot check a signature says so; it does not accept.
+    """
+    secret = os.environ.get("LINEAR_WEBHOOK_SECRET")
+    if not secret:
+        raise LinearError("LINEAR_WEBHOOK_SECRET is not set")
+    digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, signature)
 
 
 def poll_comments(
