@@ -172,9 +172,33 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
 - **`POST /webhooks/linear` receives what Linear pushes, and logs it** (built
   in JIM-128). It authenticates the delivery — HMAC-SHA256 over the raw body,
   keyed on `LINEAR_WEBHOOK_SECRET`, against the `Linear-Signature` header —
-  and stops there: nothing is mapped to an `Event` and nobody is woken, so
-  the tick is still the only delivery path. It is a place to read real
-  payloads while the ingress transport is undecided (§8, Q8).
+  and stops there: nobody is woken, so the tick is still the only delivery
+  path. It is a place to read real payloads while the ingress transport is
+  undecided (§8, Q8).
+- **`linear.webhook_event()` maps a delivery to an `Event`** (built in
+  JIM-130), against those logged payloads rather than against the published
+  schema. A delivery maps when it is an entity delivery — a `type` and a
+  `data` — naming an issue, at `data.issue.identifier` or `data.identifier`;
+  anything else returns nothing, because a payload naming no issue can wake
+  nobody and an unrecognized shape is worth less than a guess. A comment is
+  its text; **everything else that carries an issue is a field update**,
+  keyed on carrying one rather than on a list of entity types, so the
+  reactions, labels and attachments Linear hangs off an issue need no entry
+  each. Mapping only: the route is unchanged and delivery is the next ticket.
+  - **A Linear field update is a wake** (`EventKind.ISSUE_UPDATE`). A person
+    answers a parked agent by moving the issue at least as often as by
+    writing to it — a design parked for review is approved by a state
+    change, and an issue cancelled under a working agent is something it has
+    to be told. The body is the changed fields with the values they held
+    before, out of the payload's `updatedFrom`, so a worker can act without
+    re-reading the issue. Only the new side of a changed relation resolves to
+    a name (`stateId` is reported as `state`, from the `state` object carried
+    alongside); the previous value stays the id Linear sent, because
+    resolving it would cost a call and the mapping is pure.
+  - The **actor** comes through the mapping, and losing it would be a
+    self-wake loop: this path carries every comment an agent posts through
+    the Linear MCP *and* the assignee + state change the bridge makes to
+    claim an issue (§5.12), both written as foregent's own account.
 - Maintains the issue ↔ agent ↔ workspace mapping as an **in-memory cache**,
   rebuildable from herdr + Linear — the bridge owns no database (§5.11).
 - Dispatch: ready issue → claim it (assignee + In Progress, §5.12) → acquire

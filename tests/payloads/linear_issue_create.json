@@ -1,0 +1,71 @@
+{
+  "action": "create",
+  "actor": {
+    "id": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "name": "AJ",
+    "email": "jim.posen+aj@gmail.com",
+    "url": "https://linear.app/jimpo/profiles/jim.posenaj",
+    "type": "user"
+  },
+  "createdAt": "2026-08-19T19:16:48.007Z",
+  "data": {
+    "id": "35481eec-ab3b-426d-8d9b-7a3b4336f784",
+    "createdAt": "2026-08-19T19:16:48.007Z",
+    "updatedAt": "2026-08-19T19:16:48.007Z",
+    "number": 133,
+    "title": "Wake and update workers from Linear webhooks",
+    "priority": 0,
+    "sortOrder": -23196,
+    "prioritySortOrder": -93670,
+    "slaType": "all",
+    "addedToProjectAt": "2026-08-19T19:16:48.060Z",
+    "addedToTeamAt": "2026-08-19T19:16:48.060Z",
+    "labelIds": [
+      "91e1d4c5-ea47-43ae-9644-7488023737e7"
+    ],
+    "teamId": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6",
+    "projectId": "1b3e123a-432d-4f9c-8b0f-5a83e216527e",
+    "previousIdentifiers": [],
+    "creatorId": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "stateId": "f6a28504-0f21-49ad-b4f7-aa0940277df8",
+    "reactionData": [],
+    "priorityLabel": "No priority",
+    "inheritsSharedAccess": false,
+    "botActor": null,
+    "identifier": "JIM-133",
+    "url": "https://linear.app/jimpo/issue/JIM-133/wake-and-update-workers-from-linear-webhooks",
+    "subscriberIds": [
+      "442931c7-7df1-4c3f-994d-43dac8f75c3e"
+    ],
+    "project": {
+      "id": "1b3e123a-432d-4f9c-8b0f-5a83e216527e",
+      "name": "Foregent",
+      "url": "https://linear.app/jimpo/project/foregent-0dcd5bb100c1"
+    },
+    "state": {
+      "id": "f6a28504-0f21-49ad-b4f7-aa0940277df8",
+      "color": "#e2e2e2",
+      "name": "Todo",
+      "type": "unstarted"
+    },
+    "team": {
+      "id": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6",
+      "key": "JIM",
+      "name": "Jimpo"
+    },
+    "labels": [
+      {
+        "id": "91e1d4c5-ea47-43ae-9644-7488023737e7",
+        "color": "#BB87FC",
+        "name": "feature"
+      }
+    ],
+    "releases": [],
+    "description": "Wire the route that JIM-128 left as a sink: authenticate (already there), map the payload with `webhook_event`, drop what foregent does not track, enqueue the rest for delivery. Push works end to end here, while the tick still runs — which is what makes the two paths comparable before one is deleted.\n\n## Scope\n\n* A delivery for an issue foregent has no agent for is dropped, and the route still answers 200. Linear must not be told a delivery failed because it was about somebody else's issue.\n* Both paths now feed the same delivery queue, so a comment can arrive twice: once pushed, once polled. Sending a worker the same comment twice for the length of one ticket is acceptable, and dropping the poll ends it. Say so in the code rather than building dedup that gets deleted a ticket later.\n\n## Acceptance\n\nTests posting signed payloads: a comment on a tracked in-flight issue reaches its agent; one on an untracked issue reaches nobody and still answers 200; one written by foregent's own account reaches nobody."
+  },
+  "url": "https://linear.app/jimpo/issue/JIM-133/wake-and-update-workers-from-linear-webhooks",
+  "type": "Issue",
+  "organizationId": "a6caa4ca-9105-40ee-a70c-a9589610ad37",
+  "webhookTimestamp": 1787167008278,
+  "webhookId": "83fbe1b3-4bc3-4eea-bc3c-6133c7af8ab5"
+}

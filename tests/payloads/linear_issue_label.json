@@ -1,0 +1,24 @@
+{
+  "action": "update",
+  "actor": null,
+  "createdAt": "2026-08-19T19:16:19.932Z",
+  "data": {
+    "id": "91e1d4c5-ea47-43ae-9644-7488023737e7",
+    "createdAt": "2020-07-02T04:52:49.444Z",
+    "updatedAt": "2026-07-28T19:02:13.556Z",
+    "name": "feature",
+    "color": "#BB87FC",
+    "isGroup": false,
+    "lastAppliedAt": "2026-08-19T19:16:19.767Z",
+    "organizationId": "a6caa4ca-9105-40ee-a70c-a9589610ad37",
+    "teamId": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6"
+  },
+  "updatedFrom": {
+    "lastAppliedAt": "2026-08-18T15:28:25.965Z"
+  },
+  "url": "https://linear.app/jimpo/team/JIM/issue-label/feature",
+  "type": "IssueLabel",
+  "organizationId": "a6caa4ca-9105-40ee-a70c-a9589610ad37",
+  "webhookTimestamp": 1787166980060,
+  "webhookId": "83fbe1b3-4bc3-4eea-bc3c-6133c7af8ab5"
+}

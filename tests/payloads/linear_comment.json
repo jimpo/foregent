@@ -1,0 +1,45 @@
+{
+  "action": "create",
+  "actor": {
+    "id": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "name": "AJ",
+    "email": "jim.posen+aj@gmail.com",
+    "url": "https://linear.app/jimpo/profiles/jim.posenaj",
+    "type": "user"
+  },
+  "createdAt": "2026-08-19T19:22:59.574Z",
+  "data": {
+    "id": "5f7ca446-c4df-4413-b10d-62c28671f1f9",
+    "createdAt": "2026-08-19T19:22:59.574Z",
+    "updatedAt": "2026-08-19T19:22:59.518Z",
+    "body": "## Plan\n\nI read the 11 deliveries `/webhooks/linear` has logged since JIM-128 (captured from the running server's pane). What they show:\n\n* `actor` and `updatedFrom` are **top-level**, not inside `data`. `actor` is `{id, name, email, url, type}` and can be `null` (Linear sent a label update with no actor).\n* `Issue` create/update/remove carry `data.identifier` (`JIM-130`). The claim foregent made on this issue is in the log: `actor.id = 442931c7…` with `updatedFrom = {updatedAt, sortOrder, startedAt, assigneeId, stateId}` — exactly the self-wake loop the mapper has to keep filterable.\n* `IssueLabel` update carries the *label definition*, no issue anywhere. It is a real captured \"payload with no issue\".\n* `updatedFrom` gives previous values as **raw ids** (`stateId: f6a28504…`), while `data` carries the resolved object (`data.state.name = \"In Progress\"`). So `state: Todo → Cancelled` is only half-reachable purely: the new side resolves to a name, the old side stays an id. I will not fabricate the old name with a lookup — the mapper stays pure.\n\n### `linear.webhook_event(payload) -> Event | None`\n\nRecognition, in order:\n\n1. Not a dict, no string `type`, or no dict `data` → `None`. That is the envelope every entity delivery has, and it drops `AppUserNotification`-style payloads (which carry `notification`, not `data`) without guessing.\n2. Issue key from `data.issue.identifier`, else `data.identifier`. Empty → `None`.\n3. `type == \"Comment\"` → `EventKind.COMMENT`, body is `data.body`. Anything else → a new `EventKind.ISSUE_UPDATE`. Keying on \"has an issue\" rather than on a list of types means reactions, labels and attachments map the day they arrive, without a release to add them.\n4. `actor.id` → `Event.actor`, `actor.name` → `Event.author`, both defaulting to `\"\"` when the actor is null.\n\n### The `ISSUE_UPDATE` body\n\nOne `field: old → new` line per entry in `updatedFrom`, where:\n\n* a changed relation reported by id is shown under the name of the object it points at — `stateId` renders as `state`, taking the new value from `data.state.name`;\n* `updatedAt`, `sortOrder` and `prioritySortOrder` are dropped. Linear rewrites all three on every issue write, and they bury the field a person actually changed.\n\nSo foregent's own claim reads:\n\n```\nstate: f6a28504-0f21-49ad-b4f7-aa0940277df8 → In Progress\nassignee: none → AJ\nstartedAt: none → 2026-08-19T19:19:27.117Z\n```\n\n### Also in this change\n\n`EventKind`'s docstring says a Linear field update is deliberately not a wake, and `wake_message` has no case for one — an unhandled kind there leaves `header` unbound. Both are fixed, and `docs/PLAN.md` §5.1 records the reversal.\n\nMapping only: no route change, nothing delivered. One pull request's worth, in two commits (`events.py` gains the kind; `linear.py` gains the mapper).\n\n### Test payloads\n\nTests run over the captured deliveries, held as fixtures. The log has no `Comment` yet, so I am generating one — this comment — and will capture it. It is written by foregent's own account, which makes it the acceptance criterion's \"one written by foregent's own account\" at the same time.",
+    "issueId": "a015637c-447d-45a3-973e-c0368543de8c",
+    "userId": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "reactionData": [],
+    "isArtificialAgentSessionRoot": false,
+    "botActor": null,
+    "user": {
+      "id": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+      "name": "AJ",
+      "email": "jim.posen+aj@gmail.com",
+      "url": "https://linear.app/jimpo/profiles/jim.posenaj"
+    },
+    "issue": {
+      "id": "a015637c-447d-45a3-973e-c0368543de8c",
+      "title": "Turn a Linear webhook delivery into a foregent event",
+      "teamId": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6",
+      "team": {
+        "id": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6",
+        "key": "JIM",
+        "name": "Jimpo"
+      },
+      "identifier": "JIM-130",
+      "url": "https://linear.app/jimpo/issue/JIM-130/turn-a-linear-webhook-delivery-into-a-foregent-event"
+    }
+  },
+  "url": "https://linear.app/jimpo/issue/JIM-130/turn-a-linear-webhook-delivery-into-a-foregent-event#comment-5f7ca446",
+  "type": "Comment",
+  "organizationId": "a6caa4ca-9105-40ee-a70c-a9589610ad37",
+  "webhookTimestamp": 1787167379794,
+  "webhookId": "83fbe1b3-4bc3-4eea-bc3c-6133c7af8ab5"
+}

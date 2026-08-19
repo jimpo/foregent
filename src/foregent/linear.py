@@ -7,8 +7,10 @@ is tracking. This is the bridge's own direct Linear access, separate from the
 agent-facing Linear MCP (docs/PLAN.md §5.12).
 
 Traffic in the other direction — deliveries Linear makes to the bridge — is
-here too, as the one thing a receiver has to do before reading a payload:
-:func:`webhook_authentic`.
+here too: :func:`webhook_authentic` proves a payload came from Linear, and
+:func:`webhook_event` turns it into an event in foregent's own shape. Those
+two are the whole of understanding a Linear payload; nothing above this
+module reads one.
 """
 
 from __future__ import annotations
@@ -217,3 +219,104 @@ def poll_comments(
         for node in nodes
     ]
     return events, nodes[-1]["createdAt"] if nodes else since
+
+
+# What Linear rewrites on every issue write. Reporting these alongside the
+# field a person actually changed buries it.
+_BOOKKEEPING = frozenset({"updatedAt", "sortOrder", "prioritySortOrder"})
+
+
+def _readable(value: object) -> str:
+    """A value out of a Linear payload, as a person would read it.
+
+    Linear spells a relation as a nested object with a ``name``, and a set of
+    them as a list of those; everything else is a scalar it already renders.
+    """
+    if isinstance(value, dict):
+        return str(value.get("name", value))
+    if isinstance(value, list):
+        return ", ".join(_readable(item) for item in value) or "none"
+    return "none" if value is None else str(value)
+
+
+def _current(data: dict, field: str) -> tuple[str, object]:
+    """What ``field`` is called and what it now holds, after the change.
+
+    A changed relation is reported under an id field (``stateId``) with the
+    relation itself carried alongside under its own name (``state``), so the
+    id is reported as the thing it points at. The previous value stays the
+    raw id Linear sent: resolving it would need a second call, and this
+    mapping is pure.
+    """
+    for suffix, plural in (("Ids", "s"), ("Id", "")):
+        if field.endswith(suffix):
+            name = field[: -len(suffix)] + plural
+            if name in data:
+                return name, data[name]
+    return field, data.get(field)
+
+
+def _changes(data: dict, updated_from: dict) -> str:
+    """The changed fields, each with the value it held before.
+
+    Enough for a worker to act on the update without re-reading the issue,
+    which is the whole reason the body is filled in at all.
+    """
+    lines = []
+    for field, was in updated_from.items():
+        if field in _BOOKKEEPING:
+            continue
+        name, now = _current(data, field)
+        lines.append(f"{name}: {_readable(was)} → {_readable(now)}")
+    return "\n".join(lines)
+
+
+def webhook_event(payload: dict) -> Event | None:
+    """The foregent event a Linear webhook delivery is, or ``None`` for none.
+
+    Pure, and the whole of understanding a Linear payload: everything above
+    it works in foregent's own shape (docs/PLAN.md §5.1).
+
+    A delivery maps when it is an entity delivery — a ``type`` naming the
+    entity and a ``data`` object holding it — that names an issue, at
+    ``data.issue.identifier`` for something attached to an issue or
+    ``data.identifier`` for the issue itself. Anything else returns ``None``:
+    a payload naming no issue can wake nobody, and a shape this does not
+    recognize is dropped rather than guessed at.
+
+    A comment is its text. Everything else that carries an issue is a field
+    update, keyed on carrying one rather than on a list of entity types, so
+    the reactions, labels and attachments Linear hangs off an issue map
+    without an entry each.
+
+    The actor is carried through because :func:`~foregent.events.wakes` drops
+    foregent's own writes by identity, and this path is how they come back:
+    every comment an agent posts through the Linear MCP, and the assignee and
+    state change the bridge makes to claim an issue (§5.12). A mapping that
+    lost the actor would turn every claim into a wake of the agent it just
+    launched.
+    """
+    data = payload.get("data")
+    if not isinstance(payload.get("type"), str) or not isinstance(data, dict):
+        return None
+    issue = data.get("issue")
+    key = (issue.get("identifier") if isinstance(issue, dict) else None) or data.get(
+        "identifier"
+    )
+    if not isinstance(key, str) or not key:
+        return None
+    # Linear sends no actor for a change it made itself; such an event is
+    # nobody's own write, which is what `wakes` reads "" as.
+    actor = payload.get("actor") or {}
+    if payload["type"] == "Comment":
+        kind, body = EventKind.COMMENT, data.get("body") or ""
+    else:
+        kind = EventKind.ISSUE_UPDATE
+        body = _changes(data, payload.get("updatedFrom") or {})
+    return Event(
+        kind=kind,
+        issue_key=key,
+        actor=actor.get("id") or "",
+        author=actor.get("name") or "",
+        body=body,
+    )

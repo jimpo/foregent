@@ -1,0 +1,86 @@
+{
+  "action": "update",
+  "actor": {
+    "id": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "name": "AJ",
+    "email": "jim.posen+aj@gmail.com",
+    "url": "https://linear.app/jimpo/profiles/jim.posenaj",
+    "type": "user"
+  },
+  "createdAt": "2026-08-19T19:19:27.190Z",
+  "data": {
+    "id": "a015637c-447d-45a3-973e-c0368543de8c",
+    "createdAt": "2026-08-19T19:16:19.735Z",
+    "updatedAt": "2026-08-19T19:19:27.188Z",
+    "number": 130,
+    "title": "Turn a Linear webhook delivery into a foregent event",
+    "priority": 0,
+    "sortOrder": 35,
+    "prioritySortOrder": -93742,
+    "startedAt": "2026-08-19T19:19:27.117Z",
+    "slaType": "all",
+    "addedToProjectAt": "2026-08-19T19:16:19.820Z",
+    "addedToTeamAt": "2026-08-19T19:16:19.820Z",
+    "labelIds": [
+      "91e1d4c5-ea47-43ae-9644-7488023737e7"
+    ],
+    "teamId": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6",
+    "projectId": "1b3e123a-432d-4f9c-8b0f-5a83e216527e",
+    "previousIdentifiers": [],
+    "creatorId": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "assigneeId": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+    "stateId": "c67cc2fa-9587-4945-b7b9-eb6e48872d9e",
+    "reactionData": [],
+    "priorityLabel": "No priority",
+    "inheritsSharedAccess": false,
+    "botActor": null,
+    "identifier": "JIM-130",
+    "url": "https://linear.app/jimpo/issue/JIM-130/turn-a-linear-webhook-delivery-into-a-foregent-event",
+    "subscriberIds": [
+      "442931c7-7df1-4c3f-994d-43dac8f75c3e"
+    ],
+    "assignee": {
+      "id": "442931c7-7df1-4c3f-994d-43dac8f75c3e",
+      "name": "AJ",
+      "email": "jim.posen+aj@gmail.com",
+      "url": "https://linear.app/jimpo/profiles/jim.posenaj"
+    },
+    "project": {
+      "id": "1b3e123a-432d-4f9c-8b0f-5a83e216527e",
+      "name": "Foregent",
+      "url": "https://linear.app/jimpo/project/foregent-0dcd5bb100c1"
+    },
+    "state": {
+      "id": "c67cc2fa-9587-4945-b7b9-eb6e48872d9e",
+      "color": "#f2c94c",
+      "name": "In Progress",
+      "type": "started"
+    },
+    "team": {
+      "id": "9a1bf9e6-353d-441c-8af1-92cca93c4bf6",
+      "key": "JIM",
+      "name": "Jimpo"
+    },
+    "labels": [
+      {
+        "id": "91e1d4c5-ea47-43ae-9644-7488023737e7",
+        "color": "#BB87FC",
+        "name": "feature"
+      }
+    ],
+    "releases": [],
+    "description": "Add `linear.webhook_event(payload) -> Event | None`: a pure mapping from a Linear webhook body to foregent's own event shape. Write it against the payloads `/webhooks/linear` has been logging since JIM-128, not against a guess at the schema.\n\n## Scope\n\n* Any payload naming an issue foregent could be tracking maps. `Comment` becomes `EventKind.COMMENT` with the comment text as the body; everything else that carries an issue (`Issue` create/update/remove, reactions, labels, attachments) becomes a new `EventKind.ISSUE_UPDATE`.\n* The issue key comes from `data.issue.identifier` or `data.identifier`. A payload with no issue identifier returns `None`, and so does one whose shape the mapper does not recognize — an unknown payload is dropped, never guessed at.\n* Fill in the actor id from the payload. `wakes()` drops foregent's own writes by actor identity, and this path now carries the writes agents make through the Linear MCP *and* the assignee/state change foregent makes when it claims an issue. A mapping that loses the actor turns every claim into a self-wake loop.\n* For `ISSUE_UPDATE`, build the body from `updatedFrom` — the changed fields with their previous values (`state: Todo → Cancelled`) — so a worker can act on the update without re-reading the issue.\n* `events.py` currently says a Linear field update is deliberately not a wake. That decision reverses here; update the module docstring and `docs/PLAN.md` §5.1 with it.\n\nMapping only. Nothing is delivered and no route changes — that is the next ticket.\n\n## Acceptance\n\nUnit tests over captured payloads: a comment, an issue update with several changed fields, a payload with no issue, one of an unrecognized type, and one written by foregent's own account (which must carry the actor through so the filter can drop it)."
+  },
+  "updatedFrom": {
+    "updatedAt": "2026-08-19T19:16:19.735Z",
+    "sortOrder": -20142,
+    "startedAt": null,
+    "assigneeId": null,
+    "stateId": "f6a28504-0f21-49ad-b4f7-aa0940277df8"
+  },
+  "url": "https://linear.app/jimpo/issue/JIM-130/turn-a-linear-webhook-delivery-into-a-foregent-event",
+  "type": "Issue",
+  "organizationId": "a6caa4ca-9105-40ee-a70c-a9589610ad37",
+  "webhookTimestamp": 1787167167699,
+  "webhookId": "83fbe1b3-4bc3-4eea-bc3c-6133c7af8ab5"
+}
