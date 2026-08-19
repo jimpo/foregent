@@ -5,7 +5,8 @@ HTTP so the CLI can stay a thin client (``docs/PLAN.md`` §2, Bridge core).
 Queued issues are dispatched to agents as capacity allows, through the
 :class:`~foregent.agents.AgentManager` seam (§5.13) rather than to any one
 harness, and a periodic tick asks Linear what changed on the issues it is
-tracking, so a parked agent is woken by activity on its own issue (§5.1).
+tracking, so an agent sees activity on its own issue whether it is working
+or parked (§5.1).
 ``/webhooks/linear`` receives what Linear pushes, and logs it (§8, Q8).
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
@@ -38,9 +39,9 @@ from foregent.agents import (
     label_for,
 )
 from foregent.agents.herdr_claude import HerdrClaudeManager
-from foregent.events import Event, wake_message, wakes
+from foregent.events import Event, delivery_message, wakes
 from foregent.models import Issue, IssueStatus
-from foregent.store import IssueStore
+from foregent.store import IN_FLIGHT, IssueStore
 
 logger = logging.getLogger(__name__)
 
@@ -153,23 +154,29 @@ def watch_agents() -> None:
 
 
 def deliver(event: Event, viewer: str) -> None:
-    """Wake whichever parked agent ``event`` was for, if any (docs/PLAN.md §5.6).
+    """Hand ``event`` to whichever agent it was for, if any (docs/PLAN.md §5.1).
 
-    Goes through :func:`wake_issue` rather than the store directly, so that
-    parked-ness, send-before-unblock, and the 409 for an issue nobody is
-    waiting on all stay decided in one place. An event with nowhere to go is
-    the normal case, not an error: the tick polls every in-flight issue, and
-    most of them have a working agent that this ticket does not deliver to.
+    Goes through :func:`deliver_issue` rather than the store directly, so that
+    the live-agent guard, send-before-unblock, and the 409 for an issue with
+    nobody behind it all stay decided in one place. An event with nowhere to
+    go is the normal case, not an error: the tick polls every in-flight issue,
+    and a person comments on issues foregent is not tracking at all.
+
+    The status is read once here only to word the prompt: a parked agent is
+    being woken and a working one is not, and only the caller of a plain
+    ``message`` endpoint can know which.
     """
     key = wakes(event, viewer)
     if not key:
         return
+    issue = store.get(key)
+    parked = issue is not None and issue.status is IssueStatus.BLOCKED
     try:
-        wake_issue(key, wake_message(event))
+        deliver_issue(key, delivery_message(event, parked=parked))
     except HTTPException as exc:
-        logger.debug("event on %s woke nobody: %s", key, exc.detail)
+        logger.debug("event on %s reached nobody: %s", key, exc.detail)
         return
-    logger.info("woke %s on activity by %s", key, event.author or "someone")
+    logger.info("delivered to %s on activity by %s", key, event.author or "someone")
 
 
 def poll_tick(cursor: str, viewer: str) -> tuple[str, str]:
@@ -407,18 +414,26 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
     return _record(issue)
 
 
-@app.post("/issues/{key}/wake")
-def wake_issue(key: str, message: Annotated[str, Body(embed=True)]) -> dict[str, str]:
-    """Deliver ``message`` to issue ``key``'s parked agent and unblock it.
+@app.post("/issues/{key}/deliver")
+def deliver_issue(
+    key: str, message: Annotated[str, Body(embed=True)]
+) -> dict[str, str]:
+    """Deliver ``message`` to issue ``key``'s agent, unblocking it if parked.
 
-    The counterpart to :func:`block_issue` (docs/PLAN.md §5.6): the event the
-    agent parked on has arrived, its process never died, and prompting it is
-    the whole of waking it up. Capacity does not change and nothing is
-    dispatched — the agent held its slot for the duration of the block.
+    Every agent foregent has running is reachable, not only a parked one: a
+    worker should see activity on its own issue as soon as it happens
+    (docs/PLAN.md §5.1). What the status decides is only what happens *after*
+    the send. A BLOCKED issue is unblocked, as the counterpart to
+    :func:`block_issue` (§5.6) — the event the agent parked on has arrived and
+    prompting it is the whole of waking it up. An IN_PROGRESS or IN_REVIEW
+    issue is left exactly as it was; it was never waiting. Capacity does not
+    change either way and nothing is dispatched, because the agent has been
+    holding its slot the whole time.
 
-    409 if the issue is not parked. That covers two cases: it is not BLOCKED
-    at all, and it is BLOCKED with no agent recorded — ``block()`` upserts an
-    unknown key, so an issue can carry a blocker with nothing to prompt.
+    409 for an issue with no agent to prompt. Both halves of the guard are
+    needed and neither implies the other: a Done issue keeps the agent ref of
+    the agent foregent has since stopped, and ``block()`` upserts an unknown
+    key, so an issue can carry a blocker with nothing behind it.
 
     **Sends first, unblocks second**, so a harness failure leaves the issue
     BLOCKED with no rollback path to get wrong and a retry is safe. It is
@@ -427,16 +442,18 @@ def wake_issue(key: str, message: Annotated[str, Body(embed=True)]) -> dict[str,
     before it lands.
     """
     issue = store.get(key)
-    if issue is None or issue.status is not IssueStatus.BLOCKED:
+    if issue is None or issue.status not in IN_FLIGHT or issue.agent is None:
         status = issue.status if issue is not None else "not tracked"
-        raise HTTPException(status_code=409, detail=f"{key} is {status}, not blocked")
-    if issue.agent is None:
-        raise HTTPException(status_code=409, detail=f"{key} has no agent to wake")
+        raise HTTPException(
+            status_code=409, detail=f"{key} has no agent to deliver to ({status})"
+        )
     try:
         manager.send(issue.agent, message)
     except AgentError as exc:
         raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
-    return _record(store.unblock(key) or issue)
+    if issue.status is IssueStatus.BLOCKED:
+        issue = store.unblock(key) or issue
+    return _record(issue)
 
 
 @app.post("/webhooks/linear")

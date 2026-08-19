@@ -161,9 +161,10 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
     window and the cursor would skip everything older that did not fit.
     `last` serves the oldest page, ascending, and the next tick collects the
     remainder.
-  - Every **in-flight** issue is polled, not only the parked ones. Events for
-    a working agent are dropped (delivering to one is a later ticket), but
-    polling them is what keeps the cursor honest: watching only blocked
+  - Every **in-flight** issue is polled, not only the parked ones, and every
+    one of them is delivered to (JIM-131): a worker should see activity on
+    its own issue as soon as it happens, not once it happens to park. Polling
+    the lot is also what keeps the cursor honest — watching only blocked
     issues would hand a newly parked one a cursor from before it existed, and
     wake it with comments that predate its own block.
 - **Events are foregent's own shape**, not a provider payload. The transport
@@ -204,8 +205,9 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
 - Dispatch: ready issue → claim it (assignee + In Progress, §5.12) → acquire
   workspace (§5.7) → `AgentManager.launch()` → brief the agent with its issue
   key and the `foregent-worker` skill.
-- Wake: an event on a parked agent's own issue → prompt delivered to the
-  still-alive agent (§5.6). Matching is `wakes(event) -> key`, a lookup rather
+- Delivery: an event on an agent's own issue → prompt delivered to that agent,
+  working or parked; a parked one is unblocked afterwards and a working one is
+  left as it was (§5.6). Matching is `wakes(event) -> key`, a lookup rather
   than a scan, because the event names the issue it is about.
 - **Never wake on foregent's own writes.** Claiming an issue assigns it and
   moves its state, and agents comment through the Linear MCP under the same
@@ -295,12 +297,13 @@ cares.
   `AgentManager.send()`. Context is intact because the process never died and
   the workspace was never released. Capacity does not change either — the
   parked agent was holding its slot the whole time.
-- **An event wakes the agent that owns the issue the event is about**, and the
-  blocker is never read (`foregent/events.py`, a pure `wakes(event) -> key` so
-  it is testable without a server, a transport or a live agent — the tick
+- **An event goes to the agent that owns the issue the event is about**, and
+  the blocker is never read (`foregent/events.py`, a pure `wakes(event) -> key`
+  so it is testable without a server, a transport or a live agent — the tick
   (§5.1) then becomes a trigger for machinery that already works).
-  Three kinds wake an agent, and nothing else does:
+  Four kinds reach an agent, and nothing else does:
   - a comment or reply on the agent's own Linear issue;
+  - a change to one of that issue's fields, its state above all (JIM-130);
   - a review or comment on the pull request linked to that issue, inline or
     PR-level;
   - that pull request ceasing to merge cleanly as main advances.
@@ -321,17 +324,25 @@ cares.
     operator comments on the parked ticket instead — a person deciding the
     dependency is satisfied, rather than the bridge guessing it from a state
     change.
-  - Linear *field* updates deliberately do not wake: a priority tweak or a
-    label change is not an answer to the question the agent asked.
-- The wake message **carries the event**, not merely "you are unblocked": the
-  agent has to act on the feedback, and re-reading the issue to find out what
-  it was is a round trip it does not need.
-- `POST /issues/{key}/wake` is the seam ingestion will call, and is drivable
+- The message **carries the event**, not merely "you are unblocked": the agent
+  has to act on the feedback, and re-reading the issue to find out what it was
+  is a round trip it does not need. It has **two wordings** (JIM-131): a
+  parked agent is idle and waiting for exactly this, so it is told it is
+  being woken; a working agent was never waiting, and telling it otherwise is
+  a lie it would have to reason past.
+- **A live agent is reachable whether or not it is parked** (JIM-131). What
+  the status decides is only what happens after the send: BLOCKED is
+  unblocked, IN_PROGRESS and IN_REVIEW are left exactly as they were, and
+  capacity and the dispatch queue are untouched either way — the agent has
+  been holding its slot the whole time. An issue with no agent behind it,
+  which includes Queued, Orphaned, Done and untracked, is dropped and logged
+  at debug: the normal case, not an error.
+- `POST /issues/{key}/deliver` is the seam ingestion calls, and is drivable
   with `curl` on its own. It **sends before it unblocks**, so a harness
   failure leaves the issue BLOCKED with no rollback path to get wrong and a
   retry is safe — and because an agent that has not received the message is
   not awake yet. A blocked issue with no agent recorded is a 409, like one
-  that was never parked.
+  that was never dispatched.
 - Cold parking (terminate on block, `--resume` on wake) is technically viable
   since resume works, but instant wake and a guaranteed-intact context beat the
   memory savings for a small fleet. Resume is for *recovery* (§5.12), not

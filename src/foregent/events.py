@@ -1,15 +1,15 @@
-"""Which parked issue does an incoming event wake?
+"""Which issue does an incoming event belong to?
 
-An agent that reports itself blocked parks alive in its workspace until
-something outside it changes (``docs/PLAN.md`` §5.6). This module is the
-decision of *which* parked agent a given event was for, plus the vocabulary it
-needs: a normalized :class:`Event` and a pure :func:`wakes`.
+This module is the decision of *which* agent a given event was for, plus the
+vocabulary it needs: a normalized :class:`Event` and a pure :func:`wakes`.
 
-The rule is **an event wakes the agent that owns the issue the event is
+The rule is **an event goes to the agent that owns the issue the event is
 about** — a comment on the issue, a change to one of its fields, or activity
-on the pull request linked to it. The blocker the agent reported is never
-read: it says what the agent was waiting for, in whatever words it chose, and
-is for the operator reading ``foregent status``.
+on the pull request linked to it. It goes there whether that agent is working
+or parked on a block (``docs/PLAN.md`` §5.6): a worker should see activity on
+its own issue as soon as it happens. The blocker a parked agent reported is
+never read: it says what the agent was waiting for, in whatever words it
+chose, and is for the operator reading ``foregent status``.
 
 Ingestion — the periodic tick that asks Linear and GitHub what changed, and
 resolving a pull request back to the Linear issue it is linked to — lands
@@ -24,13 +24,13 @@ from enum import StrEnum
 
 
 class EventKind(StrEnum):
-    """The kinds of outside event that wake a parked agent.
+    """The kinds of outside event an agent is told about.
 
-    Anything else ingestion receives is not a wake. A Linear field update is
-    one of them because a person answers an agent by moving the issue at
+    Anything else ingestion receives is not delivered. A Linear field update
+    is one of them because a person answers an agent by moving the issue at
     least as often as by writing to it: a design parked for review is
     approved by a state change, and an issue cancelled under a working agent
-    is something it has to be told. Which updates are worth a wake is the
+    is something it has to be told. Which updates are worth delivering is the
     dispatcher's judgment, not this vocabulary's.
     """
 
@@ -53,14 +53,14 @@ class Event:
     request's link to the issue — which Linear makes for itself off the branch
     name — so a worker never has to report its own PR number to be findable.
     An event ingestion could not attribute to an issue carries no key and
-    wakes nobody.
+    reaches nobody.
 
     Deliberately flat: a per-platform payload hierarchy would put the work of
     understanding two payload formats into every consumer instead of into
     ingestion alone. The fields matching does not read (``repo``, ``number``,
-    ``author``, ``body``) are what :func:`wake_message` hands the agent, so it
-    can act on the event rather than go re-read the issue to find out what
-    happened.
+    ``author``, ``body``) are what :func:`delivery_message` hands the agent,
+    so it can act on the event rather than go re-read the issue to find out
+    what happened.
     """
 
     kind: EventKind
@@ -78,18 +78,18 @@ class Event:
 
 
 def wakes(event: Event, viewer: str = "") -> str:
-    """The issue whose parked agent ``event`` wakes, or ``""`` for none.
+    """The issue whose agent ``event`` goes to, or ``""`` for none.
 
     Pure, and a lookup rather than a scan: the event names its own issue, so
-    there is nothing to search parked agents for. The caller checks that the
-    issue is actually parked — an event on an issue nobody is waiting on is
-    not an error, just a wake with nowhere to go.
+    there is nothing to search agents for. The caller checks that the issue
+    has a live agent to deliver to — an event on an issue nobody is working
+    is not an error, just a message with nowhere to go.
 
     ``viewer`` is foregent's own account id on the event's platform. Foregent
     writes to Linear as that account on every dispatch (assignee + In
     Progress), and so does every agent posting through the Linear MCP, so
     those writes come straight back as events; without dropping them the
-    bridge wakes agents with their own writes, and a wake that triggers
+    bridge prompts agents with their own writes, and a prompt that triggers
     another write is a loop. The filter is on **actor identity, not
     content**. An event with no actor is never foregent's own.
     """
@@ -98,24 +98,29 @@ def wakes(event: Event, viewer: str = "") -> str:
     return event.issue_key
 
 
-def wake_message(event: Event) -> str:
-    """What to prompt a woken agent with.
+def delivery_message(event: Event, *, parked: bool) -> str:
+    """What to prompt the agent ``event`` reached with.
 
-    Carries the event that resolved the block rather than a bare "you are
-    unblocked": the agent has to act on the feedback, and re-reading the
-    issue to find out what it was costs a round trip it does not need.
+    Carries the event itself rather than a bare "something happened": the
+    agent has to act on the feedback, and re-reading the issue to find out
+    what it was costs a round trip it does not need.
+
+    ``parked`` is the one difference between the two readers. A parked agent
+    is idle and waiting for exactly this, so the message says it is being
+    woken; a working agent was never waiting, and telling it that it is being
+    woken is a lie it would have to reason past. The event reads the same
+    either way.
     """
     who = event.author or "someone"
     pull_request = f"{event.repo}#{event.number}"
     match event.kind:
         case EventKind.COMMENT:
-            header = f"Waking you: {who} commented on {event.issue_key}."
+            what = f"{who} commented on {event.issue_key}."
         case EventKind.ISSUE_UPDATE:
-            header = f"Waking you: {who} updated {event.issue_key}."
+            what = f"{who} updated {event.issue_key}."
         case EventKind.PR_REVIEW:
-            header = f"Waking you: {who} reviewed {pull_request}."
+            what = f"{who} reviewed {pull_request}."
         case EventKind.PR_CONFLICT:
-            header = (
-                f"Waking you: {pull_request} no longer merges cleanly into main."
-            )
+            what = f"{pull_request} no longer merges cleanly into main."
+    header = f"Waking you: {what}" if parked else what
     return f"{header}\n\n{event.body}" if event.body else header

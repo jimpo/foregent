@@ -269,8 +269,8 @@ class DispatchTests(unittest.TestCase):
         )
 
 
-class WakeTests(unittest.TestCase):
-    """Prompting a parked agent with the event that resolved it (JIM-101)."""
+class DeliverTests(unittest.TestCase):
+    """Prompting the agent an event was for, working or parked (JIM-131)."""
 
     def setUp(self) -> None:
         server.store = IssueStore()
@@ -291,51 +291,87 @@ class WakeTests(unittest.TestCase):
             )
         )
 
-    def test_waking_sends_the_message_and_resumes_the_issue(self) -> None:
+    def work(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
+        server.store.add(
+            Issue(key="JIM-88", title="", status=status, agent=self.ref)
+        )
+
+    def test_delivering_to_a_parked_agent_sends_and_resumes_the_issue(self) -> None:
         self.park()
-        record = server.wake_issue("JIM-88", "AJ commented: ship it")
+        record = server.deliver_issue("JIM-88", "AJ commented: ship it")
         self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
         self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
         self.assertEqual(record["blocker"], "")
 
-    def test_waking_does_not_dispatch_anything_else(self) -> None:
-        # The woken agent held its capacity slot the whole time it was parked
-        # (docs/PLAN.md §5.6), so waking it frees nothing.
+    def test_delivering_to_a_working_agent_sends_and_changes_nothing(self) -> None:
+        # A worker sees activity on its own issue as it happens; it was never
+        # waiting, so there is no status to move it out of.
+        self.work()
+        record = server.deliver_issue("JIM-88", "AJ commented: ship it")
+        self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
+        self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
+
+    def test_delivering_to_an_agent_in_review_sends_and_changes_nothing(self) -> None:
+        self.work(IssueStatus.IN_REVIEW)
+        record = server.deliver_issue("JIM-88", "go on")
+        self.assertEqual(self.manager.sent, [(self.ref, "go on")])
+        self.assertEqual(record["status"], IssueStatus.IN_REVIEW)
+
+    def test_delivering_does_not_dispatch_anything_else(self) -> None:
+        # The agent held its capacity slot the whole time, parked or not
+        # (docs/PLAN.md §5.6), so prompting it frees nothing.
         self.park()
         server.store.queue("JIM-89", "/ws/JIM-89")
-        server.wake_issue("JIM-88", "go on")
+        server.deliver_issue("JIM-88", "go on")
         self.assertEqual(self.manager.launched, [])
 
-    def test_waking_an_issue_that_is_not_blocked_is_a_conflict(self) -> None:
-        server.store.add(
-            Issue(key="JIM-88", title="", status=IssueStatus.IN_PROGRESS, agent=self.ref)
-        )
+    def test_delivering_to_an_untracked_issue_is_a_conflict(self) -> None:
         with self.assertRaises(server.HTTPException) as caught:
-            server.wake_issue("JIM-88", "go on")
+            server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(self.manager.sent, [])
 
-    def test_waking_an_untracked_issue_is_a_conflict(self) -> None:
+    def test_delivering_to_a_queued_issue_is_a_conflict(self) -> None:
+        # Nothing is running yet: the brief at dispatch is what it will read.
+        server.store.queue("JIM-88", "/ws/JIM-88")
         with self.assertRaises(server.HTTPException) as caught:
-            server.wake_issue("JIM-88", "go on")
+            server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(self.manager.sent, [])
 
-    def test_waking_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
+    def test_delivering_to_an_orphaned_issue_is_a_conflict(self) -> None:
+        self.work()
+        server.store.orphan("JIM-88")
+        with self.assertRaises(server.HTTPException) as caught:
+            server.deliver_issue("JIM-88", "go on")
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_delivering_to_a_completed_issue_is_a_conflict(self) -> None:
+        # Done keeps the ref of the agent foregent has since stopped, so the
+        # status is what rules it out, not the missing agent.
+        self.work()
+        server.store.complete("JIM-88")
+        with self.assertRaises(server.HTTPException) as caught:
+            server.deliver_issue("JIM-88", "go on")
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_delivering_to_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
         # `block()` upserts an unknown key, so an issue can carry a blocker
         # with nothing to prompt.
         server.store.block("JIM-88", "a review of the PR")
         with self.assertRaises(server.HTTPException) as caught:
-            server.wake_issue("JIM-88", "go on")
+            server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
 
     def test_a_harness_failure_leaves_the_issue_blocked(self) -> None:
         # So a retry is safe: nothing was delivered, and the blocker is still
-        # recorded to match the next event against.
+        # recorded for the operator reading `foregent status`.
         self.park()
         self.manager.fail_send = AgentError("prompt never landed")
         with self.assertRaises(server.HTTPException) as caught:
-            server.wake_issue("JIM-88", "go on")
+            server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 502)
         issue = server.store.get("JIM-88")
         assert issue is not None
@@ -573,6 +609,16 @@ class PollTickTests(unittest.TestCase):
             )
         )
 
+    def work(self, key: str = "JIM-36") -> None:
+        server.store.add(
+            Issue(
+                key=key,
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                agent=AgentRef(f"fg-{key.lower()}", "conversation-1"),
+            )
+        )
+
     def tick(self, cursor: str = "T0", viewer: str = "") -> tuple[str, str]:
         return server.poll_tick(cursor, viewer)
 
@@ -581,10 +627,32 @@ class PollTickTests(unittest.TestCase):
         self.answer([comment("JIM-36", body="ship it")], cursor="T1")
         self.tick()
         _, text = self.manager.sent[0]
+        self.assertIn("Waking", text)
         self.assertIn("ship it", text)
         issue = server.store.get("JIM-36")
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+
+    def test_a_comment_on_a_working_issue_reaches_its_agent_too(self) -> None:
+        # JIM-131: a worker sees activity on its own issue as it happens, and
+        # is not told it is being woken from a block it never reported.
+        self.work()
+        self.answer([comment("JIM-36", body="ship it")], cursor="T1")
+        self.tick()
+        _, text = self.manager.sent[0]
+        self.assertNotIn("Waking", text)
+        self.assertIn("ship it", text)
+
+    def test_a_delivery_to_a_working_agent_leaves_its_issue_alone(self) -> None:
+        # Nothing about it was waiting: not its status, and not its slot.
+        self.work()
+        server.store.queue("JIM-41", "/ws/JIM-41")
+        self.answer([comment("JIM-36")], cursor="T1")
+        self.tick()
+        issue = server.store.get("JIM-36")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+        self.assertEqual(self.manager.launched, [])
 
     def test_the_cursor_advances_only_over_what_was_served(self) -> None:
         # Cursor, not clock (JIM-36): the next window starts at the last
@@ -620,10 +688,10 @@ class PollTickTests(unittest.TestCase):
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.BLOCKED)
 
-    def test_an_event_for_an_issue_nobody_is_parked_on_is_dropped(self) -> None:
-        # Every in-flight issue is polled, so most events arrive for a working
-        # agent. Delivering to those is a later ticket; dropping them is not
-        # an error and must not stop the pass.
+    def test_an_event_for_an_issue_with_no_agent_is_dropped(self) -> None:
+        # The normal case, not an error: an in-flight issue can be recorded
+        # with nothing behind it, and a person comments on issues foregent is
+        # not tracking at all. Neither may stop the pass.
         server.store.add(
             Issue(key="JIM-36", title="", status=IssueStatus.IN_PROGRESS)
         )

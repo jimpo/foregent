@@ -13,8 +13,9 @@ from dataclasses import replace
 from foregent.models import Issue, IssueStatus
 
 # An issue with a live agent working it, whether or not that agent is busy.
-# These are the states an issue can be orphaned out of (docs/PLAN.md §5.12).
-_IN_FLIGHT = (IssueStatus.IN_PROGRESS, IssueStatus.IN_REVIEW, IssueStatus.BLOCKED)
+# These are the states an event can be delivered into (docs/PLAN.md §5.1) and
+# the ones an issue can be orphaned out of (§5.12).
+IN_FLIGHT = (IssueStatus.IN_PROGRESS, IssueStatus.IN_REVIEW, IssueStatus.BLOCKED)
 
 
 class IssueStore:
@@ -118,7 +119,7 @@ class IssueStore:
           that tells them apart, and ``complete()`` has already run by then.
         """
         existing = self._issues.get(key)
-        if existing is None or existing.status not in _IN_FLIGHT:
+        if existing is None or existing.status not in IN_FLIGHT:
             return None
         issue = replace(existing, status=IssueStatus.ORPHANED, agent=None)
         self._issues[key] = issue
@@ -131,7 +132,7 @@ class IssueStore:
         only matters on issues foregent has an agent for, and only those cost
         anything to watch.
         """
-        return [i for i in self.list_issues() if i.status in _IN_FLIGHT]
+        return [i for i in self.list_issues() if i.status in IN_FLIGHT]
 
     def list_issues(self) -> list[Issue]:
         """Return all issues, sorted by key for stable output."""

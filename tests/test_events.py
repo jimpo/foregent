@@ -1,4 +1,4 @@
-"""Tests for deciding which parked agent an event wakes (JIM-101).
+"""Tests for deciding which agent an event goes to (JIM-101).
 
 Matching is a pure function over the event (``docs/PLAN.md`` §5.6), so none of
 this needs a server, a transport, or a live agent — which is the point of
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from foregent.events import Event, EventKind, wake_message, wakes
+from foregent.events import Event, EventKind, delivery_message, wakes
 
 # Foregent's own Linear account: it writes as this on every dispatch, and so
 # does every agent posting through the Linear MCP.
@@ -86,13 +86,15 @@ class SelfEventTests(unittest.TestCase):
         self.assertEqual(wakes(comment("JIM-42", actor=""), FOREGENT), "JIM-42")
 
 
-class WakeMessageTests(unittest.TestCase):
-    """What the woken agent is told (docs/PLAN.md §5.6)."""
+class DeliveryMessageTests(unittest.TestCase):
+    """What the agent the event reached is told (docs/PLAN.md §5.6)."""
 
     def test_a_comment_carries_who_said_what(self) -> None:
         # Not merely "you are unblocked": the agent has to act on the
         # feedback, and re-reading the issue is a round trip it does not need.
-        message = wake_message(comment("JIM-42", body="the schema is wrong"))
+        message = delivery_message(
+            comment("JIM-42", body="the schema is wrong"), parked=True
+        )
         self.assertIn("AJ", message)
         self.assertIn("JIM-42", message)
         self.assertIn("the schema is wrong", message)
@@ -100,21 +102,22 @@ class WakeMessageTests(unittest.TestCase):
     def test_an_issue_update_carries_what_changed(self) -> None:
         # A state change is an answer as much as a comment is, so the agent
         # is told which field moved rather than that "something happened".
-        message = wake_message(
+        message = delivery_message(
             Event(
                 kind=EventKind.ISSUE_UPDATE,
                 issue_key="JIM-42",
                 actor="operator",
                 author="AJ",
                 body="state: Todo → Cancelled",
-            )
+            ),
+            parked=True,
         )
         self.assertIn("AJ", message)
         self.assertIn("JIM-42", message)
         self.assertIn("state: Todo → Cancelled", message)
 
     def test_a_review_names_the_pull_request(self) -> None:
-        message = wake_message(
+        message = delivery_message(
             Event(
                 kind=EventKind.PR_REVIEW,
                 issue_key="JIM-42",
@@ -122,7 +125,8 @@ class WakeMessageTests(unittest.TestCase):
                 number=123,
                 author="AJ",
                 body="rename this",
-            )
+            ),
+            parked=True,
         )
         self.assertIn("AJ", message)
         self.assertIn("jimpo/binius64#123", message)
@@ -130,19 +134,36 @@ class WakeMessageTests(unittest.TestCase):
 
     def test_a_conflict_says_what_broke(self) -> None:
         # Nobody said anything here, so the message has to stand on its own.
-        message = wake_message(
+        message = delivery_message(
             Event(
                 kind=EventKind.PR_CONFLICT,
                 issue_key="JIM-42",
                 repo="jimpo/binius64",
                 number=123,
-            )
+            ),
+            parked=True,
         )
         self.assertIn("jimpo/binius64#123", message)
         self.assertIn("main", message)
 
+    def test_a_parked_agent_is_told_it_is_being_woken(self) -> None:
+        self.assertIn("Waking", delivery_message(comment("JIM-42"), parked=True))
+
+    def test_a_working_agent_is_not(self) -> None:
+        # It never stopped, so "waking you" is a lie it would have to reason
+        # past (JIM-131). The event itself reads the same either way.
+        message = delivery_message(
+            comment("JIM-42", body="the schema is wrong"), parked=False
+        )
+        self.assertNotIn("Waking", message)
+        self.assertIn("AJ", message)
+        self.assertIn("JIM-42", message)
+        self.assertIn("the schema is wrong", message)
+
     def test_an_anonymous_comment_still_reads(self) -> None:
-        message = wake_message(Event(kind=EventKind.COMMENT, issue_key="BIN-7"))
+        message = delivery_message(
+            Event(kind=EventKind.COMMENT, issue_key="BIN-7"), parked=True
+        )
         self.assertIn("someone", message)
         self.assertIn("BIN-7", message)
 
