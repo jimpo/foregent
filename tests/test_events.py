@@ -97,6 +97,22 @@ class WakeMessageTests(unittest.TestCase):
         self.assertIn("JIM-42", message)
         self.assertIn("the schema is wrong", message)
 
+    def test_an_issue_update_carries_what_changed(self) -> None:
+        # A state change is an answer as much as a comment is, so the agent
+        # is told which field moved rather than that "something happened".
+        message = wake_message(
+            Event(
+                kind=EventKind.ISSUE_UPDATE,
+                issue_key="JIM-42",
+                actor="operator",
+                author="AJ",
+                body="state: Todo → Cancelled",
+            )
+        )
+        self.assertIn("AJ", message)
+        self.assertIn("JIM-42", message)
+        self.assertIn("state: Todo → Cancelled", message)
+
     def test_a_review_names_the_pull_request(self) -> None:
         message = wake_message(
             Event(

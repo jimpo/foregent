@@ -6,10 +6,10 @@ decision of *which* parked agent a given event was for, plus the vocabulary it
 needs: a normalized :class:`Event` and a pure :func:`wakes`.
 
 The rule is **an event wakes the agent that owns the issue the event is
-about** — a comment on the issue, or activity on the pull request linked to
-it. The blocker the agent reported is never read: it says what the agent was
-waiting for, in whatever words it chose, and is for the operator reading
-``foregent status``.
+about** — a comment on the issue, a change to one of its fields, or activity
+on the pull request linked to it. The blocker the agent reported is never
+read: it says what the agent was waiting for, in whatever words it chose, and
+is for the operator reading ``foregent status``.
 
 Ingestion — the periodic tick that asks Linear and GitHub what changed, and
 resolving a pull request back to the Linear issue it is linked to — lands
@@ -26,13 +26,18 @@ from enum import StrEnum
 class EventKind(StrEnum):
     """The kinds of outside event that wake a parked agent.
 
-    Exactly these three; anything else ingestion receives is not a wake. A
-    Linear *field* update is the notable omission — a priority tweak or a
-    label change is not an answer to a parked agent's question.
+    Anything else ingestion receives is not a wake. A Linear field update is
+    one of them because a person answers an agent by moving the issue at
+    least as often as by writing to it: a design parked for review is
+    approved by a state change, and an issue cancelled under a working agent
+    is something it has to be told. Which updates are worth a wake is the
+    dispatcher's judgment, not this vocabulary's.
     """
 
     # Someone commented, or replied to a comment, on the Linear issue.
     COMMENT = "comment"
+    # A field of the Linear issue changed: its state, assignee, labels.
+    ISSUE_UPDATE = "issue_update"
     # A review or a comment on the linked pull request, inline or PR-level.
     PR_REVIEW = "pr_review"
     # The linked pull request stopped merging cleanly as main advanced.
@@ -105,6 +110,8 @@ def wake_message(event: Event) -> str:
     match event.kind:
         case EventKind.COMMENT:
             header = f"Waking you: {who} commented on {event.issue_key}."
+        case EventKind.ISSUE_UPDATE:
+            header = f"Waking you: {who} updated {event.issue_key}."
         case EventKind.PR_REVIEW:
             header = f"Waking you: {who} reviewed {pull_request}."
         case EventKind.PR_CONFLICT:
