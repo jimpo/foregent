@@ -106,11 +106,11 @@ One machine (or VM) per project. Three layers:
 
 ```
             Linear / GitHub  (cloud)
-                 │ polled              ▲ comments, PRs, issue updates
-                 ▼                     │ (written by agents via MCP)
+                 │ webhooks            ▲ comments, PRs, issue updates
+                 ▼ (HTTPS ingress)     │ (written by agents via MCP)
   ┌───────────────────────────────────┴─────────────┐
   │ foregent bridge (Python/FastAPI, STATELESS)     │
-  │  • event tick + routing                         │
+  │  • event ingest + routing                       │
   │  • AgentManager (herdr+Claude Code impl)        │
   │  • issue↔agent↔workspace: in-memory cache only, │
   │    rebuilt from herdr agents + Linear           │
@@ -135,14 +135,24 @@ launches, prompts, and reaps agents through it. Agents talk back to the world
 through Linear/GitHub MCP tools, and to the bridge through a small foregent
 MCP server (`report_blocked`, `complete_task`).
 
-Event delivery: the bridge **polls** Linear and GitHub for changes on the
-issues it is tracking, then routes by event type + issue/PR mapping. Foregent
-is never publicly reachable and receives nothing inbound (Q8, resolved
-2026-07-28).
+Event delivery: Linear and GitHub **push** changes to the bridge, which routes
+each delivery by event type + issue/PR mapping. The bridge has no public
+address of its own, so an HTTPS ingress — a Cloudflare tunnel — fronts it
+(Q8, resolved 2026-08-28). A periodic poll of Linear still carries delivery
+while the push path is being wired (§5.1); it goes away with JIM-134.
 
 ## 5. Feature set
 
 ### 5.1 Event bridge (the core)
+
+**The transport is push** (Q8, resolved 2026-08-28): Linear delivers to
+`POST /webhooks/linear` through the HTTPS ingress that fronts the bridge, and
+the route hands the delivery to the same queue, matcher and agents the tick
+feeds today. The migration is three tickets — JIM-133 wires the route to the
+queue, JIM-134 deletes the tick, JIM-135 adds the replay and duplicate guards
+that polling did not need — and the tick keeps delivering until JIM-133 lands,
+so the two paths are comparable before one is removed.
+
 - A **periodic tick** asks Linear what changed on the issues the bridge is
   tracking (comments today; later GitHub the same, for PR review submitted,
   comments, checks, merges). One query per source covers the whole fleet,
@@ -150,6 +160,10 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
   than with workspace size. Built in JIM-36: `linear.poll_comments()` plus
   `server.poll_tick()` on a daemon thread, `FOREGENT_POLL_INTERVAL` seconds
   apart (default 30 — under 5% of Linear's 2,500 requests an hour).
+  **Transitional**: it is the delivery path in the running bridge, and JIM-134
+  removes it, keeping `poll_comments()` as library code for a future catch-up
+  read. Everything under it — the queue, `wakes()`, the self-write filter — is
+  transport-independent and survives.
   - **The tick tracks a cursor, not a clock.** The next window starts at the
     `createdAt` of the last comment actually served, so a tick that runs late,
     or a restart, cannot skip a window — and a comment written while the
@@ -172,14 +186,15 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
     issues would hand a newly parked one a cursor from before it existed, and
     wake it with comments that predate its own block.
 - **Events are foregent's own shape**, not a provider payload. The transport
-  is a source feeding one matcher; that seam is what makes push an additive
-  change later rather than a rewrite.
+  is a source feeding one matcher; that seam is what makes the swap to push a
+  change of caller rather than a rewrite.
 - **`POST /webhooks/linear` receives what Linear pushes, and logs it** (built
   in JIM-128). It authenticates the delivery — HMAC-SHA256 over the raw body,
   keyed on `LINEAR_WEBHOOK_SECRET`, against the `Linear-Signature` header —
   and stops there: nobody is woken, so the tick is still the only delivery
-  path. It is a place to read real payloads while the ingress transport is
-  undecided (§8, Q8).
+  path in the running bridge. The payloads it logged are what
+  `webhook_event()` was written against, and JIM-133 is what wires it to the
+  delivery queue.
 - **`linear.webhook_event()` maps a delivery to an `Event`** (built in
   JIM-130), against those logged payloads rather than against the published
   schema. A delivery maps when it is an entity delivery — a `type` and a
@@ -464,6 +479,14 @@ cares.
     so `SessionStart` reports session identity back to herdr.
   - *Pin/record the herdr protocol version* (`ping` → `protocol: 20`) and fail
     startup on mismatch.
+  - *An HTTPS ingress for the webhook endpoint, and `LINEAR_WEBHOOK_SECRET`
+    in the bridge's env.* A `cloudflared` tunnel, run as a service beside the
+    bridge, plus the Linear webhook pointed at `<ingress>/webhooks/linear`.
+    A quick tunnel is enough to try it and useless for a box that stays up,
+    because its hostname changes on every restart; a provisioned box gets a
+    named tunnel on a domain. Missing this is not a dispatch blocker — it is a
+    *delivery* blocker, and once JIM-134 removes the tick, an agent that parks
+    on a box with no ingress never wakes.
   - *`LINEAR_API_KEY` / `GITHUB_TOKEN` in the herdr server's env.* The MCP
     config stores the variable, not the token (§5.2), so a server missing its
     variable is configured, looks installed, and fails to authenticate once an
@@ -668,12 +691,12 @@ system itself.
    bootstrap mode, no event delivery yet. From here on, foregent development
    itself runs through the bridge.
 3. **Linear loop**: the wake path (unblock + prompt an agent, blocker matching)
-   and the tick that feeds it over tracked and ready issues; the claim/orphan
-   protocol (§5.12) including resume-based re-dispatch; the
-   Linear-persistence spike (§5.11: attachment `metadata` upsert-by-url,
-   self-event actor filtering); the managed team gains an **Orphaned**
-   workflow state. Foregent development driven from Linear end-to-end in
-   bootstrap mode.
+   and the delivery that feeds it — the tick first, then the webhook route it
+   is replaced by (JIM-133/134/135); the claim/orphan protocol (§5.12)
+   including resume-based re-dispatch; the Linear-persistence spike (§5.11:
+   attachment `metadata` upsert-by-url, self-event actor filtering); the
+   managed team gains an **Orphaned** workflow state. Foregent development
+   driven from Linear end-to-end in bootstrap mode.
 4. **Workspaces**: pool, jj-or-git decision executed (Q6), multi-repo layout,
    sccache wiring.
 5. **GitHub full mode**: PR flow, review-comment monitor, park-alive on PR
@@ -703,11 +726,16 @@ system itself.
 - **Multi-repo + rebase automation** has sharp edges (cross-repo atomic
   changes, conflict handling) → start with binius' real dependency shape, keep
   cross-repo tasks single-owner.
-- **Event latency and API budget** replace webhook exposure as the delivery
-  risk, now that the bridge polls and is never publicly reachable (Q8). Linear
-  allows 2,500 requests/hour per key; a 30-second tick spends under 5% of it,
-  and the ceiling is the tick rate rather than the fleet size. A push
-  transport, if one is ever needed, is the mitigation.
+- **Silent delivery loss** is push's failure mode, where polling's was
+  lateness (Q8). A bridge whose ingress is down is told nothing: Linear retries
+  a failed delivery three times — after one minute, one hour, and six hours —
+  and then drops it, so an outage longer than a working day strands a parked
+  agent forever. Mitigations: the ingress runs as a supervised service beside
+  the bridge, JIM-135's replay and duplicate guards make a retry safe to
+  accept, and `linear.poll_comments()` survives JIM-134 as the catch-up read a
+  reconciliation pass would use. The ingress is also an inbound surface on a
+  machine that had none; it is authenticated by HMAC over the raw body, and
+  the tunnel exposes exactly one endpoint.
 
 ## 8. Open questions
 
@@ -717,21 +745,21 @@ system itself.
 - **Q7 — Multi-repo task semantics.** Is one Linear issue ever cross-repo? Start
   by forbidding cross-repo issues; revisit with binius data.
 - **Q8 — Webhook ingress.** Resolved 2026-07-28 (JIM-102) as *poll, don't
-  receive*; **reopened 2026-08-19 (JIM-128)**, which adds an authenticated
-  `/webhooks/linear` that logs the delivery and does nothing else (§5.1). What
-  that settles is the handler and the payloads; what stays open is the part
-  polling won on. Bridges sit on private networks with no inbound port, and
-  every push option pays for that with infrastructure — a Cloudflare named
-  tunnel (domain + daemon + DNS + subscription lifecycle) or a Lambda/SQS
-  relay (AWS credentials on every box). What they buy is latency: sub-second
-  against a 30-second tick, when every consumer is a human replying to a
-  review. §5.1 commits to a periodic tick regardless, so push is built *on top
-  of* the loop rather than instead of it — and polling's failure mode is
-  lateness where push's is silence. Decide the transport when latency is
-  genuinely felt (→ Cloudflare tunnel) or when one endpoint serves many
-  bridges and lost events stop being acceptable (→ Lambda + SQS, whose buffer
-  earns its keep there). Both stay cheap to add because the event shape is
-  foregent's own.
+  receive*; reopened 2026-08-19 (JIM-128), which added an authenticated
+  `/webhooks/linear` that logs the delivery; **resolved the other way
+  2026-08-28: push, over a Cloudflare tunnel.** What changed is the price.
+  Polling won on infrastructure — a bridge on a private network with no
+  inbound port pays nothing, where a named tunnel costs a domain, a daemon,
+  DNS and a subscription lifecycle. That bill is now paid: `cloudflared` runs
+  beside the bridge as one more provisioned service (§5.8), and the same
+  ingress serves GitHub when full mode lands. What push buys is latency —
+  sub-second against a 30-second tick — and, more than that, an event shape
+  that arrives complete rather than being re-derived from a query window, with
+  no cursor to keep honest and no API budget to spend on quiet issues.
+  Rejected again: a Lambda/SQS relay, whose buffer earns its keep only when one
+  endpoint serves many bridges; revisit it if that ever happens. The cost
+  accepted is that push fails silently where polling failed late (§7), and
+  JIM-135 is what makes a retried delivery safe to accept.
 - **Q9 — Reviewer stage in bootstrap mode**: is there a lightweight self-review
   pass before auto-merge, or is speed the point? A question about the skill's
   workflow, not about a second agent.
