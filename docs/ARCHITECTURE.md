@@ -316,6 +316,26 @@ Unbuilt. The agent's working directory is whatever the operator passed to
 `foregent queue`, with no per-issue checkout and no isolation between one
 issue and the next.
 
+Decided in JIM-59: the bridge will own the lifecycle, creating one **jj
+workspace** per dispatch named for the issue key and removing it on
+`complete_task`. Neither the agent nor the harness is trusted with the job — an
+agent that dies mid-issue leaks a workspace nobody owns, and herdr's own
+`worktree.create` is git-only and one repo per workspace. Creation is
+`jj workspace forget <key>`, which tolerates absence, then `jj workspace add`,
+so a crashed agent's stale workspace is reclaimed by the next dispatch that
+wants the name and there is no reaper and no registry to keep honest. One fresh
+workspace per dispatch is the point of the exercise: no agent inherits the
+previous one's dirty working copy, which is worth more today than parallelism.
+
+Two properties of a secondary jj workspace shape it, both verified on jj 0.43.
+It has no `.git`, so raw `git`, `gh`, and the harness's git integration are
+blind inside one — survivable because the write paths do not need them:
+`jj git push` reaches the shared git backend, and GitHub mode opens its pull
+request through the GitHub MCP. And a bookmark it moves stays invisible to git
+until a mutating jj command runs at the colocated root, so bootstrap mode's
+advance of `main` is published by teardown itself — which must therefore run
+even when the workspace directory is already gone.
+
 ## 7. The AgentManager seam
 
 Foregent owns what an agent is for. The manager owns how a harness is driven.
