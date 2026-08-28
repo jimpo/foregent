@@ -7,6 +7,8 @@ Queued issues are dispatched to agents as capacity allows, through the
 harness, and a periodic tick asks Linear what changed on the issues it is
 tracking, so an agent sees activity on its own issue whether it is working
 or parked (§5.1).
+Events reach an agent through a queue drained by a daemon thread (§5.1), so
+whoever ingested one is never held behind an agent that is mid-turn.
 ``/webhooks/linear`` receives what Linear pushes, and logs it (§8, Q8).
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
@@ -17,6 +19,7 @@ HTTP.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -34,6 +37,7 @@ from foregent.agents import (
     AgentEventKind,
     AgentManager,
     AgentRef,
+    AgentStatus,
     LaunchSpec,
     issue_key_from_label,
     label_for,
@@ -60,6 +64,7 @@ async def lifespan(_app: FastAPI):
     await run_in_threadpool(check_agent_mcp)
     await run_in_threadpool(rebuild_store)
     watch_agents()
+    watch_deliveries()
     poll_linear()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
@@ -80,6 +85,19 @@ store = IssueStore()
 # The harness foregent runs agents on. One process-wide manager, swapped
 # wholesale to change harness (docs/PLAN.md §5.13).
 manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
+
+# Events waiting for the agent they are for, oldest first (docs/PLAN.md
+# §5.1). One queue and one drainer, so two events for one agent reach it one
+# at a time and in the order they were written, and whoever ingested them
+# waited on neither. A long wait on one agent therefore holds up deliveries
+# to another; capacity is one agent (§5.6), so there is no other agent to
+# hold up, and a queue per agent is the change when capacity grows.
+deliveries: queue.Queue[tuple[str, str]] = queue.Queue()
+
+# How long to pause before offering a message to a busy agent again. `send`
+# blocks on the harness for its own budget first, so this paces only the
+# case where the harness is failing rather than the agent being busy.
+DELIVERY_RETRY_SECONDS = 5.0
 
 
 def check_herdr_protocol() -> None:
@@ -153,14 +171,115 @@ def watch_agents() -> None:
     threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
 
 
+def watch_deliveries() -> None:
+    """Hand queued messages to their agents, on a daemon thread (§5.1).
+
+    In the shape of :func:`watch_agents`, and for the same reason: a send
+    blocks for as long as its agent stays busy, which can be a whole turn,
+    and no ingesting caller can be held that long — Linear retries any
+    webhook delivery the bridge is slow to answer.
+
+    One thread, so the queue's order is the delivery order. It survives a
+    failed delivery: a drainer that died on one message would silently
+    strand every message behind it.
+    """
+
+    def consume() -> None:
+        while True:
+            key, message = deliveries.get()
+            try:
+                send_queued(key, message)
+            except Exception:
+                logger.exception("delivering to %s failed", key)
+            finally:
+                deliveries.task_done()
+
+    threading.Thread(target=consume, name="foregent-deliveries", daemon=True).start()
+
+
+def send_queued(key: str, message: str) -> None:
+    """Deliver one queued ``message`` to issue ``key``'s agent, then unblock it.
+
+    The store is read here rather than trusted from the enqueue: an agent can
+    die while its messages wait, and a message for an agent that is no longer
+    there is dropped and logged rather than delivered to whatever holds the
+    key next.
+
+    **Sends first, unblocks second** (docs/PLAN.md §5.6): an agent that has
+    not received the message is not awake yet, and a send that failed leaves
+    the issue BLOCKED, with no rollback path to get wrong.
+    """
+    issue = store.get(key)
+    if issue is None or issue.status not in IN_FLIGHT or issue.agent is None:
+        status = issue.status if issue is not None else "not tracked"
+        logger.warning(
+            "dropped a message for %s: no agent to deliver to (%s)", key, status
+        )
+        return
+    if not send_when_free(issue.agent, message):
+        return
+    if issue.status is IssueStatus.BLOCKED:
+        store.unblock(key)
+
+
+def send_when_free(ref: AgentRef, message: str) -> bool:
+    """Send ``message`` once the agent is free; ``False`` if it died first.
+
+    A busy agent is waited on for as long as its turn takes.
+    :meth:`~foregent.agents.AgentManager.send` waits for the harness's own
+    budget and fails when that runs out, and that failure means the agent is
+    still working, not that the message is lost — so it is offered again. The
+    one thing that ends the wait is the agent being gone, because then the
+    message can never land.
+
+    A harness that cannot be reached is not an agent that died, so that is
+    retried too; the pause between attempts is what keeps a broken socket
+    from spinning.
+
+    A message can therefore reach an agent twice: a stalled prompt is
+    reported as a failure and never landed, but a socket that dies just after
+    one landed reports the same thing. That trade is deliberate — an agent
+    told twice re-reads its issue and carries on, where an event dropped on a
+    blinking socket is gone.
+    """
+    while True:
+        try:
+            manager.send(ref, message)
+            return True
+        except AgentError as exc:
+            if agent_gone(ref):
+                logger.warning(
+                    "dropped a message for %s: agent is gone (%s)", ref.label, exc
+                )
+                return False
+            logger.debug(
+                "%s is not free yet, still trying to deliver: %s", ref.label, exc
+            )
+        time.sleep(DELIVERY_RETRY_SECONDS)
+
+
+def agent_gone(ref: AgentRef) -> bool:
+    """Whether the harness says the agent no longer exists.
+
+    A harness that answers nothing reads as *not* gone: dropping an event
+    because a socket blinked would lose it for good, and waiting costs only
+    another attempt.
+    """
+    try:
+        return manager.status(ref) is AgentStatus.GONE
+    except AgentError as exc:
+        logger.warning("cannot tell whether %s is still alive: %s", ref.label, exc)
+        return False
+
+
 def deliver(event: Event, viewer: str) -> None:
     """Hand ``event`` to whichever agent it was for, if any (docs/PLAN.md §5.1).
 
-    Goes through :func:`deliver_issue` rather than the store directly, so that
-    the live-agent guard, send-before-unblock, and the 409 for an issue with
-    nobody behind it all stay decided in one place. An event with nowhere to
-    go is the normal case, not an error: the tick polls every in-flight issue,
-    and a person comments on issues foregent is not tracking at all.
+    Goes through :func:`deliver_issue` rather than the queue directly, so that
+    the live-agent guard and the 409 for an issue with nobody behind it stay
+    decided in one place. An event with nowhere to go is the normal case, not
+    an error: the tick polls every in-flight issue, and a person comments on
+    issues foregent is not tracking at all.
 
     The status is read once here only to word the prompt: a parked agent is
     being woken and a working one is not, and only the caller of a plain
@@ -176,7 +295,7 @@ def deliver(event: Event, viewer: str) -> None:
     except HTTPException as exc:
         logger.debug("event on %s reached nobody: %s", key, exc.detail)
         return
-    logger.info("delivered to %s on activity by %s", key, event.author or "someone")
+    logger.info("queued for %s on activity by %s", key, event.author or "someone")
 
 
 def poll_tick(cursor: str, viewer: str) -> tuple[str, str]:
@@ -418,28 +537,26 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
 def deliver_issue(
     key: str, message: Annotated[str, Body(embed=True)]
 ) -> dict[str, str]:
-    """Deliver ``message`` to issue ``key``'s agent, unblocking it if parked.
+    """Queue ``message`` for issue ``key``'s agent, and return the record.
 
     Every agent foregent has running is reachable, not only a parked one: a
     worker should see activity on its own issue as soon as it happens
-    (docs/PLAN.md §5.1). What the status decides is only what happens *after*
-    the send. A BLOCKED issue is unblocked, as the counterpart to
-    :func:`block_issue` (§5.6) — the event the agent parked on has arrived and
-    prompting it is the whole of waking it up. An IN_PROGRESS or IN_REVIEW
-    issue is left exactly as it was; it was never waiting. Capacity does not
-    change either way and nothing is dispatched, because the agent has been
-    holding its slot the whole time.
+    (docs/PLAN.md §5.1). The send itself waits for whatever the agent is
+    doing to finish, so it happens on the drainer thread
+    (:func:`watch_deliveries`) and this route only enqueues. What the caller
+    is told is therefore that the message is *accepted*, not that it has been
+    read: the issue comes back as it stands, so a parked one still reads
+    BLOCKED until :func:`send_queued` has sent and unblocked it.
 
-    409 for an issue with no agent to prompt. Both halves of the guard are
-    needed and neither implies the other: a Done issue keeps the agent ref of
-    the agent foregent has since stopped, and ``block()`` upserts an unknown
-    key, so an issue can carry a blocker with nothing behind it.
+    409 for an issue with no agent to prompt, checked here rather than on the
+    drainer so an event with nowhere to go is answered instead of queued.
+    Both halves of the guard are needed and neither implies the other: a Done
+    issue keeps the agent ref of the agent foregent has since stopped, and
+    ``block()`` upserts an unknown key, so an issue can carry a blocker with
+    nothing behind it.
 
-    **Sends first, unblocks second**, so a harness failure leaves the issue
-    BLOCKED with no rollback path to get wrong and a retry is safe. It is
-    also the truthful order: an agent that has not received the message is
-    not awake yet, and ``send`` can sit waiting for the harness for a while
-    before it lands.
+    Capacity does not change and nothing is dispatched, whatever the status:
+    the agent has been holding its slot the whole time.
     """
     issue = store.get(key)
     if issue is None or issue.status not in IN_FLIGHT or issue.agent is None:
@@ -447,12 +564,7 @@ def deliver_issue(
         raise HTTPException(
             status_code=409, detail=f"{key} has no agent to deliver to ({status})"
         )
-    try:
-        manager.send(issue.agent, message)
-    except AgentError as exc:
-        raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
-    if issue.status is IssueStatus.BLOCKED:
-        issue = store.unblock(key) or issue
+    deliveries.put((key, message))
     return _record(issue)
 
 

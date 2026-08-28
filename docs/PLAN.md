@@ -213,6 +213,26 @@ is never publicly reachable and receives nothing inbound (Q8, resolved
   working or parked; a parked one is unblocked afterwards and a working one is
   left as it was (§5.6). Matching is `wakes(event) -> key`, a lookup rather
   than a scan, because the event names the issue it is about.
+- **Deliveries are queued, and sent by a daemon thread** (JIM-132), in the
+  shape of the harness-event consumer. Handing a message to an agent means
+  waiting for whatever it is doing to finish, so no ingesting caller can do
+  it: Linear retries any webhook delivery the bridge is slow to answer, and a
+  webhook that waits on an agent is a webhook that is delivered twice. The
+  route checks that there is an agent to prompt — an in-memory lookup — and
+  otherwise only enqueues.
+  - **One queue, one drainer**: two comments written during one long turn
+    arrive as two prompts, in the order they were written. Nothing is
+    coalesced, because merging two people's comments into one prompt loses
+    who said what. The cost is that a wait on one agent holds up deliveries
+    to another; capacity is one agent (§5.6), so there is no other agent to
+    hold up, and a queue per agent is the change when capacity grows.
+  - **A busy agent is waited out, not timed out.** `AgentManager.send` waits
+    for the harness's own idle budget and fails when it runs out, which says
+    the agent is still working, not that the message is lost — so the drainer
+    offers it again. The only end to the wait is the harness reporting the
+    agent GONE, when the message can never land: it is dropped and logged. A
+    harness that cannot be reached is not an agent that died, and is retried
+    like any other busy one.
 - **Never wake on foregent's own writes.** Claiming an issue assigns it and
   moves its state, and agents comment through the Linear MCP under the same
   account; both come back as changes. `wakes()` drops them by actor identity,
@@ -342,11 +362,17 @@ cares.
   which includes Queued, Orphaned, Done and untracked, is dropped and logged
   at debug: the normal case, not an error.
 - `POST /issues/{key}/deliver` is the seam ingestion calls, and is drivable
-  with `curl` on its own. It **sends before it unblocks**, so a harness
-  failure leaves the issue BLOCKED with no rollback path to get wrong and a
-  retry is safe — and because an agent that has not received the message is
-  not awake yet. A blocked issue with no agent recorded is a 409, like one
-  that was never dispatched.
+  with `curl` on its own. It queues the message and answers at once (§5.1),
+  so what it reports is that the message was *accepted*, not that it has been
+  read: a parked issue still reads BLOCKED until the drainer has sent. A
+  blocked issue with no agent recorded is a 409, like one that was never
+  dispatched.
+- The drainer **sends before it unblocks**, so a harness failure leaves the
+  issue BLOCKED with no rollback path to get wrong and a retry is safe — and
+  because an agent that has not received the message is not awake yet. It
+  reads the store again when the message comes off the queue: an agent can
+  die while its messages wait, and a queued message must not be handed to
+  whatever holds that issue key next.
 - Cold parking (terminate on block, `--resume` on wake) is technically viable
   since resume works, but instant wake and a guaranteed-intact context beat the
   memory savings for a small fleet. Resume is for *recovery* (§5.12), not

@@ -9,6 +9,7 @@ Code is. Linear is stubbed too — its own client is covered by
 from __future__ import annotations
 
 import os
+import queue
 import tempfile
 import threading
 import unittest
@@ -42,6 +43,13 @@ class FakeManager:
         self.stream: list[AgentEvent] = []
         self.fail_launch: Exception | None = None
         self.fail_send: Exception | None = None
+        self.fail_status: Exception | None = None
+        # How many sends fail before one lands, negative for all of them.
+        # The delivery drainer keeps offering a message to a busy agent, so
+        # a harness that recovers and one that never does are both worth
+        # driving (JIM-132).
+        self.fail_sends = -1
+        self.agent_status = AgentStatus.IDLE
         # Observes the world as the agent starts, for the things dispatch has
         # to have finished by then rather than merely around then.
         self.at_launch: Callable[[], None] | None = None
@@ -60,12 +68,15 @@ class FakeManager:
         return ref
 
     def send(self, ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
-        if self.fail_send:
+        if self.fail_send and self.fail_sends != 0:
+            self.fail_sends -= 1
             raise self.fail_send
         self.sent.append((ref, text))
 
     def status(self, ref: AgentRef) -> AgentStatus:
-        return AgentStatus.IDLE
+        if self.fail_status:
+            raise self.fail_status
+        return self.agent_status
 
     def wait(
         self, ref: AgentRef, until: Collection[AgentStatus], timeout: float
@@ -101,6 +112,18 @@ def drain_events(manager: FakeManager) -> None:
         for thread in threading.enumerate():
             if thread.name == "foregent-agent-events":
                 thread.join(timeout=5)
+
+
+def drain_deliveries() -> None:
+    """Run the delivery drainer until everything queued has been handled.
+
+    Bounded, because the drainer is endless by design: a delivery that never
+    finishes fails the test instead of hanging it.
+    """
+    server.watch_deliveries()
+    waiter = threading.Thread(target=server.deliveries.join, daemon=True)
+    waiter.start()
+    waiter.join(timeout=5)
 
 
 class DispatchTests(unittest.TestCase):
@@ -270,14 +293,18 @@ class DispatchTests(unittest.TestCase):
 
 
 class DeliverTests(unittest.TestCase):
-    """Prompting the agent an event was for, working or parked (JIM-131)."""
+    """Queueing an event for the agent it was for (JIM-131, JIM-132)."""
 
     def setUp(self) -> None:
         server.store = IssueStore()
         self.manager = FakeManager()
-        patcher = mock.patch.object(server, "manager", self.manager)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.enterContext(mock.patch.object(server, "manager", self.manager))
+        # A queue per test, so a drainer left over from an earlier one cannot
+        # take this test's messages.
+        self.enterContext(mock.patch.object(server, "deliveries", queue.Queue()))
+        # The drainer paces its retries against a real agent's turn; nothing
+        # here is really busy.
+        self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
         self.ref = AgentRef("fg-jim-88", "conversation-1")
 
     def park(self, blocker: str = "a review of the PR") -> None:
@@ -296,26 +323,121 @@ class DeliverTests(unittest.TestCase):
             Issue(key="JIM-88", title="", status=status, agent=self.ref)
         )
 
-    def test_delivering_to_a_parked_agent_sends_and_resumes_the_issue(self) -> None:
+    def issue(self) -> Issue:
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        return issue
+
+    def test_delivering_queues_rather_than_sending_on_the_callers_thread(self) -> None:
+        # A send waits out whatever the agent is doing, and Linear retries
+        # any webhook delivery the bridge is slow to answer, so no ingesting
+        # caller may be held behind an agent mid-turn (JIM-132).
+        self.work()
+        record = server.deliver_issue("JIM-88", "AJ commented: ship it")
+        self.assertEqual(self.manager.sent, [])
+        self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
+        drain_deliveries()
+        self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
+
+    def test_a_parked_agent_is_unblocked_once_its_message_is_sent(self) -> None:
         self.park()
         record = server.deliver_issue("JIM-88", "AJ commented: ship it")
+        # Accepted, not yet read: the issue moves when the agent has it.
+        self.assertEqual(record["status"], IssueStatus.BLOCKED)
+        drain_deliveries()
         self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
-        self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
-        self.assertEqual(record["blocker"], "")
+        self.assertEqual(self.issue().status, IssueStatus.IN_PROGRESS)
+        self.assertEqual(self.issue().blocker, "")
 
-    def test_delivering_to_a_working_agent_sends_and_changes_nothing(self) -> None:
+    def test_a_working_agent_is_sent_to_and_left_as_it_was(self) -> None:
         # A worker sees activity on its own issue as it happens; it was never
         # waiting, so there is no status to move it out of.
         self.work()
-        record = server.deliver_issue("JIM-88", "AJ commented: ship it")
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        drain_deliveries()
         self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
-        self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
+        self.assertEqual(self.issue().status, IssueStatus.IN_PROGRESS)
 
-    def test_delivering_to_an_agent_in_review_sends_and_changes_nothing(self) -> None:
+    def test_an_agent_in_review_is_sent_to_and_left_as_it_was(self) -> None:
         self.work(IssueStatus.IN_REVIEW)
-        record = server.deliver_issue("JIM-88", "go on")
+        server.deliver_issue("JIM-88", "go on")
+        drain_deliveries()
         self.assertEqual(self.manager.sent, [(self.ref, "go on")])
-        self.assertEqual(record["status"], IssueStatus.IN_REVIEW)
+        self.assertEqual(self.issue().status, IssueStatus.IN_REVIEW)
+
+    def test_two_events_for_one_agent_keep_the_order_they_arrived_in(self) -> None:
+        # Two people commenting during one long turn are two prompts, in the
+        # order they were written; merging them would lose who said what.
+        self.work()
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        server.deliver_issue("JIM-88", "Sam commented: hold on")
+        drain_deliveries()
+        self.assertEqual(
+            [text for _, text in self.manager.sent],
+            ["AJ commented: ship it", "Sam commented: hold on"],
+        )
+
+    def test_a_busy_agent_is_waited_out_rather_than_given_up_on(self) -> None:
+        # `send` fails once the harness's own idle budget runs out, and that
+        # says the agent is still working, not that the message is lost: five
+        # minutes is not a reason to throw an event away (JIM-132).
+        self.work()
+        self.manager.fail_send = AgentError("agent is busy")
+        self.manager.fail_sends = 2
+        server.deliver_issue("JIM-88", "go on")
+        drain_deliveries()
+        self.assertEqual(self.manager.sent, [(self.ref, "go on")])
+
+    def test_a_gone_agent_drops_its_queued_events(self) -> None:
+        # The one end to the wait: a message for an agent that no longer
+        # exists can never land, so it is dropped and logged rather than
+        # retried forever.
+        self.park()
+        self.manager.fail_send = AgentError("agent is gone")
+        self.manager.agent_status = AgentStatus.GONE
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        server.deliver_issue("JIM-88", "Sam commented: hold on")
+        with self.assertLogs(server.logger, "WARNING"):
+            drain_deliveries()
+        self.assertEqual(self.manager.sent, [])
+        # Nothing was delivered, so nothing was woken: the blocker still
+        # stands for the operator reading `foregent status`.
+        self.assertEqual(self.issue().status, IssueStatus.BLOCKED)
+        self.assertEqual(self.issue().blocker, "a review of the PR")
+
+    def test_an_unreachable_harness_is_not_taken_for_a_dead_agent(self) -> None:
+        # A harness that answers nothing about the agent is no proof it died,
+        # and dropping the event on a blinking socket would lose it for good.
+        self.work()
+        self.manager.fail_send = AgentError("herdr is unreachable")
+        self.manager.fail_sends = 1
+        self.manager.fail_status = AgentError("herdr is unreachable")
+        server.deliver_issue("JIM-88", "go on")
+        drain_deliveries()
+        self.assertEqual(self.manager.sent, [(self.ref, "go on")])
+
+    def test_an_agent_that_died_while_its_message_waited_is_not_sent_to(self) -> None:
+        # The store is read again on the drainer: the consumer orphans the
+        # issue when the agent exits, and a queued message must not be handed
+        # to whatever holds that key next.
+        self.work()
+        server.deliver_issue("JIM-88", "go on")
+        server.store.orphan("JIM-88")
+        with self.assertLogs(server.logger, "WARNING"):
+            drain_deliveries()
+        self.assertEqual(self.manager.sent, [])
+
+    def test_one_failed_delivery_does_not_strand_the_ones_behind_it(self) -> None:
+        # There is a single drainer, so a message that kills it would leave
+        # every message behind it waiting forever.
+        self.work()
+        self.manager.fail_send = RuntimeError("the drainer's own bug")
+        self.manager.fail_sends = 1
+        server.deliver_issue("JIM-88", "first")
+        server.deliver_issue("JIM-88", "second")
+        with self.assertLogs(server.logger, "ERROR"):
+            drain_deliveries()
+        self.assertEqual(self.manager.sent, [(self.ref, "second")])
 
     def test_delivering_does_not_dispatch_anything_else(self) -> None:
         # The agent held its capacity slot the whole time, parked or not
@@ -323,13 +445,14 @@ class DeliverTests(unittest.TestCase):
         self.park()
         server.store.queue("JIM-89", "/ws/JIM-89")
         server.deliver_issue("JIM-88", "go on")
+        drain_deliveries()
         self.assertEqual(self.manager.launched, [])
 
     def test_delivering_to_an_untracked_issue_is_a_conflict(self) -> None:
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(self.manager.sent, [])
+        self.assertTrue(server.deliveries.empty())
 
     def test_delivering_to_a_queued_issue_is_a_conflict(self) -> None:
         # Nothing is running yet: the brief at dispatch is what it will read.
@@ -337,7 +460,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(self.manager.sent, [])
+        self.assertTrue(server.deliveries.empty())
 
     def test_delivering_to_an_orphaned_issue_is_a_conflict(self) -> None:
         self.work()
@@ -345,7 +468,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(self.manager.sent, [])
+        self.assertTrue(server.deliveries.empty())
 
     def test_delivering_to_a_completed_issue_is_a_conflict(self) -> None:
         # Done keeps the ref of the agent foregent has since stopped, so the
@@ -355,7 +478,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertEqual(self.manager.sent, [])
+        self.assertTrue(server.deliveries.empty())
 
     def test_delivering_to_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
         # `block()` upserts an unknown key, so an issue can carry a blocker
@@ -364,19 +487,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-
-    def test_a_harness_failure_leaves_the_issue_blocked(self) -> None:
-        # So a retry is safe: nothing was delivered, and the blocker is still
-        # recorded for the operator reading `foregent status`.
-        self.park()
-        self.manager.fail_send = AgentError("prompt never landed")
-        with self.assertRaises(server.HTTPException) as caught:
-            server.deliver_issue("JIM-88", "go on")
-        self.assertEqual(caught.exception.status_code, 502)
-        issue = server.store.get("JIM-88")
-        assert issue is not None
-        self.assertEqual(issue.status, IssueStatus.BLOCKED)
-        self.assertEqual(issue.blocker, "a review of the PR")
+        self.assertTrue(server.deliveries.empty())
 
 
 class CheckHerdrProtocolTests(unittest.TestCase):
@@ -586,6 +697,7 @@ class PollTickTests(unittest.TestCase):
         server.store = IssueStore()
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
+        self.enterContext(mock.patch.object(server, "deliveries", queue.Queue()))
         self.viewer = self.enterContext(
             mock.patch.object(server.linear, "viewer_id", return_value=self.VIEWER)
         )
@@ -620,7 +732,10 @@ class PollTickTests(unittest.TestCase):
         )
 
     def tick(self, cursor: str = "T0", viewer: str = "") -> tuple[str, str]:
-        return server.poll_tick(cursor, viewer)
+        """One pass, plus the drainer that hands what it found to the agents."""
+        result = server.poll_tick(cursor, viewer)
+        drain_deliveries()
+        return result
 
     def test_a_comment_on_a_parked_issue_wakes_its_agent(self) -> None:
         self.park()
