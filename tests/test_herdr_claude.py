@@ -386,6 +386,34 @@ class SendTests(unittest.TestCase):
         self.assertEqual(client.count("agent.prompt"), 1)
 
 
+class ReadTests(unittest.TestCase):
+    """Reading an agent's screen, whatever the agent is doing."""
+
+    def test_a_working_agents_screen_is_read_from_what_is_visible(self) -> None:
+        # Scrollback can only be captured while the agent is idle, and the
+        # screen is quoted into the error of a prompt that failed — which is
+        # raised against a working agent by definition (JIM-144).
+        sources: list[str] = []
+
+        def read(params: dict) -> dict:
+            sources.append(params["source"])
+            if params["source"] == "recent":
+                raise herdr.HerdrAPIError("agent_not_idle", "it is working")
+            return {"read": {"text": "on screen"}}
+
+        client = FakeClient({"agent.read": read})
+        self.assertEqual(manager(client).read(AgentRef("fg-jim-86")), "on screen")
+        self.assertEqual(sources, ["recent", "visible"])
+
+    def test_a_read_that_failed_for_another_reason_is_not_retried(self) -> None:
+        client = FakeClient(
+            errors={"agent.read": herdr.HerdrAPIError("agent_not_found", "nope")}
+        )
+        with self.assertRaises(AgentError):
+            manager(client).read(AgentRef("fg-jim-86"))
+        self.assertEqual(client.count("agent.read"), 1)
+
+
 class StatusTests(unittest.TestCase):
     def test_status_maps_herdr_states(self) -> None:
         for herdr_status, expected in [

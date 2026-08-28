@@ -94,6 +94,7 @@ _NOT_FOUND = "agent_not_found"
 _TIMEOUT = "timeout"
 _NOT_READY = "agent_not_ready"
 _STALLED = "agent_prompt_stalled"
+_NOT_IDLE = "agent_not_idle"
 
 # herdr's agent statuses. Anything unrecognized (a new herdr release) maps to
 # UNKNOWN rather than raising: an unreadable state is not a dead agent.
@@ -256,11 +257,29 @@ class HerdrClaudeManager:
         return _status_of(result.get("agent", {}))
 
     def read(self, ref: AgentRef, lines: int = 50) -> str:
-        """Return the tail of the agent's terminal output."""
-        result = self._call(
-            "agent.read",
-            {"target": ref.label, "source": "recent", "lines": lines},
-        )
+        """Return the tail of the agent's terminal output.
+
+        Scrollback is only capturable while the agent is idle, so a working
+        one falls back to what is on screen. Every caller wants the screen
+        for a human to look at — a triage endpoint, or the quoted tail in a
+        failed prompt's error — and a working agent is exactly when that
+        error is raised, so refusing to read at all would replace the cause
+        with a complaint about reading.
+        """
+        try:
+            result = self.client.call(
+                "agent.read",
+                {"target": ref.label, "source": "recent", "lines": lines},
+            )
+        except herdr.HerdrAPIError as exc:
+            if exc.code != _NOT_IDLE:
+                raise AgentError(f"reading {ref.label}: {exc}") from exc
+            result = self._call(
+                "agent.read",
+                {"target": ref.label, "source": "visible", "lines": lines},
+            )
+        except herdr.HerdrError as exc:
+            raise AgentError(f"reading {ref.label}: {exc}") from exc
         return result.get("read", {}).get("text", "")
 
     def stop(self, ref: AgentRef) -> None:
