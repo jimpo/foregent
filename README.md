@@ -28,11 +28,11 @@ route answers Linear at once instead of waiting on a busy agent. The agent
 reports back through two MCP tools the bridge serves: `report_blocked` and
 `complete_task`.
 
-> **Migration in progress.** The route authenticates a delivery and logs it;
-> what actually wakes an agent today is still a 30-second poll of Linear. Both
-> paths produce the same events, so what is changing is which one is wired to
-> the delivery queue: JIM-133 wires the route, JIM-134 then deletes the tick
-> and `FOREGENT_POLL_INTERVAL` with it.
+> **Migration in progress.** A 30-second poll of Linear still runs beside the
+> webhook route, and both feed the same delivery queue, so an agent can be
+> told about the same comment twice. That is harmless — it re-reads its issue
+> and carries on — and JIM-134 ends it by deleting the tick and
+> `FOREGENT_POLL_INTERVAL` with it.
 
 The bridge keeps no database. Its issue → agent map is in memory and is rebuilt
 from the live herdr agents at startup.
@@ -161,9 +161,11 @@ shapes and the retry schedule — a delivery is retried three times, after one
 minute, one hour, and six hours, so a bridge that is down for a working day
 loses the event.
 
-While JIM-133 is open, an authenticated delivery is written to the log and
-nothing else. That is how the payloads foregent maps were collected, and it is
-still the way to see what Linear is actually sending you.
+An authenticated delivery about an issue no agent here is working — which is
+most of them — is answered 200 and dropped, so Linear is never told a delivery
+failed for being none of foregent's business. The bridge logs the deliveries
+it queues for an agent and stays quiet about the rest, so to confirm the
+webhook is wired up, comment on an issue an agent is actually working.
 
 ## Running the bridge
 
@@ -255,7 +257,7 @@ state.
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 240 unit tests, ~2s
+uv run python -m unittest discover -s tests -t .   # 249 unit tests, ~2s
 uv run ty check                                    # type check
 ```
 

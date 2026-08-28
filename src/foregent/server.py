@@ -9,7 +9,8 @@ tracking, so an agent sees activity on its own issue whether it is working
 or parked (§5.1).
 Events reach an agent through a queue drained by a daemon thread (§5.1), so
 whoever ingested one is never held behind an agent that is mid-turn.
-``/webhooks/linear`` receives what Linear pushes, and logs it (§8, Q8).
+``/webhooks/linear`` receives what Linear pushes and feeds that same queue
+(§8, Q8), alongside the tick.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -18,6 +19,7 @@ HTTP.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import threading
@@ -270,6 +272,30 @@ def agent_gone(ref: AgentRef) -> bool:
     except AgentError as exc:
         logger.warning("cannot tell whether %s is still alive: %s", ref.label, exc)
         return False
+
+
+# Foregent's own Linear account id, once something has had to ask for it.
+# Empty until then; :func:`own_viewer` is the only thing that reads or writes it.
+_viewer = ""
+
+
+def own_viewer() -> str:
+    """foregent's own Linear account id, asked for once and remembered.
+
+    Every delivery is checked against it (:func:`~foregent.events.wakes`), so
+    a bridge that re-asked would spend a Linear call per webhook on an answer
+    that never changes. Raises :class:`~foregent.linear.LinearError` while it
+    is unknown, because a delivery matched without it wakes agents with their
+    own writes, and a wake that causes a write is a loop.
+
+    Blocking: it is an HTTP call, so an async caller runs it in a threadpool.
+    The tick carries its own viewer in its loop, where the cursor already
+    lives.
+    """
+    global _viewer
+    if not _viewer:
+        _viewer = linear.viewer_id()
+    return _viewer
 
 
 def deliver(event: Event, viewer: str) -> None:
@@ -570,22 +596,36 @@ def deliver_issue(
 
 @app.post("/webhooks/linear")
 async def linear_webhook(request: Request) -> dict[str, str]:
-    """Authenticate a webhook delivery from Linear and log it (JIM-128).
+    """Deliver what Linear pushes to the agent it is for (docs/PLAN.md §5.1).
 
-    A sink, not a source: the periodic tick is what delivers events to agents
-    (docs/PLAN.md §5.1), and this endpoint wakes nobody. It exists so the
-    transport question (§8, Q8) can be decided against deliveries that really
-    arrived, and so their payloads can be read before anything maps one to an
-    :class:`~foregent.events.Event`.
+    Authenticate, map the payload to an :class:`~foregent.events.Event`, and
+    hand it to :func:`deliver` — the same matching, queue and drainer the tick
+    feeds, so push is a second source rather than a second delivery path.
 
-    Logs the body whole, for the same reason: nothing here understands a
-    Linear payload yet, and a summary would be a guess at which part matters.
+    **A delivery foregent does nothing with is still a success.** Most of what
+    Linear sends is about issues no agent here is working, and a 200 is the
+    honest answer: nothing failed, and telling Linear otherwise buys three
+    pointless retries of an event that would be dropped again. That covers a
+    payload naming no issue, an issue nobody is working, and foregent's own
+    writes coming back at it.
+
+    The one delivery that is *not* accepted is one that arrives while
+    foregent's own account id is unknown (:func:`own_viewer`): matching
+    without it would wake an agent with its own comment. Linear's retry is
+    worth more here than a wake foregent has to guess at, so it answers 503
+    and asks to be sent it again.
+
+    The tick delivers the same comments in parallel with this, so an agent can
+    be told about one twice, in whichever order the two paths land it. That is
+    accepted rather than de-duplicated: an agent told twice re-reads its issue
+    and carries on, and JIM-134 removes the tick, which ends it.
 
     Reads the raw bytes rather than a parsed body, because that is what the
     signature covers (:func:`~foregent.linear.webhook_authentic`). 401 for a
     delivery that does not prove it came from Linear, absent signature
     included; 503 when this bridge holds no secret to check one against, which
-    is an operator's misconfiguration and not the caller's fault.
+    is an operator's misconfiguration and not the caller's fault; 400 for a
+    signed body that is not JSON, which is not a delivery Linear makes.
     """
     body = await request.body()
     try:
@@ -597,7 +637,24 @@ async def linear_webhook(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not authentic:
         raise HTTPException(status_code=401, detail="signature does not match")
-    logger.info("Linear webhook: %s", body.decode("utf-8", "replace"))
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("not a JSON object")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"not a Linear delivery: {exc}"
+        ) from exc
+    event = linear.webhook_event(payload)
+    if event is None:
+        logger.debug("Linear webhook is about no issue foregent knows: %s", payload)
+        return {"status": "ok"}
+    try:
+        viewer = await run_in_threadpool(own_viewer)
+    except linear.LinearError as exc:
+        logger.error("cannot tell foregent's own writes apart: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    deliver(event, viewer)
     return {"status": "ok"}
 
 

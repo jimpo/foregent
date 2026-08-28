@@ -138,8 +138,9 @@ MCP server (`report_blocked`, `complete_task`).
 Event delivery: Linear and GitHub **push** changes to the bridge, which routes
 each delivery by event type + issue/PR mapping. The bridge has no public
 address of its own, so an HTTPS ingress — a Cloudflare tunnel — fronts it
-(Q8, resolved 2026-08-28). A periodic poll of Linear still carries delivery
-while the push path is being wired (§5.1); it goes away with JIM-134.
+(Q8, resolved 2026-08-28). A periodic poll of Linear still runs beside the
+push path, delivering the same Linear comments a second time (§5.1); it goes
+away with JIM-134.
 
 ## 5. Feature set
 
@@ -148,10 +149,16 @@ while the push path is being wired (§5.1); it goes away with JIM-134.
 **The transport is push** (Q8, resolved 2026-08-28): Linear delivers to
 `POST /webhooks/linear` through the HTTPS ingress that fronts the bridge, and
 the route hands the delivery to the same queue, matcher and agents the tick
-feeds today. The migration is three tickets — JIM-133 wires the route to the
-queue, JIM-134 deletes the tick, JIM-135 adds the replay and duplicate guards
-that polling did not need — and the tick keeps delivering until JIM-133 lands,
-so the two paths are comparable before one is removed.
+feeds (JIM-133). Both paths run today, so the two are comparable before one is
+removed; JIM-134 deletes the tick, and JIM-135 adds the replay and duplicate
+guards that polling did not need.
+
+- **A comment arrives twice while both paths run**, once pushed and once
+  polled, in whichever order they land. Accepted rather than de-duplicated:
+  an agent told twice re-reads its issue and carries on, JIM-134 ends it by
+  deleting the tick, and a dedup built here would be deleted a ticket later.
+  A *retried* delivery is the duplicate that outlives the tick, and JIM-135 is
+  what makes that one safe.
 
 - A **periodic tick** asks Linear what changed on the issues the bridge is
   tracking (comments today; later GitHub the same, for PR review submitted,
@@ -160,9 +167,9 @@ so the two paths are comparable before one is removed.
   than with workspace size. Built in JIM-36: `linear.poll_comments()` plus
   `server.poll_tick()` on a daemon thread, `FOREGENT_POLL_INTERVAL` seconds
   apart (default 30 — under 5% of Linear's 2,500 requests an hour).
-  **Transitional**: it is the delivery path in the running bridge, and JIM-134
-  removes it, keeping `poll_comments()` as library code for a future catch-up
-  read. Everything under it — the queue, `wakes()`, the self-write filter — is
+  **Transitional**: it delivers beside the webhook route, and JIM-134 removes
+  it, keeping `poll_comments()` as library code for a future catch-up read.
+  Everything under it — the queue, `wakes()`, the self-write filter — is
   transport-independent and survives.
   - **The tick tracks a cursor, not a clock.** The next window starts at the
     `createdAt` of the last comment actually served, so a tick that runs late,
@@ -188,23 +195,34 @@ so the two paths are comparable before one is removed.
 - **Events are foregent's own shape**, not a provider payload. The transport
   is a source feeding one matcher; that seam is what makes the swap to push a
   change of caller rather than a rewrite.
-- **`POST /webhooks/linear` receives what Linear pushes, and logs it** (built
-  in JIM-128). It authenticates the delivery — HMAC-SHA256 over the raw body,
-  keyed on `LINEAR_WEBHOOK_SECRET`, against the `Linear-Signature` header —
-  and stops there: nobody is woken, so the tick is still the only delivery
-  path in the running bridge. The payloads it logged are what
-  `webhook_event()` was written against, and JIM-133 is what wires it to the
-  delivery queue.
+- **`POST /webhooks/linear` receives what Linear pushes and delivers it**
+  (JIM-128, wired to the queue in JIM-133). It authenticates the delivery —
+  HMAC-SHA256 over the raw body, keyed on `LINEAR_WEBHOOK_SECRET`, against the
+  `Linear-Signature` header — maps it with `webhook_event()`, and hands the
+  result to the same matcher and queue as the tick.
+  - **A delivery foregent does nothing with is answered 200.** Most of what
+    Linear sends is about issues no agent here is working; nothing failed, and
+    a failure code buys three pointless retries of an event that would be
+    dropped again. That covers a payload naming no issue, an issue with no
+    agent behind it, and foregent's own writes coming back.
+  - **A delivery that arrives before foregent knows its own account id is
+    answered 503**, the one delivery that is not accepted. Matching without
+    that id wakes an agent with its own comment, and Linear's retry is worth
+    more than a wake foregent has to guess at. The id is asked for once and
+    remembered, off the event loop, so a webhook does not cost a Linear call.
+  - A signed body that is not a JSON object is answered 400: it is not a
+    delivery Linear makes, and pretending it was handled hides a caller that
+    is not Linear.
 - **`linear.webhook_event()` maps a delivery to an `Event`** (built in
-  JIM-130), against those logged payloads rather than against the published
-  schema. A delivery maps when it is an entity delivery — a `type` and a
-  `data` — naming an issue, at `data.issue.identifier` or `data.identifier`;
-  anything else returns nothing, because a payload naming no issue can wake
-  nobody and an unrecognized shape is worth less than a guess. A comment is
-  its text; **everything else that carries an issue is a field update**,
-  keyed on carrying one rather than on a list of entity types, so the
-  reactions, labels and attachments Linear hangs off an issue need no entry
-  each. Mapping only: the route is unchanged and delivery is the next ticket.
+  JIM-130), written against the payloads the route logged in its first life
+  rather than against the published schema. A delivery maps when it is an
+  entity delivery — a `type` and a `data` — naming an issue, at
+  `data.issue.identifier` or `data.identifier`; anything else returns nothing,
+  because a payload naming no issue can wake nobody and an unrecognized shape
+  is worth less than a guess. A comment is its text; **everything else that
+  carries an issue is a field update**, keyed on carrying one rather than on a
+  list of entity types, so the reactions, labels and attachments Linear hangs
+  off an issue need no entry each.
   - **A Linear field update is a wake** (`EventKind.ISSUE_UPDATE`). A person
     answers a parked agent by moving the issue at least as often as by
     writing to it — a design parked for review is approved by a state
