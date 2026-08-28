@@ -27,17 +27,19 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import config, herdr, linear, mcp_servers, skills
+from foregent import config, herdr, linear, mcp_servers, skills, workspaces
 from foregent.agents import (
     AgentError,
     AgentEventKind,
     AgentManager,
+    AgentRecord,
     AgentRef,
     AgentStatus,
     LaunchSpec,
@@ -136,6 +138,11 @@ def rebuild_store() -> None:
         # prevent double-launch. A BLOCKED issue also holds a live agent, but
         # distinguishing that (and full orphan reconciliation) is out of scope
         # here.
+        # `repo` is left empty: the agent's cwd is recoverable but the repo the
+        # workspace was made from is not, so a restart cannot tear that
+        # workspace down. It goes with the rest of the durable per-issue
+        # metadata (docs/ARCHITECTURE.md §1.4); until then the leak is
+        # reclaimed by the next dispatch for that key.
         store.add(
             Issue(
                 key=key,
@@ -490,27 +497,44 @@ def dispatch() -> None:
     ensure_skills()
     try:
         linear.claim_issue(issue.key)
-        ref = _adopt(label) or manager.launch(
-            LaunchSpec(
-                label=label,
-                cwd=issue.directory,
-                mcp_servers=agent_mcp_servers(),
+        running = _adopt(label)
+        if running is not None:
+            # A previous attempt got as far as launching, so it also built the
+            # workspace; the agent's own cwd is where that ended up, and the
+            # store's copy was never written.
+            ref, cwd = running.ref, running.cwd
+        else:
+            # Before the launch, because the workspace is the agent's cwd.
+            cwd = str(workspaces.create(Path(issue.repo), issue.key))
+            ref = manager.launch(
+                LaunchSpec(
+                    label=label,
+                    cwd=cwd,
+                    mcp_servers=agent_mcp_servers(),
+                )
             )
-        )
         manager.send(ref, brief_for(issue.key))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
+    except workspaces.WorkspaceError as exc:
+        raise HTTPException(status_code=502, detail=f"workspace: {exc}") from exc
     except AgentError as exc:
         raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
-    store.add(replace(issue, status=IssueStatus.IN_PROGRESS, agent=ref))
+    store.add(
+        replace(issue, status=IssueStatus.IN_PROGRESS, directory=cwd, agent=ref)
+    )
 
 
-def _adopt(label: str) -> AgentRef | None:
-    """An already-running agent for ``label``, if a previous attempt left one."""
+def _adopt(label: str) -> AgentRecord | None:
+    """An already-running agent for ``label``, if a previous attempt left one.
+
+    The whole record, not just the ref: a retry needs the agent's cwd as well,
+    because the workspace a failed attempt built is not in the store.
+    """
     for record in manager.list_agents():
         if record.ref.label == label:
             logger.info("adopting the agent already running as %s", label)
-            return record.ref
+            return record
     return None
 
 
@@ -522,7 +546,12 @@ def list_issues() -> list[dict[str, str]]:
 
 @app.post("/issues/{key}/queue")
 def queue_issue(key: str, directory: Annotated[str, Body(embed=True)]) -> dict[str, str]:
-    """Queue issue ``key`` to run in ``directory``, dispatching if capacity allows."""
+    """Queue issue ``key`` against the repo at ``directory``, dispatching if free.
+
+    ``directory`` is the project, not the agent's cwd: dispatch builds a
+    per-issue workspace from it and runs the agent there
+    (:mod:`foregent.workspaces`).
+    """
     existing = store.get(key)
     if existing is not None and existing.status in (
         IssueStatus.QUEUED,
@@ -681,6 +710,29 @@ async def complete_task(issue_key: str) -> str:
             await run_in_threadpool(manager.stop, issue.agent)
         except AgentError as exc:
             return f"{result} Agent teardown failed: {exc}"
+    # Then the workspace, and only after the agent is gone — removing a live
+    # agent's own cwd out from under it is worse than leaking a directory.
+    #
+    # This is not the same best-effort as the teardown above. Forgetting the
+    # workspace is the mutating jj command at the colocated root that exports
+    # the bookmark the agent moved from inside it, so a failure here can leave
+    # the issue's work outside git's view of `main` with the issue already
+    # Done. It cannot fail the tool for that reason, but it is logged as an
+    # error and said out loud in the result rather than passed over.
+    if issue is not None and issue.repo and issue.directory:
+        try:
+            await run_in_threadpool(
+                workspaces.destroy,
+                Path(issue.repo),
+                issue_key,
+                Path(issue.directory),
+            )
+        except workspaces.WorkspaceError as exc:
+            logger.error("could not remove the %s workspace: %s", issue_key, exc)
+            return (
+                f"{result} The workspace was left behind ({exc}); if this issue "
+                f"advanced {workspaces.TRUNK}, that may not have reached git yet."
+            )
     return result
 
 

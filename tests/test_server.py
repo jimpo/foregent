@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -30,6 +32,7 @@ from foregent.agents import (
 from foregent.events import Event, EventKind
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
+from foregent.workspaces import WorkspaceError
 
 
 class FakeManager:
@@ -53,6 +56,9 @@ class FakeManager:
         # Observes the world as the agent starts, for the things dispatch has
         # to have finished by then rather than merely around then.
         self.at_launch: Callable[[], None] | None = None
+        # The same, for teardown: what must still be standing while the agent
+        # is being stopped.
+        self.on_stop: Callable[[], None] | None = None
 
     def describe(self) -> str:
         return "a fake harness"
@@ -87,6 +93,8 @@ class FakeManager:
         return ""
 
     def stop(self, ref: AgentRef) -> None:
+        if self.on_stop:
+            self.on_stop()
         self.stopped.append(ref)
 
     def list_agents(self) -> list[AgentRecord]:
@@ -155,7 +163,9 @@ class DispatchTests(unittest.TestCase):
         self.claim.assert_called_once_with("JIM-88")
         self.assertEqual(len(self.manager.launched), 1)
 
-    def test_dispatch_launches_in_the_issues_workspace(self) -> None:
+    def test_dispatch_runs_a_plain_directory_agent_in_it_directly(self) -> None:
+        # A queued directory foregent cannot make a workspace from is used as
+        # the cwd as it stands, so a non-jj project still gets its agent.
         self.queue()
         server.dispatch()
         spec = self.manager.launched[0]
@@ -838,6 +848,108 @@ class PollTickTests(unittest.TestCase):
         self.tick(viewer=viewer)
         self.viewer.assert_called_once()
         self.assertEqual(self.poll.call_args.args[2], self.VIEWER)
+
+
+@unittest.skipUnless(shutil.which("jj"), "jj is not installed")
+class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
+    """Dispatch builds the agent a workspace, and completion removes it (JIM-59)."""
+
+    def setUp(self) -> None:
+        server.store = IssueStore()
+        self.manager = FakeManager()
+        self.enterContext(mock.patch.object(server, "manager", self.manager))
+        self.enterContext(mock.patch.object(server.linear, "claim_issue"))
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CLAUDE_CONFIG_DIR": str(self.tmp / "claude"),
+                    "FOREGENT_WORKSPACE_ROOT": str(self.tmp / "workspaces"),
+                },
+            )
+        )
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True)
+        for args in (
+            ("git", "init", "--colocate"),
+            ("describe", "-m", "first"),
+            ("new",),
+            ("bookmark", "create", "main", "-r", "@-"),
+        ):
+            subprocess.run(["jj", "--no-pager", *args], cwd=self.repo, check=True)
+
+    def test_dispatch_launches_in_a_workspace_not_in_the_repo(self) -> None:
+        server.store.queue("JIM-88", str(self.repo))
+
+        server.dispatch()
+
+        cwd = Path(self.manager.launched[0].cwd)
+        self.assertEqual(cwd, self.tmp / "workspaces" / "JIM-88")
+        self.assertTrue(cwd.is_dir())
+        # The store keeps both: the repo to forget the workspace, the path to
+        # remove it.
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.repo, str(self.repo))
+        self.assertEqual(issue.directory, str(cwd))
+
+    def test_a_workspace_that_cannot_be_built_fails_the_dispatch(self) -> None:
+        # And leaves the issue Queued, so a retry picks it up rather than
+        # stranding it as In Progress with no agent.
+        server.store.queue("JIM-88", str(self.repo))
+
+        with mock.patch.object(
+            server.workspaces, "create", side_effect=WorkspaceError("no disk")
+        ):
+            with self.assertRaises(server.HTTPException) as caught:
+                server.dispatch()
+
+        self.assertEqual(caught.exception.status_code, 502)
+        self.assertIn("no disk", str(caught.exception.detail))
+        self.assertEqual(self.manager.launched, [])
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.QUEUED)
+
+    async def test_completion_removes_the_workspace(self) -> None:
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+
+        await server.complete_task("JIM-88")
+
+        self.assertFalse(cwd.exists())
+
+    async def test_the_workspace_outlives_the_agent_that_used_it(self) -> None:
+        # Removing a live agent's own cwd is worse than leaking a directory,
+        # so teardown waits for the stop.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        alive: list[bool] = []
+        self.manager.on_stop = lambda: alive.append(cwd.is_dir())
+
+        await server.complete_task("JIM-88")
+
+        self.assertEqual(alive, [True])
+
+    async def test_a_failed_teardown_is_reported_not_swallowed(self) -> None:
+        # It is the step that exports the agent's `main` to git, so it does not
+        # get the silent best-effort treatment agent teardown gets.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+
+        with mock.patch.object(
+            server.workspaces, "destroy", side_effect=WorkspaceError("busy")
+        ):
+            result = await server.complete_task("JIM-88")
+
+        self.assertIn("busy", result)
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.DONE)
 
 
 class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):

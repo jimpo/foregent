@@ -36,13 +36,18 @@ class Issue:
 
     ``key`` is the Linear identifier (e.g. ``"JIM-43"``) and is the stable
     handle used throughout the system (agent labels, workspace paths).
-    ``directory`` is the working directory the issue was queued with, where
-    its agent is launched.
+
+    ``repo`` is the project directory the issue was queued with, and
+    ``directory`` is where its agent actually runs: the per-issue workspace
+    built from ``repo`` at dispatch (:mod:`foregent.workspaces`), or ``repo``
+    itself where foregent cannot make one. Both are kept, because teardown
+    needs the repo to forget the workspace and the path to remove it.
     """
 
     key: str
     title: str
     status: IssueStatus = IssueStatus.TODO
+    repo: str = ""
     directory: str = ""
     blocker: str = ""
     # The agent working this issue: where it runs, and the conversation it

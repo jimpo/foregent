@@ -36,15 +36,18 @@ class IssueStore:
         """Return the issue with ``key``, or ``None`` if absent."""
         return self._issues.get(key)
 
-    def queue(self, key: str, directory: str) -> Issue:
-        """Mark issue ``key`` Queued with ``directory``, at the back of the queue.
+    def queue(self, key: str, repo: str) -> Issue:
+        """Mark issue ``key`` Queued against ``repo``, at the back of the queue.
 
         Re-inserting the key makes dict insertion order the queue (FIFO)
         order, so :meth:`next_queued` needs no separate queue structure.
         Unknown keys are upserted, as in :meth:`complete`.
+
+        Only the repo is known here. The agent's own directory is the
+        workspace dispatch builds from it, so it is set there.
         """
         existing = self._issues.pop(key, None) or Issue(key=key, title="")
-        issue = replace(existing, status=IssueStatus.QUEUED, directory=directory)
+        issue = replace(existing, status=IssueStatus.QUEUED, repo=repo, directory="")
         self._issues[key] = issue
         return issue
 
