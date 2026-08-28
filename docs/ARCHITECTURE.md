@@ -103,6 +103,7 @@ One machine per project. Three layers.
   │  • AgentManager (herdr + Claude Code)           │
   │  • foregent MCP server (mounted at /mcp)        │
   │  • skill and MCP provisioning                   │
+  │  • per-issue jj workspaces                      │
   └───────────────┬─────────────────────────────────┘
                   │ unix socket (newline-delimited JSON)
                   ▼
@@ -129,6 +130,7 @@ the bridge through the foregent MCP server.
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
 | `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
+| `workspaces.py` | Per-issue jj workspaces: create at dispatch, remove at completion, and record the path as trusted for Claude Code. |
 | `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's user-level Claude Code config. |
 | `skills/` | The packaged `foregent-worker` skill and its installer. |
 | `cli.py` | `status`, `queue`, `setup`, `serve`. A thin HTTP client of the bridge, except `setup`. |
@@ -147,10 +149,13 @@ the bridge through the foregent MCP server.
    when the session started, so this must finish before launch.
 3. **Claim.** Assignee and In Progress are set in Linear in one step. Nothing
    is dispatched without a durable ownership record.
-4. **Launch.** A herdr workspace opens at the directory and Claude Code
+4. **Workspace.** A fresh jj workspace is built from the queued repo, named
+   for the issue key (§6.5). Before the launch, because it is the agent's
+   cwd.
+5. **Launch.** A herdr workspace opens at that directory and Claude Code
    starts in it, with a conversation id foregent generates rather than
    scrapes.
-5. **Brief.** The agent is prompted with `/foregent-worker JIM-42`, so the
+6. **Brief.** The agent is prompted with `/foregent-worker JIM-42`, so the
    lifecycle has one definition — the skill.
 
 Dispatch is not atomic. The deterministic agent label `fg-jim-42` is what
@@ -198,9 +203,13 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
 - **`report_blocked(issue_key, blocker)`** records the note and marks the
   issue Blocked. Nothing is terminated and capacity does not change.
 - **`complete_task(issue_key)`** marks the issue Done, dispatches the next
-  queued issue, then stops the calling agent, closing its herdr workspace.
-  Teardown is best-effort: the issue is already Done, so a failed teardown
-  must not fail the tool.
+  queued issue, stops the calling agent, and removes its jj workspace — in
+  that order, because removing a live agent's own cwd is worse than leaking a
+  directory. Neither teardown can fail the tool, since the issue is Done
+  either way. They are not equally quiet: the agent stop is best-effort, while
+  a workspace that cannot be removed is logged as an error and reported in the
+  tool's result, because forgetting it is what exports the agent's work to git
+  (§6.5).
 
 The tools are mounted in the bridge's own process, so they mutate the store
 directly instead of looping back over HTTP.
@@ -231,7 +240,8 @@ the rest mirror Linear states.
 
 One concurrent agent, hardcoded. A parked agent holds the slot for the whole
 block. Three simplifications rest on this and become real work when it
-changes: one delivery queue for the fleet, no workspace pool, no per-agent
+changes: one delivery queue for the fleet, no workspace pool — workspaces are
+built per dispatch rather than acquired from one (§6.5) — and no per-agent
 ordering.
 
 ### 5.3 The agent binding
@@ -248,7 +258,9 @@ labels, finding every live agent including parked ones.
 
 It recovers no more than that. Every agent returns as In Progress, because
 the label does not record that it was blocked, and titles, blockers and
-conversation ids are lost.
+conversation ids are lost. So is the repo each workspace was built from: the
+agent's cwd comes back, but not what it was made from, so a restarted bridge
+cannot tear that workspace down (§6.5).
 
 Unbuilt: orphan reconciliation — querying Linear on boot for owned in-flight
 issues, moving the ones whose agents are gone to Orphaned, and re-dispatching
@@ -312,29 +324,52 @@ graduate a repository to full mode.
 
 ### 6.5 Workspaces
 
-Unbuilt. The agent's working directory is whatever the operator passed to
-`foregent queue`, with no per-issue checkout and no isolation between one
-issue and the next.
+Each agent works in its own **jj workspace**, named for the issue key and
+built from the repo the issue was queued against. `foregent queue -d` names
+that repo; the workspace is the agent's cwd. The root is
+`FOREGENT_WORKSPACE_ROOT`, `~/.foregent/workspaces` by default, deliberately
+outside any repo — a workspace is disposable and has no business living inside
+the checkout it was made from.
 
-Decided in JIM-59: the bridge will own the lifecycle, creating one **jj
-workspace** per dispatch named for the issue key and removing it on
-`complete_task`. Neither the agent nor the harness is trusted with the job — an
-agent that dies mid-issue leaks a workspace nobody owns, and herdr's own
-`worktree.create` is git-only and one repo per workspace. Creation is
-`jj workspace forget <key>`, which tolerates absence, then `jj workspace add`,
-so a crashed agent's stale workspace is reclaimed by the next dispatch that
-wants the name and there is no reaper and no registry to keep honest. One fresh
-workspace per dispatch is the point of the exercise: no agent inherits the
+The bridge owns the lifecycle. It creates the workspace before launch and
+removes it on `complete_task`; neither the agent nor the harness is trusted
+with the job, because an agent that dies mid-issue leaks a workspace nobody
+owns. One fresh workspace per dispatch is the point: no agent inherits the
 previous one's dirty working copy, which is worth more today than parallelism.
 
-Two properties of a secondary jj workspace shape it, both verified on jj 0.43.
-It has no `.git`, so raw `git`, `gh`, and the harness's git integration are
-blind inside one — survivable because the write paths do not need them:
-`jj git push` reaches the shared git backend, and GitHub mode opens its pull
-request through the GitHub MCP. And a bookmark it moves stays invisible to git
-until a mutating jj command runs at the colocated root, so bootstrap mode's
-advance of `main` is published by teardown itself — which must therefore run
-even when the workspace directory is already gone.
+Creation is `jj workspace forget <key>`, which tolerates absence, then
+`jj workspace add`. Forgetting first is the whole leak story — a crashed
+agent's stale workspace is reclaimed by the next dispatch that wants the name,
+so there is no reaper and no registry to keep honest. A repo that is not a jj
+repo is used as the cwd as it stands, so a project foregent cannot isolate
+still gets its agent.
+
+Three behaviors of jj shape this, all established by driving jj 0.43 directly:
+
+- **`add` needs an explicit revision.** Given none, jj gives the new working
+  copy the parents of the *current* workspace's working-copy commit, so the
+  agent would start from whatever commit the operator's own checkout was
+  sitting on. Foregent passes `main` — the branch bootstrap mode and the
+  worker skill already name (§6.4), so a second name for it would only be a
+  third place to disagree.
+- **A secondary workspace has no `.git`.** Raw `git`, `gh`, and the harness's
+  git integration are blind inside one. The write paths do not need them:
+  `jj git push` reaches the shared git backend, and GitHub mode opens its pull
+  request through the GitHub MCP. What degrades is agent-side git
+  convenience — a quality cost, not a correctness one.
+- **A bookmark moved inside one is invisible to git** until a mutating jj
+  command runs at the colocated root. Bootstrap mode advances `main` from
+  inside the workspace, so **teardown is what publishes the work to git**, and
+  `forget` runs even when the workspace directory is already gone. This is why
+  a failed teardown is reported rather than passed over (§4.3).
+
+Unbuilt: teardown after a restart. The agent's cwd is recovered from herdr but
+the repo it was made from is not (§5.4), so a workspace whose bridge restarted
+is left for the next dispatch of that key to reclaim.
+
+The pool is deliberately absent. Capacity is one concurrent agent (§5.2), so N
+slots with issue-keyed acquisition would be structure for a number that never
+changes; it arrives with capacity.
 
 ## 7. The AgentManager seam
 
@@ -383,6 +418,15 @@ and none is obvious from either tool's documentation.
 - **Stopping an agent emits only `workspace_closed`.** Closing a workspace
   kills its panes with no pane event, so watching pane events alone misses
   every deliberate teardown.
+- **Workspace trust is inherited, not matched.** Claude Code opens its trust
+  dialog in a directory it has not seen, and herdr reads that dialog as
+  `blocked`, so an untrusted cwd fails a dispatch outright (§8.3). The check
+  is not an exact path match: it walks up from the directory testing each
+  ancestor, so trusting a workspace root once covers every per-issue workspace
+  under it. Read off build 2.1.251 and documented nowhere, so foregent treats
+  it as an optimization rather than a guarantee — it writes the exact entry
+  whenever its own copy of the rule says untrusted, which is the answer a
+  stricter harness would give.
 - **Detection is screen-scraping underneath.** herdr's detection manifest
   updates on its own schedule, independent of the protocol version, so the
   startup protocol check says nothing about it.
@@ -425,6 +469,11 @@ installed.
 - **Pre-accepted workspace trust.** A fresh directory makes Claude Code open
   its trust dialog before accepting input, and herdr's detection reads that
   dialog as `blocked` — so the agent never reaches idle and the launch fails.
+  Every workspace is a fresh directory, so trust the workspace *root* once and
+  every workspace under it inherits it (§7.1). Foregent writes the entry
+  itself for any workspace it finds untrusted, so this is a should, not a
+  must; doing it by hand keeps foregent out of `~/.claude.json`, which every
+  running Claude Code session rewrites.
 - **The herdr Claude integration** (`herdr integration install claude`), so
   session identity is reported back to herdr.
 - **`LINEAR_API_KEY` and `GITHUB_TOKEN` in the herdr server's environment.**
@@ -442,6 +491,7 @@ installed.
 | `FOREGENT_API_URL` | CLI, agents | Where the bridge is. Default `http://127.0.0.1:8577`. |
 | `FOREGENT_HERDR_SESSION` | bridge | Which herdr session agents run in. |
 | `FOREGENT_POLL_INTERVAL` | bridge | Seconds between poll ticks. |
+| `FOREGENT_WORKSPACE_ROOT` | bridge | Where per-issue workspaces are built. Default `~/.foregent/workspaces`. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
 | `GITHUB_TOKEN` | agents | GitHub MCP authentication. |

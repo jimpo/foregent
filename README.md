@@ -120,13 +120,19 @@ This lets Claude Code report its session identity back to herdr.
 
 Claude Code asks `Yes, I trust this folder` in a directory it has not seen, and
 answers nothing until it is told. herdr reads that dialog as `blocked`, so
-**dispatch into an untrusted directory fails**. Before queueing an issue in a
-fresh directory, either run `claude` in it once and accept, or add the entry
-yourself in `~/.claude.json`:
+**dispatch into an untrusted directory fails**.
+
+Every agent runs in a fresh per-issue workspace, so trust the directory those
+are built under — once, and every workspace under it is covered:
 
 ```json
-{ "projects": { "/home/you/ws/JIM-42": { "hasTrustDialogAccepted": true } } }
+{ "projects": { "/home/you/.foregent/workspaces": { "hasTrustDialogAccepted": true } } }
 ```
+
+Foregent falls back to writing the entry for each workspace it creates if it
+finds one untrusted, so a box that skips this still dispatches. Doing it here
+is better: `~/.claude.json` is rewritten by every running Claude Code session,
+and the entry above means foregent never has to touch it.
 
 ## Webhook ingress (Cloudflare tunnel)
 
@@ -201,7 +207,7 @@ server or credential the machine is missing.
 ## Working an issue
 
 ```sh
-foregent queue JIM-42 -d ~/ws/JIM-42    # queue an issue, with the agent's cwd
+foregent queue JIM-42 -d ~/src/myrepo   # queue an issue against a repo
 foregent status                         # what is tracked, and its state
 ```
 
@@ -209,6 +215,15 @@ foregent status                         # what is tracked, and its state
 agent at a time**. Dispatch assigns the issue to the foregent account in Linear
 and moves it to `In Progress`, so the team must have a state with exactly that
 name. A queued issue waits until the running agent finishes.
+
+`-d` is the **repository**, not the agent's working directory. Dispatch builds
+the agent a jj workspace of its own from it — `~/.foregent/workspaces/JIM-42`
+by default, `FOREGENT_WORKSPACE_ROOT` elsewhere — created fresh on `main`, so
+no agent inherits the last one's dirty working copy. Completion removes it. A
+directory that is not a jj repo is used as the agent's cwd as it stands.
+
+Inside a workspace there is no `.git`, so raw `git` and `gh` do not work there;
+`jj` does, and reaches the same repository.
 
 What the agent does next is the `foregent-worker` skill
 (`src/foregent/skills/foregent-worker/SKILL.md`): read the issue, do the work,
@@ -252,12 +267,13 @@ state.
 | `FOREGENT_HERDR_SESSION` | The herdr session to run agents in. Falls back to the session the bridge process runs in, then herdr's default. |
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_POLL_INTERVAL` | Seconds between Linear polls (default 30). Transitional — it goes away with the tick (JIM-134). |
+| `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
 
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 249 unit tests, ~2s
+uv run python -m unittest discover -s tests -t .   # 272 unit tests, ~4s
 uv run ty check                                    # type check
 ```
 

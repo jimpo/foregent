@@ -55,7 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
         "-d",
         "--directory",
         default=".",
-        help="Working directory for the agent (default: current directory).",
+        help=(
+            "The project repository (default: current directory). The agent "
+            "runs in its own workspace built from it, not in it."
+        ),
     )
     queue.set_defaults(func=cmd_queue)
 

@@ -72,6 +72,11 @@ Version control is Jujutsu (`jj`), colocated with git. In a `jj` repo, drive it
 with `jj` — raw `git` commands can corrupt its state. Keep each commit to one
 logical change with a message in the imperative mood.
 
+Your working directory is a jj workspace of its own, and a jj workspace has no
+`.git`, so `git` and `gh` do not work in it at all. `jj` does, and reaches the
+same repository. Foregent removes the workspace when you complete the issue, so
+nothing you leave outside version control survives.
+
 ## Being blocked
 
 Blocked means something outside your workspace has to change first: a PR needs
