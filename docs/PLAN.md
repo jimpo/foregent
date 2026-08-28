@@ -54,7 +54,11 @@ What that buys, all *(verified)* on a live box:
 - **A real status enum**: `idle | working | blocked | done | unknown`, driven
   by a versioned, auto-updating detection manifest
   (`~/.local/state/herdr/agent-detection/remote/claude.toml`) with rules for
-  permission prompts, selection forms, and the transcript viewer.
+  permission prompts, selection forms, and the transcript viewer. That
+  manifest carries its own version and updates on herdr's schedule, not on
+  the protocol's, so the startup protocol check (§5.8) says nothing about it:
+  a manifest update can reclassify a screen — turning a status foregent waits
+  on into one it does not — while `ping` still answers the pinned number.
 
 The cost is that herdr is a hard dependency: 0.8.x, solo-maintained, protocol
 20. Contained by the AgentManager seam (§5.13), a protocol check at startup
@@ -426,7 +430,10 @@ cares.
   - *Pre-accept the workspace trust dialog.* A fresh directory makes Claude
     Code open `❯ 1. Yes, I trust this folder` before accepting any input, and
     every per-issue workspace is a fresh directory. Pre-seed trust for the
-    workspace pool root rather than answering a modal per dispatch.
+    workspace pool root rather than answering a modal per dispatch. This is a
+    precondition for dispatch, not a nicety: herdr's detection manifest reads
+    that dialog as `blocked`, so an agent started in an untrusted directory
+    never reaches `idle` and `launch()` fails on it *(verified)*.
   - *Install the herdr Claude integration* (`herdr integration install claude`)
     so `SessionStart` reports session identity back to herdr.
   - *Pin/record the herdr protocol version* (`ping` → `protocol: 20`) and fail

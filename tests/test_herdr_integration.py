@@ -190,60 +190,61 @@ class AgentIntegrationTests(unittest.TestCase):
         _stop_server(cls.process, cls.session)
 
     def test_agent_lifecycle(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            created = self.client.call(
-                "workspace.create",
-                {"cwd": str(Path(directory).resolve()), "label": "JIM-83"},
-            )
-            pane_id = created["root_pane"]["pane_id"]
-            name = f"fg-inttest-{os.getpid()}"
+        # Runs in the repo checkout because reaching `idle` at all requires a
+        # directory Claude Code already trusts (docs/PLAN.md §5.8).
+        created = self.client.call(
+            "workspace.create",
+            {"cwd": str(_REPO_ROOT), "label": "JIM-83"},
+        )
+        pane_id = created["root_pane"]["pane_id"]
+        name = f"fg-inttest-{os.getpid()}"
 
-            started = self.client.call(
-                "agent.start",
-                {
-                    "name": name,
-                    "kind": "claude",
-                    "pane_id": pane_id,
-                    # A foregent-assigned conversation id is what makes an
-                    # agent resumable (docs/PLAN.md §5.11); assert it reaches
-                    # the process rather than trusting the flag list.
-                    "args": [
-                        "--session-id",
-                        str(uuid.uuid4()),
-                        "--model",
-                        "haiku",
-                        "--permission-mode",
-                        "bypassPermissions",
-                    ],
-                    "timeout_ms": _AGENT_START_MS,
-                },
-                timeout=herdr.timeout_for_wait(_AGENT_START_MS),
-            )
-            self.assertIn("--session-id", started["argv"])
+        started = self.client.call(
+            "agent.start",
+            {
+                "name": name,
+                "kind": "claude",
+                "pane_id": pane_id,
+                # A foregent-assigned conversation id is what makes an
+                # agent resumable (docs/PLAN.md §5.11); assert it reaches
+                # the process rather than trusting the flag list.
+                "args": [
+                    "--session-id",
+                    str(uuid.uuid4()),
+                    "--model",
+                    "haiku",
+                    "--permission-mode",
+                    "bypassPermissions",
+                ],
+                "timeout_ms": _AGENT_START_MS,
+            },
+            timeout=herdr.timeout_for_wait(_AGENT_START_MS),
+        )
+        self.assertIn("--session-id", started["argv"])
 
-            self.client.call(
-                "agent.wait",
-                {"target": name, "until": ["idle"], "timeout_ms": _AGENT_START_MS},
-                timeout=herdr.timeout_for_wait(_AGENT_START_MS),
-            )
-            agent = self.client.call("agent.get", {"target": name})["agent"]
-            self.assertEqual(agent["agent"], "claude")
-            self.assertEqual(agent["agent_status"], "idle")
+        self.client.call(
+            "agent.wait",
+            {"target": name, "until": ["idle"], "timeout_ms": _AGENT_START_MS},
+            timeout=herdr.timeout_for_wait(_AGENT_START_MS),
+        )
+        agent = self.client.call("agent.get", {"target": name})["agent"]
+        self.assertEqual(agent["agent"], "claude")
+        self.assertEqual(agent["agent_status"], "idle")
 
-            read = self.client.call(
-                "agent.read", {"target": name, "source": "recent", "lines": 5}
-            )
-            self.assertIn("text", read["read"])
+        read = self.client.call(
+            "agent.read", {"target": name, "source": "recent", "lines": 5}
+        )
+        self.assertIn("text", read["read"])
 
-            # Closing the pane kills the agent, and herdr drops it from the
-            # roster at once — the crash authority the bridge relies on
-            # (docs/PLAN.md §5.6).
-            self.client.call("pane.close", {"pane_id": pane_id})
-            names = [
-                a.get("name")
-                for a in self.client.call("agent.list")["agents"]
-            ]
-            self.assertNotIn(name, names)
+        # Closing the pane kills the agent, and herdr drops it from the
+        # roster at once — the crash authority the bridge relies on
+        # (docs/PLAN.md §5.6).
+        self.client.call("pane.close", {"pane_id": pane_id})
+        names = [
+            a.get("name")
+            for a in self.client.call("agent.list")["agents"]
+        ]
+        self.assertNotIn(name, names)
 
 
 @unittest.skipUnless(_HERDR, "herdr is not installed")
@@ -262,31 +263,29 @@ class ManagerIntegrationTests(unittest.TestCase):
         _stop_server(cls.process, cls.session)
 
     def test_launch_list_and_stop(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            cwd = str(Path(directory).resolve())
-            label = f"fg-inttest-{os.getpid()}"
-            ref = self.manager.launch(
-                LaunchSpec(label=label, cwd=cwd, model="haiku")
-            )
-            self.addCleanup(self.manager.stop, ref)
+        # In the repo checkout, for the trust reason in `test_agent_lifecycle`.
+        cwd = str(_REPO_ROOT)
+        label = f"fg-inttest-{os.getpid()}"
+        ref = self.manager.launch(LaunchSpec(label=label, cwd=cwd, model="haiku"))
+        self.addCleanup(self.manager.stop, ref)
 
-            # A conversation id exists from the moment the agent does, which
-            # is what makes it resumable (docs/PLAN.md §5.11).
-            self.assertTrue(ref.conversation_id)
-            self.assertEqual(self.manager.status(ref), AgentStatus.IDLE)
+        # A conversation id exists from the moment the agent does, which
+        # is what makes it resumable (docs/PLAN.md §5.11).
+        self.assertTrue(ref.conversation_id)
+        self.assertEqual(self.manager.status(ref), AgentStatus.IDLE)
 
-            records = self.manager.list_agents()
-            self.assertIn(label, [record.ref.label for record in records])
-            record = next(r for r in records if r.ref.label == label)
-            self.assertEqual(record.cwd, cwd)
+        records = self.manager.list_agents()
+        self.assertIn(label, [record.ref.label for record in records])
+        record = next(r for r in records if r.ref.label == label)
+        self.assertEqual(record.cwd, cwd)
 
-            self.assertIn("claude", self.manager.read(ref, lines=40).lower())
+        self.assertIn("claude", self.manager.read(ref, lines=40).lower())
 
-            self.manager.stop(ref)
-            self.assertEqual(self.manager.status(ref), AgentStatus.GONE)
-            self.assertNotIn(
-                label, [r.ref.label for r in self.manager.list_agents()]
-            )
+        self.manager.stop(ref)
+        self.assertEqual(self.manager.status(ref), AgentStatus.GONE)
+        self.assertNotIn(
+            label, [r.ref.label for r in self.manager.list_agents()]
+        )
 
     def test_a_prompt_sent_right_after_launch_is_answered(self) -> None:
         # The acceptance criterion for launch + send: no settle guesswork, no
@@ -302,31 +301,36 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.manager.wait(ref, {AgentStatus.IDLE, AgentStatus.DONE}, 120)
         self.assertIn("PONG", self.manager.read(ref, lines=40))
 
-    def test_an_untrusted_workspace_costs_a_retry_not_the_message(self) -> None:
+    def test_an_untrusted_workspace_costs_the_whole_dispatch(self) -> None:
         # A directory Claude Code has not been told to trust opens a modal
-        # that swallows the first prompt while herdr still reports the agent
-        # idle and interactive. The delivery check catches that (herdr
-        # answers `agent_prompt_stalled`) and the resend gets through, since
-        # the first attempt's Enter dismissed the dialog.
+        # before it will take any input, and herdr's detection manifest reads
+        # that modal as `blocked`. The agent therefore never reaches `idle`
+        # and the launch fails: an untrusted workspace costs the dispatch,
+        # not a retry. Pre-accepting trust for the workspace pool root is
+        # what makes dispatch work at all (docs/PLAN.md §5.8, JIM-96).
         #
-        # Recovering is not a reason to leave it: relying on a modal being
-        # dismissed by a keystroke meant for something else is fragile, and a
-        # dialog whose default is "No, exit" would kill the agent instead.
-        # Pre-accepting trust for the workspace pool root is the real fix
-        # (docs/PLAN.md §5.8, JIM-96).
+        # Slow by construction — it sits out herdr's start budget waiting for
+        # a state that cannot arrive.
         with tempfile.TemporaryDirectory() as directory:
             label = f"fg-untrusted-{os.getpid()}"
-            ref = self.manager.launch(
-                LaunchSpec(
-                    label=label,
-                    cwd=str(Path(directory).resolve()),
-                    model="haiku",
+            with self.assertRaises(AgentError) as caught:
+                self.manager.launch(
+                    LaunchSpec(
+                        label=label,
+                        cwd=str(Path(directory).resolve()),
+                        model="haiku",
+                    )
                 )
+            # The screen goes in the error because a launch that hangs is
+            # nearly always a modal; which lines of it the tail catches
+            # depends on where the dialog sits, so only its presence is
+            # asserted here.
+            self.assertIn("never became idle", str(caught.exception))
+            self.assertIn("last screen:", str(caught.exception))
+            # The failed launch takes its workspace down with it.
+            self.assertNotIn(
+                label, [r.ref.label for r in self.manager.list_agents()]
             )
-            self.addCleanup(self.manager.stop, ref)
-            self.manager.send(ref, "Reply with just the word PONG.")
-            self.manager.wait(ref, {AgentStatus.IDLE, AgentStatus.DONE}, 120)
-            self.assertIn("PONG", self.manager.read(ref, lines=40))
 
     def test_events_report_work_and_death(self) -> None:
         # The bridge's crash authority: agent death arrives as an event
@@ -383,14 +387,12 @@ class ManagerIntegrationTests(unittest.TestCase):
     def test_a_second_launch_for_one_issue_is_refused(self) -> None:
         # The deterministic label is what makes a double dispatch impossible
         # rather than merely unlikely (docs/PLAN.md §5.11).
-        with tempfile.TemporaryDirectory() as directory:
-            cwd = str(Path(directory).resolve())
-            label = f"fg-dup-{os.getpid()}"
-            spec = LaunchSpec(label=label, cwd=cwd, model="haiku")
-            ref = self.manager.launch(spec)
-            self.addCleanup(self.manager.stop, ref)
-            with self.assertRaises(AgentError):
-                self.manager.launch(spec)
+        label = f"fg-dup-{os.getpid()}"
+        spec = LaunchSpec(label=label, cwd=str(_REPO_ROOT), model="haiku")
+        ref = self.manager.launch(spec)
+        self.addCleanup(self.manager.stop, ref)
+        with self.assertRaises(AgentError):
+            self.manager.launch(spec)
 
 
 if __name__ == "__main__":
