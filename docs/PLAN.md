@@ -3,7 +3,7 @@
 Status: **source of truth** for this repo — design, decisions, and phase
 status. Rejected designs are summarized in §9; everything before it describes
 only the current one. Behavior marked *(verified)* was confirmed by driving
-herdr 0.7.5 (protocol 17) and Claude Code 2.1.220 directly.
+herdr 0.8.2 (protocol 20) and Claude Code 2.1.250 directly.
 
 ## 1. Motivation
 
@@ -56,8 +56,8 @@ What that buys, all *(verified)* on a live box:
   (`~/.local/state/herdr/agent-detection/remote/claude.toml`) with rules for
   permission prompts, selection forms, and the transcript viewer.
 
-The cost is that herdr is a hard dependency: 0.7.x, solo-maintained, protocol
-17. Contained by the AgentManager seam (§5.13), a protocol check at startup
+The cost is that herdr is a hard dependency: 0.8.x, solo-maintained, protocol
+20. Contained by the AgentManager seam (§5.13), a protocol check at startup
 (`ping` returns the version), and a degraded fallback inside Claude Code
 itself (`claude -p --output-format stream-json`, or `--bg` with
 `claude agents`) at the cost of observability.
@@ -429,7 +429,7 @@ cares.
     workspace pool root rather than answering a modal per dispatch.
   - *Install the herdr Claude integration* (`herdr integration install claude`)
     so `SessionStart` reports session identity back to herdr.
-  - *Pin/record the herdr protocol version* (`ping` → `protocol: 17`) and fail
+  - *Pin/record the herdr protocol version* (`ping` → `protocol: 20`) and fail
     startup on mismatch.
   - *`LINEAR_API_KEY` / `GITHUB_TOKEN` in the herdr server's env.* The MCP
     config stores the variable, not the token (§5.2), so a server missing its
