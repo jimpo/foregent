@@ -8,6 +8,7 @@ settings the server needs.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 DEFAULT_API_URL = "http://127.0.0.1:8577"
 
@@ -15,6 +16,11 @@ DEFAULT_API_URL = "http://127.0.0.1:8577"
 # query every 30 seconds spends under 5% of the budget; every consumer today
 # is a human replying to a review, who does not feel the difference (JIM-102).
 DEFAULT_POLL_INTERVAL = 30.0
+
+# Where per-issue workspaces are built (JIM-59). Outside any repo on purpose:
+# a workspace is disposable and is removed when its issue completes, so it has
+# no business living inside the checkout it was made from.
+DEFAULT_WORKSPACE_ROOT = "~/.foregent/workspaces"
 
 
 def api_url() -> str:
@@ -33,6 +39,16 @@ def poll_interval() -> float:
         return float(os.environ["FOREGENT_POLL_INTERVAL"])
     except (KeyError, ValueError):
         return DEFAULT_POLL_INTERVAL
+
+
+def workspace_root() -> Path:
+    """Directory holding the per-issue workspaces (``FOREGENT_WORKSPACE_ROOT``).
+
+    One directory per issue key is created under this, and removed when the
+    issue completes (:mod:`foregent.workspaces`).
+    """
+    root = os.environ.get("FOREGENT_WORKSPACE_ROOT") or DEFAULT_WORKSPACE_ROOT
+    return Path(root).expanduser()
 
 
 def herdr_session() -> str | None:

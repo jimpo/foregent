@@ -1,0 +1,248 @@
+"""Per-issue jj workspaces, created at dispatch and removed at completion (JIM-59).
+
+Foregent owns the workspace lifecycle. The bridge builds an agent's checkout
+before launching it and removes it when the issue completes, so no agent
+inherits the previous one's dirty working copy and a crashed agent leaks
+nothing a later dispatch cannot reclaim.
+
+The unit is a **jj workspace**, named for the issue key. Creation is
+``jj workspace forget`` then ``jj workspace add``: forgetting first is what
+makes the name reclaimable, so there is no reaper and no registry to keep
+honest.
+
+Two properties of a secondary jj workspace shape everything here, both
+established by driving jj 0.43 directly:
+
+- It has no ``.git``. Raw ``git`` and ``gh`` are blind inside one, which the
+  write paths survive because ``jj git push`` reaches the shared git backend
+  and GitHub mode opens its pull request over the API.
+- A bookmark it moves is **not exported to git** until a mutating jj command
+  runs at the colocated root. Bootstrap mode advances ``main`` from inside the
+  workspace, so :func:`destroy` is what publishes the agent's work to git —
+  see the ``forget`` call there, which must run even when the directory is
+  already gone.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+from foregent import config, mcp_servers
+
+logger = logging.getLogger(__name__)
+
+# The revision a fresh workspace starts on. Hardcoded rather than configured:
+# bootstrap mode already names `main` as the branch the agent rebases onto and
+# fast-forwards (docs/ARCHITECTURE.md §6.4), and the worker skill tells agents
+# the same, so a second name for it would be a third place to disagree.
+TRUNK = "main"
+
+# Per-call budget for a jj subprocess. Creating a workspace writes a whole
+# working copy, so this is generous; it exists to stop a wedged jj from
+# hanging dispatch forever, not to bound normal work.
+TIMEOUT = 300
+
+
+class WorkspaceError(Exception):
+    """Raised when a workspace could not be created or removed."""
+
+
+def is_repo(directory: Path) -> bool:
+    """Whether ``directory`` is the root of a jj repo.
+
+    Keyed on ``.jj`` rather than on ``jj`` exiting cleanly, so the check costs
+    no subprocess and gives the same answer on a box with no jj installed.
+    """
+    return (directory / ".jj").is_dir()
+
+
+def path_for(key: str) -> Path:
+    """Where the workspace for issue ``key`` lives."""
+    return config.workspace_root() / key
+
+
+def create(repo: Path, key: str) -> Path:
+    """Build a fresh workspace for ``key`` under ``repo`` and return its path.
+
+    A ``repo`` that is not a jj repo is returned unchanged and used as the
+    agent's cwd directly, which is what foregent did before per-issue
+    workspaces existed. That keeps a non-jj project working rather than
+    failing its dispatch over a feature it cannot use.
+
+    The workspace is forgotten before it is added, so a stale one left by a
+    crashed agent is reclaimed by the next dispatch that wants the name.
+    """
+    if not is_repo(repo):
+        logger.info("%s is not a jj repo; running the agent in it directly", repo)
+        return repo
+    path = path_for(key)
+    # Forget before add, and clear the directory with it: `jj workspace add`
+    # refuses a destination that already exists, so a crashed agent's leftovers
+    # would otherwise block every future dispatch for that key.
+    _forget(repo, key)
+    _remove(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # `-r` is not optional. With no revision, jj gives the new working copy the
+    # parents of the *current* workspace's working-copy commit — whichever
+    # commit the operator's own checkout happens to be sitting on — so the
+    # agent would start from wherever they last were.
+    _jj(repo, "workspace", "add", "--name", key, "-r", TRUNK, str(path))
+    ensure_trusted(path)
+    logger.info("created the %s workspace at %s", key, path)
+    return path
+
+
+def destroy(repo: Path, key: str, path: Path) -> None:
+    """Remove the workspace for ``key``, publishing the work it holds.
+
+    ``forget`` runs even when ``path`` is already gone, and that ordering is
+    load-bearing rather than tidy: it is the mutating jj command at the
+    colocated root that exports the bookmark the agent moved from inside the
+    workspace. Skipping it because the directory vanished would leave the
+    issue's work outside git's view of ``main``.
+    """
+    if not is_repo(repo):
+        return
+    _forget(repo, key)
+    _remove(path)
+    logger.info("removed the %s workspace at %s", key, path)
+
+
+def _forget(repo: Path, key: str) -> None:
+    """Forget the workspace named ``key``, tolerating one that is not there.
+
+    jj answers an unknown workspace with a warning and a zero exit, so absence
+    needs no probe of its own.
+    """
+    _jj(repo, "workspace", "forget", key)
+
+
+def _remove(path: Path) -> None:
+    """Delete ``path`` and everything under it, tolerating absence."""
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise WorkspaceError(f"could not remove {path}: {exc}") from exc
+
+
+def _jj(repo: Path, *args: str) -> str:
+    """Run one jj command in ``repo`` and return its stdout."""
+    try:
+        done = subprocess.run(
+            ["jj", "--no-pager", *args],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=TIMEOUT,
+            check=True,
+        )
+    except FileNotFoundError as exc:
+        raise WorkspaceError("jj is not installed on this machine") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise WorkspaceError(f"jj {' '.join(args)} timed out") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise WorkspaceError(f"jj {' '.join(args)} failed: {detail}") from exc
+    return done.stdout
+
+
+def ensure_trusted(path: Path) -> bool:
+    """Record ``path`` as a trusted workspace if it is not one already.
+
+    Claude Code opens its ``Yes, I trust this folder`` dialog in a directory it
+    has not seen, and herdr reads that dialog as ``blocked``, so an untrusted
+    cwd does not slow a dispatch down — it fails it, with nobody there to
+    answer. A per-issue workspace is always a fresh directory, and its path is
+    not known before the issue is queued, so the operator cannot pre-accept it
+    by hand the way `README.md` describes for a fixed one.
+
+    Returns whether an entry was written. **Trust is checked before it is
+    written, and a trusted path is left alone**, which is what keeps this
+    honest about :func:`foregent.mcp_servers.config_file`'s rule that every
+    running Claude Code session rewrites that file so foregent must not. On a
+    box whose workspace root is trusted, :func:`trusted` answers yes by
+    inheritance and nothing here writes at all; the write is the fallback for
+    a box where it is not, where the alternative is a dispatch that hangs on a
+    dialog rather than one that runs.
+    """
+    if trusted(path):
+        return False
+    _write_trust(path)
+    logger.info("recorded %s as a trusted workspace for Claude Code", path)
+    return True
+
+
+def trusted(path: Path) -> bool:
+    """Whether Claude Code would open its trust dialog in ``path``.
+
+    Mirrors the harness's own rule: an exact entry for the directory, or one
+    on any ancestor of it. The ancestor walk is why trusting a workspace root
+    once covers every per-issue workspace under it.
+
+    Read off Claude Code 2.1.251 and not documented by it, so it is treated as
+    an optimization rather than a guarantee — :func:`ensure_trusted` writes the
+    exact entry whenever this says no, which is the answer a stricter harness
+    would give.
+    """
+    projects = _config().get("projects")
+    if not isinstance(projects, dict):
+        return False
+    for directory in (path, *path.parents):
+        entry = projects.get(str(directory))
+        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+            return True
+    return False
+
+
+def _config() -> dict:
+    """Claude Code's user-level config, or an empty one if it cannot be read.
+
+    An unreadable or malformed config reads as "nothing is trusted", so the
+    caller writes an entry rather than assuming a dispatch will work.
+    """
+    try:
+        loaded = json.loads(mcp_servers.config_file().read_text())
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_trust(path: Path) -> None:
+    """Add ``path`` to the config's trusted projects, atomically.
+
+    Staged and renamed so a session reading the file never sees a partial one.
+    The read-modify-write can still lose whatever a session wrote in between;
+    that is why the caller only reaches this when the path is genuinely
+    untrusted, which on a correctly provisioned box is never.
+    """
+    config_file = mcp_servers.config_file()
+    loaded = _config()
+    projects = loaded.get("projects")
+    loaded["projects"] = projects if isinstance(projects, dict) else {}
+    entry = loaded["projects"].get(str(path))
+    loaded["projects"][str(path)] = {
+        **(entry if isinstance(entry, dict) else {}),
+        "hasTrustDialogAccepted": True,
+    }
+    try:
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            dir=config_file.parent,
+            prefix=f".{config_file.name}.",
+            delete=False,
+        ) as staged:
+            json.dump(loaded, staged, indent=2)
+            staged.flush()
+            os.fsync(staged.fileno())
+        os.replace(staged.name, config_file)
+    except OSError as exc:
+        raise WorkspaceError(f"could not record {path} as trusted: {exc}") from exc
