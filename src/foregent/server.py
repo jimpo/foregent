@@ -98,9 +98,9 @@ manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
 # when capacity grows.
 deliveries: queue.Queue[tuple[str, str]] = queue.Queue()
 
-# How long to pause before offering a message to a busy agent again. `send`
-# blocks on the harness for its own budget first, so this paces only the
-# case where the harness is failing rather than the agent being busy.
+# How long to pause before offering a refused message again. A prompt is
+# submitted without waiting for the agent to be free, so a refusal is the
+# harness being unreachable rather than the agent being busy.
 DELIVERY_RETRY_SECONDS = 5.0
 
 
@@ -184,9 +184,10 @@ def watch_deliveries() -> None:
     """Hand queued messages to their agents, on a daemon thread.
 
     In the shape of :func:`watch_agents`, and for the same reason: a send
-    blocks for as long as its agent stays busy, which can be a whole turn,
-    and no ingesting caller can be held that long — Linear retries any
-    webhook delivery the bridge is slow to answer.
+    talks to the harness and is retried until it lands, so it can take as
+    long as the harness is unreachable, and no ingesting caller can be held
+    that long — Linear retries any webhook delivery the bridge is slow to
+    answer.
 
     One thread, so the queue's order is the delivery order. It survives a
     failed delivery: a drainer that died on one message would silently
@@ -225,25 +226,29 @@ def send_queued(key: str, message: str) -> None:
             "dropped a message for %s: no agent to deliver to (%s)", key, status
         )
         return
-    if not send_when_free(issue.agent, message):
+    if not send_now(issue.agent, message):
         return
     if issue.status is IssueStatus.BLOCKED:
         store.unblock(key)
 
 
-def send_when_free(ref: AgentRef, message: str) -> bool:
-    """Send ``message`` once the agent is free; ``False`` if it died first.
+def send_now(ref: AgentRef, message: str) -> bool:
+    """Submit ``message`` to the agent; ``False`` if it died first.
 
-    A busy agent is waited on for as long as its turn takes.
-    :meth:`~foregent.agents.AgentManager.send` waits for the harness's own
-    budget and fails when that runs out, and that failure means the agent is
-    still working, not that the message is lost — so it is offered again. The
-    one thing that ends the wait is the agent being gone, because then the
-    message can never land.
+    Ungated (``when_idle=False``): the message goes in whatever the agent is
+    doing, because a worker is meant to see activity on its own issue as it
+    happens. The harness queues a prompt behind the turn in progress, so
+    delivering to a working agent costs it nothing and reaches it at the end
+    of the turn it is in — where waiting for it to fall idle first reaches it
+    only if it ever does, and an agent whose turn ends in ``complete_task``
+    never does.
 
-    A harness that cannot be reached is not an agent that died, so that is
-    retried too; the pause between attempts is what keeps a broken socket
-    from spinning.
+    A send that fails is offered again: the harness refusing a prompt says
+    the agent is momentarily unreachable, not that the message is lost. The
+    one thing that ends the retry is the agent being gone, because then the
+    message can never land. A harness that cannot be reached at all is not an
+    agent that died, so that is retried too; the pause between attempts is
+    what keeps a broken socket from spinning.
 
     A message can therefore reach an agent twice: a stalled prompt is
     reported as a failure and never landed, but a socket that dies just after
@@ -253,7 +258,7 @@ def send_when_free(ref: AgentRef, message: str) -> bool:
     """
     while True:
         try:
-            manager.send(ref, message)
+            manager.send(ref, message, when_idle=False)
             return True
         except AgentError as exc:
             if agent_gone(ref):

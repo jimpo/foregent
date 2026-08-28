@@ -41,6 +41,8 @@ class FakeManager:
     def __init__(self, existing: list[AgentRecord] | None = None) -> None:
         self.launched: list[LaunchSpec] = []
         self.sent: list[tuple[AgentRef, str]] = []
+        # Whether each send asked to be held until the agent was free.
+        self.idle_gated: list[bool] = []
         self.stopped: list[AgentRef] = []
         self.existing = existing or []
         self.stream: list[AgentEvent] = []
@@ -48,9 +50,9 @@ class FakeManager:
         self.fail_send: Exception | None = None
         self.fail_status: Exception | None = None
         # How many sends fail before one lands, negative for all of them.
-        # The delivery drainer keeps offering a message to a busy agent, so
-        # a harness that recovers and one that never does are both worth
-        # driving (JIM-132).
+        # The delivery drainer keeps offering a refused message, so a harness
+        # that recovers and one that never does are both worth driving
+        # (JIM-132).
         self.fail_sends = -1
         self.agent_status = AgentStatus.IDLE
         # Observes the world as the agent starts, for the things dispatch has
@@ -74,6 +76,7 @@ class FakeManager:
         return ref
 
     def send(self, ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
+        self.idle_gated.append(when_idle)
         if self.fail_send and self.fail_sends != 0:
             self.fail_sends -= 1
             raise self.fail_send
@@ -204,6 +207,10 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(issue.agent, ref)
         # The conversation id is the half that outlives the process.
         self.assertEqual(issue.agent.conversation_id, "conversation-1")
+        # The brief is the one send that waits for a free agent: it is the
+        # agent's assignment, and landing it mid-turn would interrupt work
+        # it cannot have been given yet.
+        self.assertEqual(self.manager.idle_gated, [True])
 
     def test_dispatch_installs_a_missing_skill_before_the_agent_starts(self) -> None:
         # Claude Code only watches skill directories that existed when the
@@ -338,9 +345,9 @@ class DeliverTests(unittest.TestCase):
         return issue
 
     def test_delivering_queues_rather_than_sending_on_the_callers_thread(self) -> None:
-        # A send waits out whatever the agent is doing, and Linear retries
-        # any webhook delivery the bridge is slow to answer, so no ingesting
-        # caller may be held behind an agent mid-turn (JIM-132).
+        # A send talks to the harness and is retried until it lands, and
+        # Linear retries any webhook delivery the bridge is slow to answer,
+        # so no ingesting caller may be held behind one (JIM-132).
         self.work()
         record = server.deliver_issue("JIM-88", "AJ commented: ship it")
         self.assertEqual(self.manager.sent, [])
@@ -367,6 +374,29 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
         self.assertEqual(self.issue().status, IssueStatus.IN_PROGRESS)
 
+    def test_a_working_agent_is_prompted_without_waiting_out_its_turn(self) -> None:
+        # Delivery is not gated on the agent being free (JIM-144). Gating it
+        # held every message for the whole turn — the harness waits five
+        # minutes for an idle agent, fails, and is offered the message
+        # again — so a worker heard nothing while it worked, and one whose
+        # turn ended in `complete_task` was torn down having never read it.
+        # The harness queues a prompt behind the turn in progress, so it is
+        # submitted straight away.
+        self.work()
+        self.manager.agent_status = AgentStatus.WORKING
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        drain_deliveries()
+        self.assertEqual(self.manager.idle_gated, [False])
+        self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
+
+    def test_a_parked_agent_is_prompted_the_same_way(self) -> None:
+        # Being parked is not a second delivery path: a parked agent is idle
+        # anyway, and the wake reads the same as any other message.
+        self.park()
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        drain_deliveries()
+        self.assertEqual(self.manager.idle_gated, [False])
+
     def test_an_agent_in_review_is_sent_to_and_left_as_it_was(self) -> None:
         self.work(IssueStatus.IN_REVIEW)
         server.deliver_issue("JIM-88", "go on")
@@ -386,10 +416,10 @@ class DeliverTests(unittest.TestCase):
             ["AJ commented: ship it", "Sam commented: hold on"],
         )
 
-    def test_a_busy_agent_is_waited_out_rather_than_given_up_on(self) -> None:
-        # `send` fails once the harness's own idle budget runs out, and that
-        # says the agent is still working, not that the message is lost: five
-        # minutes is not a reason to throw an event away (JIM-132).
+    def test_a_refused_message_is_offered_again_rather_than_dropped(self) -> None:
+        # A harness that refuses a prompt says the agent is momentarily
+        # unreachable, not that the message is lost: a hiccup is not a reason
+        # to throw an event away (JIM-132).
         self.work()
         self.manager.fail_send = AgentError("agent is busy")
         self.manager.fail_sends = 2

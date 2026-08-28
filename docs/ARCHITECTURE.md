@@ -180,14 +180,21 @@ the last comment served; it feeds the same queue and is being removed.
 4. **Drain.** One daemon thread sends one message at a time, in the order
    written. Nothing is coalesced — merging two people's comments into one
    prompt loses who said what.
-5. **Send, then unblock.** A busy agent is waited out, not timed out, and the
-   message is offered again until the harness reports it gone. Unblocking
-   happens only after the send succeeds, so a failure leaves the issue
-   Blocked with nothing to roll back.
+5. **Send, then unblock.** The prompt is submitted straight away, whatever
+   the agent is doing, and offered again until it lands or the harness
+   reports the agent gone. Unblocking happens only after the send succeeds,
+   so a failure leaves the issue Blocked with nothing to roll back.
 
-A live agent is reachable whether or not it is parked. Its status decides
-only what happens after the send: a parked agent is unblocked, a working one
-is left as it was.
+A live agent is reachable whether or not it is parked, and is prompted the
+same way either way. Its status decides only what happens after the send: a
+parked agent is unblocked, a working one is left as it was.
+
+Delivery is ungated (`when_idle=False`), which is the whole of a worker
+seeing activity on its own issue as it happens: the harness queues a prompt
+behind the turn in progress, so a working agent reads it at the end of that
+turn. Waiting for an idle agent first — what `send` does by default, and what
+dispatch's brief wants — reaches a worker only if it ever falls idle, and one
+whose turn ends in `complete_task` never does (JIM-144).
 
 Response codes carry meaning. A delivery foregent does nothing with is
 answered 200 — most of what Linear sends concerns issues no agent here is
@@ -411,6 +418,16 @@ and none is obvious from either tool's documentation.
 - **A stall is not a timeout.** A stall means the agent never saw the
   message, so a resend cannot double up. A timeout means it reacted but did
   not reach the watched state, and counts as delivered.
+- **A working agent takes a prompt.** herdr accepts it and the agent reads it
+  when its turn ends; only a `blocked` agent is refused outright. The
+  delivery check comes with the caveat that herdr runs it only when the
+  submission starts from a non-working state, so a prompt to a working agent
+  is accepted on herdr's word alone.
+- **Scrollback needs an idle agent.** `agent.read` captures history by
+  scrolling the pane, which herdr refuses (`agent_not_idle`) while an agent
+  is working; only the visible screen can be read then. Every read is for a
+  human to look at, and the ones that matter most quote a failure against a
+  working agent, so the manager falls back rather than propagating.
 - **Status is a per-pane subscription.** The global `pane.updated` carries an
   `agent_status` that lags, reporting an agent idle while it works. A quiet
   subscription re-checks the fleet periodically, because an agent started

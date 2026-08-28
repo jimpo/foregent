@@ -300,6 +300,35 @@ class ManagerIntegrationTests(unittest.TestCase):
         self.manager.wait(ref, {AgentStatus.IDLE, AgentStatus.DONE}, 120)
         self.assertIn("PONG", self.manager.read(ref, lines=40))
 
+    def test_a_working_agent_takes_a_prompt_mid_turn(self) -> None:
+        # What the bridge's delivery rests on (JIM-144): herdr accepts a
+        # prompt for an agent that is mid-turn, and Claude Code answers it
+        # when that turn ends. Waiting for the agent to fall idle first is
+        # what kept every event from a working worker.
+        label = f"fg-midturn-{os.getpid()}"
+        ref = self.manager.launch(
+            LaunchSpec(label=label, cwd=str(_REPO_ROOT), model="haiku")
+        )
+        self.addCleanup(self.manager.stop, ref)
+        # `send` returns once herdr has seen the agent react, so the agent is
+        # working on this by the time the second prompt goes in.
+        self.manager.send(
+            ref, "Run `sleep 20` with the Bash tool, then reply with just OK."
+        )
+        self.assertEqual(self.manager.status(ref), AgentStatus.WORKING)
+        self.manager.send(ref, "Then reply with just PONG.", when_idle=False)
+
+        # Polled rather than waited on: the agent passes through idle between
+        # the two answers, so the state says nothing about the second having
+        # been read.
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            if "PONG" in self.manager.read(ref, lines=200):
+                return
+            time.sleep(1)
+        self.fail(f"the mid-turn prompt was never answered; last screen:\n"
+                  f"{self.manager.read(ref, lines=40)}")
+
     def test_an_untrusted_workspace_costs_the_whole_dispatch(self) -> None:
         # A directory Claude Code has not been told to trust opens a modal
         # before it will take any input, and herdr's detection manifest reads
