@@ -423,15 +423,34 @@ cares.
 ### 5.7 Workspace manager
 - Unit: **workspace = directory containing one checkout of each project
   repo** (multi-repo native; single-repo is the degenerate case).
-- **Foregent owns VCS; herdr is handed a cwd.** The manager creates the
-  checkouts (jj workspaces preferred, git worktrees as fallback — Q6), then
-  calls `workspace.create {cwd, label}`. herdr's own `worktree.create` is not
-  the primary path: it is git-only and one-repo-per-workspace, which would
-  foreclose Q6 and fight goal 7. `worktree.open` may be called afterward so
-  herdr's TUI shows repo/branch for the single-repo git case.
-- Pool of N workspaces per machine; issue-keyed acquisition. A parked-alive
-  agent holds its workspace for the duration of the block (§5.6).
-- Sync: workspace refreshed (rebase onto main / trunk) before each dispatch.
+- **Foregent owns the workspace lifecycle; herdr is handed a cwd.** The bridge
+  creates the checkouts before launch and tears them down on `complete_task`.
+  Neither the agent nor the harness is trusted with it: an agent that dies
+  mid-issue leaks a workspace nobody owns, and herdr's own `worktree.create`
+  is git-only and one-repo-per-workspace, which would fight goal 7.
+  `worktree.open` may be called afterward so herdr's TUI shows repo/branch
+  for the single-repo git case.
+- **Checkouts are jj workspaces** (Q6). One fresh workspace per dispatch,
+  named for the issue key, so no agent inherits the previous one's dirty
+  working copy.
+- Lifecycle is `jj workspace forget <key>` then `jj workspace add`, both at
+  *creation*. Forget-then-add is also the leak story: a crashed agent's stale
+  workspace is reclaimed by the next dispatch that wants the name, so there is
+  no reaper and no registry to keep honest.
+- Bootstrap mode needs no special ordering: the agent advances `main` before
+  it calls `complete_task`, so teardown-on-complete is already behind it.
+- **A secondary jj workspace has no `.git`** *(verified, jj 0.43)*, so raw
+  `git`, `gh`, and the harness's own git integration are blind inside one.
+  This is survivable because the write paths do not need it: `jj git push`
+  from the workspace reaches the shared git backend, and GitHub mode opens
+  the PR through the GitHub MCP over the API (§5.2), not through `gh`.
+  What degrades is agent-side git conveniences, which is a quality cost, not
+  a correctness one.
+- Sync: workspace created from current trunk on each dispatch.
+- **No pool yet.** Capacity is one concurrent agent, so a pool of N with
+  issue-keyed acquisition would be structure for a number that never changes.
+  Add it with capacity; a parked-alive agent already holds its workspace for
+  the duration of the block (§5.6).
 
 ### 5.8 Provisioning & skills sync
 - Per-project **manifest** (in the project's infra repo): repo list, mode,
@@ -715,7 +734,7 @@ system itself.
    attachment `metadata` upsert-by-url, self-event actor filtering); the
    managed team gains an **Orphaned** workflow state. Foregent development
    driven from Linear end-to-end in bootstrap mode.
-4. **Workspaces**: pool, jj-or-git decision executed (Q6), multi-repo layout,
+4. **Workspaces**: per-dispatch jj workspaces (§5.7), multi-repo layout,
    sccache wiring.
 5. **GitHub full mode**: PR flow, review-comment monitor, park-alive on PR
    blockers + prompt wake. Foregent graduates from bootstrap to full mode on
@@ -757,9 +776,14 @@ system itself.
 
 ## 8. Open questions
 
-- **Q6 — jj workspaces vs git worktrees** for the workspace pool. Decide during
-  phase 4 with a spike; the hard requirement is rebase/linear history, not jj
-  itself.
+- **Q6 — jj workspaces vs git worktrees** for the workspace pool. **Resolved
+  2026-08-28: jj workspaces**, without the planned spike — goal 6 already
+  prefers jj, the `foregent-worker` skill already commits to it, and the
+  operator runs jj workspaces daily. Against that, a git-worktree pool cannot
+  check out `main` in two worktrees at once (`fatal: 'main' is already used by
+  worktree at ...`), so it would need per-issue branches or `--detach` before
+  it could hold two agents. jj's one real cost — no `.git` in a secondary
+  workspace — is recorded in §5.7 along with why it does not bite.
 - **Q7 — Multi-repo task semantics.** Is one Linear issue ever cross-repo? Start
   by forbidding cross-repo issues; revisit with binius data.
 - **Q8 — Webhook ingress.** Resolved 2026-07-28 (JIM-102) as *poll, don't
@@ -842,7 +866,7 @@ Artifacts retired by this decision: `src/foregent/cao.py`, `tests/test_cao*.py`,
   as the mechanism for orphan recovery and a future reaper.
 - **herdr-owned workspaces** — `worktree.create` builds the checkout and opens
   it as a workspace in one call, with lifecycle events. Rejected as the primary
-  path: git-only and one repo per workspace, which forecloses jj (Q6) and the
+  path: git-only and one repo per workspace, which forecloses jj (§5.7) and the
   multi-repo requirement (goal 7). `worktree.open` remains available for TUI
   niceness (§5.7).
 - **Bridge-orchestrated roles** — no agent-side judgment at all; the bridge
