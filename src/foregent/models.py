@@ -1,9 +1,8 @@
 """Core domain types for foregent-managed issues.
 
-These mirror the lifecycle described in ``docs/PLAN.md``: an issue is claimed,
-worked by an agent, possibly parked while blocked on an external event,
-reviewed, and completed. The per-issue metadata that must outlive a process
-(§5.11) will attach here as the Linear-side store lands.
+An issue is claimed, worked by an agent, possibly parked while blocked on an
+external event, reviewed, and completed. The per-issue metadata that must
+outlive a process will attach here as the durable Linear-side store lands.
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ class IssueStatus(StrEnum):
 
     A superset of the Linear statuses foregent reads/writes, plus the
     foregent-specific ``ORPHANED`` state (an in-flight issue whose agent is
-    gone — see ``docs/PLAN.md`` §5.12).
+    gone).
     """
 
     TODO = "Todo"
@@ -47,6 +46,6 @@ class Issue:
     directory: str = ""
     blocker: str = ""
     # The agent working this issue: where it runs, and the conversation it
-    # holds. None until dispatch. The conversation id is the half that
-    # outlives the process (docs/PLAN.md §5.11).
+    # holds. None until dispatch. The conversation id is the half that outlives
+    # the process.
     agent: AgentRef | None = None

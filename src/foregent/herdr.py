@@ -1,9 +1,8 @@
 """Minimal herdr socket API client.
 
 herdr ships no client library, so this is a thin stdlib-``socket`` wrapper
-over the newline-delimited JSON API foregent drives (``docs/PLAN.md`` §2,
-§4). Access control is unix-socket file permissions, so there is nothing to
-authenticate.
+over the newline-delimited JSON API foregent drives. Access control is
+unix-socket file permissions, so there is nothing to authenticate.
 """
 
 from __future__ import annotations
@@ -14,9 +13,9 @@ import socket
 from collections.abc import Iterator
 from pathlib import Path
 
-# Protocol version this client is written against. herdr is a hard
-# dependency (docs/PLAN.md §7), so a drift here must stop the bridge at
-# startup rather than surface as mystery errors mid-dispatch.
+# Protocol version this client is written against. herdr is a hard dependency,
+# so a drift here must stop the bridge at startup rather than surface as
+# mystery errors mid-dispatch.
 PROTOCOL = 20
 
 # Default per-call budget. Calls that block server-side (``agent.wait``,
@@ -236,7 +235,7 @@ class HerdrClient:
         """Raise unless the server speaks protocol ``expected``.
 
         Called at bridge startup: a protocol drift means every later call is
-        suspect, so it is better to refuse to start (docs/PLAN.md §5.8).
+        suspect, so it is better to refuse to start.
         """
         banner = self.ping()
         actual = banner.get("protocol")

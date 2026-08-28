@@ -6,14 +6,14 @@ vocabulary it needs: a normalized :class:`Event` and a pure :func:`wakes`.
 The rule is **an event goes to the agent that owns the issue the event is
 about** — a comment on the issue, a change to one of its fields, or activity
 on the pull request linked to it. It goes there whether that agent is working
-or parked on a block (``docs/PLAN.md`` §5.6): a worker should see activity on
+or parked on a block: a worker should see activity on
 its own issue as soon as it happens. The blocker a parked agent reported is
 never read: it says what the agent was waiting for, in whatever words it
 chose, and is for the operator reading ``foregent status``.
 
 Ingestion — the periodic tick that asks Linear and GitHub what changed, and
 resolving a pull request back to the Linear issue it is linked to — lands
-separately (§5.1). Keeping this pure is what lets it be tested without a
+separately. Keeping this pure is what lets it be tested without a
 server, a transport, or a live agent.
 """
 

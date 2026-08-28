@@ -104,9 +104,9 @@ merely stuck on; that is a decision for the person who filed it.
 
 ## Working in the foregent repo
 
-If your workspace is foregent itself, `docs/PLAN.md` is the source of truth for
-design and decisions. Read it before changing behavior, and update it in the
-same commit when a change makes it wrong — a stale plan is worse than none.
+If your workspace is foregent itself, `docs/ARCHITECTURE.md` describes the
+system. Read it before changing behavior, and update it in the same commit
+when a change makes it wrong — a stale document is worse than none.
 
 ## Never
 

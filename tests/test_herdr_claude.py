@@ -171,8 +171,8 @@ class RenderArgsTests(unittest.TestCase):
         self.assertNotIn("--session-id", args)
 
     def test_permissions_are_always_bypassed(self) -> None:
-        # Full permissions on a dedicated box (docs/PLAN.md goal 1): not a
-        # per-agent choice, so it cannot be omitted by a caller.
+        # Full permissions on a dedicated box: not a per-agent choice, so it
+        # cannot be omitted by a caller.
         args = render_args(spec())
         self.assertEqual(args[args.index("--permission-mode") + 1], "bypassPermissions")
 
@@ -239,7 +239,7 @@ class LaunchTests(unittest.TestCase):
 
     def test_launch_assigns_a_conversation_id_when_given_none(self) -> None:
         # Every agent must be resumable from the moment it exists, so the id
-        # cannot wait for the agent to report one (docs/PLAN.md §5.11).
+        # cannot wait for the agent to report one.
         client = FakeClient({"workspace.create": WORKSPACE})
         ref = manager(client).launch(spec())
         self.assertTrue(ref.conversation_id)
@@ -427,8 +427,8 @@ class WaitTests(unittest.TestCase):
         self.assertEqual(client.params_for("agent.wait")["timeout_ms"], 30_000)
 
     def test_a_dying_agent_resolves_the_wait_as_gone(self) -> None:
-        # Crash authority on the call the bridge is already making, rather
-        # than a hang until the timeout (docs/PLAN.md §5.6).
+        # Crash authority on the call the bridge is already making, rather than
+        # a hang until the timeout.
         client = FakeClient(
             errors={"agent.wait": herdr.HerdrAPIError("agent_not_found", "nope")}
         )

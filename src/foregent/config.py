@@ -48,7 +48,7 @@ def herdr_session() -> str | None:
     any herdr pane, so with only the fallbacks it would land in the *default*
     session, putting foregent's agents in the operator's interactive one
     instead of the dedicated session that exists to be attached to read-only
-    (``docs/PLAN.md`` §5.10). A dev box sets nothing and works anyway.
+   . A dev box sets nothing and works anyway.
     """
     # Empty means unset: an exported-but-blank variable is not a session name,
     # and treating it as one asks herdr for a socket nobody chose.

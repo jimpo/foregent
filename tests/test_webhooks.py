@@ -200,8 +200,8 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
 
     def test_a_field_change_reaches_the_agent_as_what_changed(self) -> None:
-        # A person answers an agent by moving the issue as often as by
-        # writing to it (docs/PLAN.md §5.1).
+        # A person answers an agent by moving the issue as often as by writing
+        # to it.
         self.track()
         self.deliver(
             {

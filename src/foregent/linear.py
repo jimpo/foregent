@@ -4,7 +4,7 @@ Linear ships no first-party client library either, so this is a thin
 wrapper, built on the ``gql`` library, over the little foregent needs of
 Linear directly: claiming an issue, and asking what changed on the issues it
 is tracking. This is the bridge's own direct Linear access, separate from the
-agent-facing Linear MCP (docs/PLAN.md §5.12).
+agent-facing Linear MCP.
 
 Traffic in the other direction — deliveries Linear makes to the bridge — is
 here too: :func:`webhook_authentic` proves a payload came from Linear, and
@@ -155,7 +155,7 @@ def viewer_id() -> str:
     Everything the bridge does to Linear — claiming an issue, and every
     comment an agent posts through the Linear MCP — is written as this
     account and comes straight back as a change, so the poll has to know it
-    to leave its own writes alone (docs/PLAN.md §5.1).
+    to leave its own writes alone.
     """
     return _request(_VIEWER_QUERY, {})["viewer"]["id"]
 
@@ -183,7 +183,7 @@ def poll_comments(
 ) -> tuple[list[Event], str]:
     """Comments left on ``keys`` after ``since``, with the cursor to poll from next.
 
-    One query for the whole fleet (docs/PLAN.md §5.1), keyed on the issues the
+    One query for the whole fleet, keyed on the issues the
     bridge is tracking so cost scales with work in progress rather than with
     workspace size. ``keys`` are issue identifiers (``JIM-36``), which Linear
     accepts in this filter as it does in ``issue(id:)``.
@@ -275,7 +275,7 @@ def webhook_event(payload: dict) -> Event | None:
     """The foregent event a Linear webhook delivery is, or ``None`` for none.
 
     Pure, and the whole of understanding a Linear payload: everything above
-    it works in foregent's own shape (docs/PLAN.md §5.1).
+    it works in foregent's own shape.
 
     A delivery maps when it is an entity delivery — a ``type`` naming the
     entity and a ``data`` object holding it — that names an issue, at
@@ -292,7 +292,7 @@ def webhook_event(payload: dict) -> Event | None:
     The actor is carried through because :func:`~foregent.events.wakes` drops
     foregent's own writes by identity, and this path is how they come back:
     every comment an agent posts through the Linear MCP, and the assignee and
-    state change the bridge makes to claim an issue (§5.12). A mapping that
+    state change the bridge makes to claim an issue. A mapping that
     lost the actor would turn every claim into a wake of the agent it just
     launched.
     """

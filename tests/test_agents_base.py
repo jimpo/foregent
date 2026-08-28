@@ -87,7 +87,7 @@ class TypeTests(unittest.TestCase):
 
     def test_ref_carries_the_durable_conversation_id(self) -> None:
         # The label locates the live process; the conversation id is what
-        # outlives it and gets recorded in Linear (docs/PLAN.md §5.11).
+        # outlives it and gets recorded in Linear.
         ref = AgentRef("fg-jim-84", "11111111-2222-3333-4444-555555555555")
         self.assertEqual(ref.conversation_id, "11111111-2222-3333-4444-555555555555")
 
@@ -100,7 +100,7 @@ class TypeTests(unittest.TestCase):
 
 
 class LabelTests(unittest.TestCase):
-    """The naming convention the bridge rebuilds its state from (§5.11)."""
+    """The naming convention the bridge rebuilds its state from."""
 
     def test_label_is_derived_from_the_issue_key(self) -> None:
         self.assertEqual(label_for("JIM-52"), "fg-jim-52")

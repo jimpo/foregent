@@ -1,6 +1,6 @@
 """In-memory store of the issues foregent is tracking.
 
-The bridge is stateless (``docs/PLAN.md`` §5.11): the authoritative record of
+The bridge is stateless: the authoritative record of
 live work lives in the agent harness and in Linear, and this store is only an
 in-memory cache rebuilt from those backends on startup.
 """
@@ -13,8 +13,8 @@ from dataclasses import replace
 from foregent.models import Issue, IssueStatus
 
 # An issue with a live agent working it, whether or not that agent is busy.
-# These are the states an event can be delivered into (docs/PLAN.md §5.1) and
-# the ones an issue can be orphaned out of (§5.12).
+# These are the states an event can be delivered into and the ones an issue can
+# be orphaned out of.
 IN_FLIGHT = (IssueStatus.IN_PROGRESS, IssueStatus.IN_REVIEW, IssueStatus.BLOCKED)
 
 
@@ -90,7 +90,7 @@ class IssueStore:
 
         The counterpart to :meth:`block`: the event the agent was parked on
         has arrived, and its still-live process is about to be prompted with
-        it (docs/PLAN.md §5.6). Capacity does not change, because a parked
+        it. Capacity does not change, because a parked
         agent was holding its slot the whole time.
 
         Only a BLOCKED issue can be unblocked; everything else returns
@@ -106,10 +106,10 @@ class IssueStore:
         return issue
 
     def orphan(self, key: str) -> Issue | None:
-        """Mark issue ``key`` Orphaned; its agent is gone (docs/PLAN.md §5.12).
+        """Mark issue ``key`` Orphaned; its agent is gone.
 
-        Only an *in-flight* issue can be orphaned, which is what §5.12 defines
-        Orphaned as. Everything else returns ``None`` and is left alone:
+        Only an *in-flight* issue can be orphaned. Everything else returns
+        ``None`` and is left alone:
 
         - Unknown keys are ignored rather than upserted: an agent dying for an
           issue foregent is not tracking says nothing worth recording.
@@ -128,7 +128,7 @@ class IssueStore:
     def in_flight(self) -> list[Issue]:
         """Every issue with a live agent working it, busy or parked.
 
-        What the event tick polls Linear about (docs/PLAN.md §5.1): activity
+        What the event tick polls Linear about: activity
         only matters on issues foregent has an agent for, and only those cost
         anything to watch.
         """

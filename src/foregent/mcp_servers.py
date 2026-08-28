@@ -1,7 +1,7 @@
 """The shared MCP servers foregent provisions on a machine (JIM-93).
 
 Agents reach Linear and GitHub through the box's own user-level Claude Code
-configuration rather than through their launch spec (``docs/PLAN.md`` §5.2).
+configuration rather than through their launch spec.
 That makes one configuration serve two audiences — foregent's agents and the
 operator's own hand-launched sessions — which is the whole reason it lives on
 the machine instead of in :class:`~foregent.agents.LaunchSpec`. ``foregent
@@ -10,7 +10,7 @@ anyone running ``claude mcp add`` by hand.
 
 Credentials are never written to disk. The stored header holds the literal
 ``${LINEAR_API_KEY}``; Claude Code expands it from the environment of each
-session, so the token lives only in the herdr server's env (§5.8) and the
+session, so the token lives only in the herdr server's env and the
 config file is safe to read and copy.
 """
 

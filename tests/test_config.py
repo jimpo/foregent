@@ -14,7 +14,7 @@ class HerdrSessionTests(unittest.TestCase):
 
     def test_the_explicit_variable_wins(self) -> None:
         # First in the order on purpose: the systemd unit sets it, and runs
-        # outside any herdr pane (docs/PLAN.md §5.10).
+        # outside any herdr pane.
         with mock.patch.dict(
             os.environ,
             {"FOREGENT_HERDR_SESSION": "foregent", "HERDR_SOCKET_PATH": "/tmp/x.sock"},

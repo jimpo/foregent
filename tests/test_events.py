@@ -1,6 +1,6 @@
 """Tests for deciding which agent an event goes to (JIM-101).
 
-Matching is a pure function over the event (``docs/PLAN.md`` §5.6), so none of
+Matching is a pure function over the event, so none of
 this needs a server, a transport, or a live agent — which is the point of
 keeping it pure.
 """
@@ -87,7 +87,7 @@ class SelfEventTests(unittest.TestCase):
 
 
 class DeliveryMessageTests(unittest.TestCase):
-    """What the agent the event reached is told (docs/PLAN.md §5.6)."""
+    """What the agent the event reached is told."""
 
     def test_a_comment_carries_who_said_what(self) -> None:
         # Not merely "you are unblocked": the agent has to act on the

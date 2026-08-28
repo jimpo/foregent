@@ -103,9 +103,9 @@ class IssueUpdateTests(unittest.TestCase):
         self.assertNotIn("sortOrder", self.event.body)
 
     def test_foregents_own_claim_is_filtered_by_actor(self) -> None:
-        # This delivery *is* foregent claiming JIM-130 — assignee and state
-        # in one mutation (docs/PLAN.md §5.12). Waking on it would wake the
-        # agent the claim just launched.
+        # This delivery *is* foregent claiming JIM-130 — assignee and state in
+        # one mutation. Waking on it would wake the agent the claim just
+        # launched.
         self.assertEqual(self.event.actor, FOREGENT)
         self.assertEqual(wakes(self.event, viewer=FOREGENT), "")
 

@@ -1,4 +1,4 @@
-"""Agent harnesses (``docs/PLAN.md`` §5.13).
+"""Agent harnesses.
 
 :mod:`foregent.agents.base` defines the seam; each other module in this
 package drives one harness behind it.

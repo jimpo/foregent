@@ -10,8 +10,8 @@ Foregent is not itself a harness. It provides solutions for:
 - Multi-agent orchestration and worktree isolation, and
 - Delivery of webhook notifications from Linear and GitHub to workers.
 
-**`docs/PLAN.md` is the source of truth** for design, decisions, and phase
-status — read it first.
+**`docs/ARCHITECTURE.md` describes the system** — read it first. Planned work
+lives in the Linear project *Foregent*.
 
 ## How it works
 
@@ -279,5 +279,6 @@ talks to the real Linear API and **mutates that issue** (assignee and state).
 Use a scratch issue.
 
 Foregent is developed by itself: issues in the Linear project *Foregent* are
-worked by foregent-launched agents inside a devbox. Keep `docs/PLAN.md` correct
-in the same commit as any change that makes it wrong.
+worked by foregent-launched agents inside a devbox. Keep
+`docs/ARCHITECTURE.md` correct in the same commit as any change that makes
+it wrong.

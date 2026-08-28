@@ -1,4 +1,4 @@
-"""Claude Code agents, run in herdr panes (``docs/PLAN.md`` §5.13).
+"""Claude Code agents, run in herdr panes.
 
 The manager owns every herdr and Claude Code detail: the socket calls that
 open a workspace and start a process, the CLI flags a `LaunchSpec` renders
@@ -30,9 +30,8 @@ from foregent.agents.base import (
 # it loads to read that agent's state off the screen.
 KIND = "claude"
 
-# Full permissions on a dedicated box (docs/PLAN.md goal 1, §5.2). Not a
-# LaunchSpec field: it is a property of how foregent runs agents at all, not
-# of any one agent.
+# Full permissions on a dedicated box. Not a LaunchSpec field: it is a property
+# of how foregent runs agents at all, not of any one agent.
 PERMISSION_MODE = "bypassPermissions"
 
 # herdr's own budget for getting a process up and detected. Generous: a cold
@@ -63,9 +62,9 @@ RETRY_SECONDS = 2.0
 # it exists to run can report.
 CONFIRM_MS = 15_000
 
-# The events every subscription carries, whatever agents exist: the three
-# ways an agent can end — which are the bridge's crash authority
-# (docs/PLAN.md §5.6) — plus the arrival of a new one.
+# The events every subscription carries, whatever agents exist: the three ways
+# an agent can end — which are the bridge's crash authority — plus the arrival
+# of a new one.
 #
 # `workspace.closed` is not redundant. Stopping an agent closes its whole
 # workspace, and that emits only `workspace_closed`; no pane event follows.
@@ -207,7 +206,7 @@ class HerdrClaudeManager:
         """Deliver ``text`` to the agent, retrying only if it did not land.
 
         This is both the assignment brief at dispatch and the wake of a
-        parked agent (docs/PLAN.md §5.6), so silently dropping a message and
+        parked agent, so silently dropping a message and
         silently sending it twice are both real failures.
         """
         if when_idle:
@@ -233,9 +232,8 @@ class HerdrClaudeManager:
         """Block until the agent reaches one of ``until``.
 
         An agent that dies while being waited on resolves the wait as
-        ``GONE`` rather than hanging until the timeout — the crash authority
-        of docs/PLAN.md §5.6, surfacing on the call the bridge is already
-        making.
+        ``GONE`` rather than hanging until the timeout — the bridge's crash
+        authority, surfacing on the call it is already making.
         """
         # GONE has no herdr spelling; it arrives as `agent_not_found`.
         # Sorted so the same wait always produces the same request.
@@ -277,7 +275,7 @@ class HerdrClaudeManager:
             self._call("pane.close", {"pane_id": agent["pane_id"]})
 
     def list_agents(self) -> list[AgentRecord]:
-        """Every live foregent agent, for boot reconciliation (§5.11).
+        """Every live foregent agent, for boot reconciliation.
 
         Agents herdr knows about but foregent did not launch — an operator's
         own pane in the same session — are skipped: they have no foregent
@@ -311,7 +309,7 @@ class HerdrClaudeManager:
 
         Retrying is therefore safe: a stall means the agent never saw it.
         Retrying *without* the check would be how a woken agent answers the
-        same message twice (docs/PLAN.md §5.6, §5.13).
+        same message twice.
         """
         for attempt in range(PROMPT_ATTEMPTS):
             try:
@@ -478,9 +476,9 @@ class HerdrClaudeManager:
             if exc.code != _TIMEOUT:
                 raise AgentError(f"starting {label}: {exc}") from exc
             # A start that never reaches idle is nearly always a modal the
-            # agent is sitting on — most often the workspace trust dialog
-            # (docs/PLAN.md §5.8). Quote the screen so the cause is in the
-            # error instead of one debugging session away.
+            # agent is sitting on — most often the workspace trust dialog .
+            # Quote the screen so the cause is in the error instead of one
+            # debugging session away.
             raise AgentError(
                 f"{label} never became idle; last screen:\n"
                 f"{self.read(AgentRef(label), lines=20)}"
@@ -525,7 +523,7 @@ def _conversation_id_of(agent: dict) -> str | None:
 
     Present only once the agent's ``SessionStart`` hook has reported in, and
     only as a cross-check: the id foregent assigned at launch is the record
-    it relies on (docs/PLAN.md §5.11).
+    it relies on.
     """
     session = agent.get("agent_session") or {}
     return session.get("value") if session.get("kind") == "id" else None

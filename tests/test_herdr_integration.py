@@ -56,7 +56,7 @@ def _clean_env() -> dict[str, str]:
 
     Every pane herdr opens inherits the server's environment, and a leaked
     ``CLAUDECODE`` / ``CLAUDE_CODE_*`` var disables Claude Code's transcript
-    saving in the child — which silently breaks resume (docs/PLAN.md §5.8).
+    saving in the child — which silently breaks resume.
     The systemd unit has the same job in production; here it also keeps a
     test run started from inside an agent session honest.
     """
@@ -136,7 +136,7 @@ class HerdrIntegrationTests(unittest.TestCase):
 
     def test_server_speaks_the_expected_protocol(self) -> None:
         # The canary for a herdr upgrade: if this fails, the bridge's own
-        # startup check (docs/PLAN.md §5.8) would refuse to start too.
+        # startup check would refuse to start too.
         self.client.check_protocol()
 
     def test_ping_reports_a_version_and_capabilities(self) -> None:
@@ -191,7 +191,7 @@ class AgentIntegrationTests(unittest.TestCase):
 
     def test_agent_lifecycle(self) -> None:
         # Runs in the repo checkout because reaching `idle` at all requires a
-        # directory Claude Code already trusts (docs/PLAN.md §5.8).
+        # directory Claude Code already trusts.
         created = self.client.call(
             "workspace.create",
             {"cwd": str(_REPO_ROOT), "label": "JIM-83"},
@@ -205,9 +205,9 @@ class AgentIntegrationTests(unittest.TestCase):
                 "name": name,
                 "kind": "claude",
                 "pane_id": pane_id,
-                # A foregent-assigned conversation id is what makes an
-                # agent resumable (docs/PLAN.md §5.11); assert it reaches
-                # the process rather than trusting the flag list.
+                # A foregent-assigned conversation id is what makes an agent
+                # resumable; assert it reaches the process rather than trusting
+                # the flag list.
                 "args": [
                     "--session-id",
                     str(uuid.uuid4()),
@@ -236,9 +236,8 @@ class AgentIntegrationTests(unittest.TestCase):
         )
         self.assertIn("text", read["read"])
 
-        # Closing the pane kills the agent, and herdr drops it from the
-        # roster at once — the crash authority the bridge relies on
-        # (docs/PLAN.md §5.6).
+        # Closing the pane kills the agent, and herdr drops it from the roster
+        # at once — the crash authority the bridge relies on .
         self.client.call("pane.close", {"pane_id": pane_id})
         names = [
             a.get("name")
@@ -269,8 +268,8 @@ class ManagerIntegrationTests(unittest.TestCase):
         ref = self.manager.launch(LaunchSpec(label=label, cwd=cwd, model="haiku"))
         self.addCleanup(self.manager.stop, ref)
 
-        # A conversation id exists from the moment the agent does, which
-        # is what makes it resumable (docs/PLAN.md §5.11).
+        # A conversation id exists from the moment the agent does, which is
+        # what makes it resumable.
         self.assertTrue(ref.conversation_id)
         self.assertEqual(self.manager.status(ref), AgentStatus.IDLE)
 
@@ -304,10 +303,10 @@ class ManagerIntegrationTests(unittest.TestCase):
     def test_an_untrusted_workspace_costs_the_whole_dispatch(self) -> None:
         # A directory Claude Code has not been told to trust opens a modal
         # before it will take any input, and herdr's detection manifest reads
-        # that modal as `blocked`. The agent therefore never reaches `idle`
-        # and the launch fails: an untrusted workspace costs the dispatch,
-        # not a retry. Pre-accepting trust for the workspace pool root is
-        # what makes dispatch work at all (docs/PLAN.md §5.8, JIM-96).
+        # that modal as `blocked`. The agent therefore never reaches `idle` and
+        # the launch fails: an untrusted workspace costs the dispatch, not a
+        # retry. Pre-accepting trust for the workspace pool root is what makes
+        # dispatch work at all (JIM-96).
         #
         # Slow by construction — it sits out herdr's start budget waiting for
         # a state that cannot arrive.
@@ -333,8 +332,8 @@ class ManagerIntegrationTests(unittest.TestCase):
             )
 
     def test_events_report_work_and_death(self) -> None:
-        # The bridge's crash authority: agent death arrives as an event
-        # rather than being discovered by a probe (docs/PLAN.md §5.6).
+        # The bridge's crash authority: agent death arrives as an event rather
+        # than being discovered by a probe.
         seen: list[AgentEvent] = []
         failure: list[BaseException] = []
 
@@ -386,7 +385,7 @@ class ManagerIntegrationTests(unittest.TestCase):
 
     def test_a_second_launch_for_one_issue_is_refused(self) -> None:
         # The deterministic label is what makes a double dispatch impossible
-        # rather than merely unlikely (docs/PLAN.md §5.11).
+        # rather than merely unlikely.
         label = f"fg-dup-{os.getpid()}"
         spec = LaunchSpec(label=label, cwd=str(_REPO_ROOT), model="haiku")
         ref = self.manager.launch(spec)

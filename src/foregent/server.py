@@ -1,16 +1,16 @@
 """The foregent API server.
 
 Owns the authoritative :class:`~foregent.store.IssueStore` and exposes it over
-HTTP so the CLI can stay a thin client (``docs/PLAN.md`` §2, Bridge core).
+HTTP so the CLI can stay a thin client.
 Queued issues are dispatched to agents as capacity allows, through the
-:class:`~foregent.agents.AgentManager` seam (§5.13) rather than to any one
+:class:`~foregent.agents.AgentManager` seam rather than to any one
 harness, and a periodic tick asks Linear what changed on the issues it is
 tracking, so an agent sees activity on its own issue whether it is working
-or parked (§5.1).
-Events reach an agent through a queue drained by a daemon thread (§5.1), so
+or parked.
+Events reach an agent through a queue drained by a daemon thread, so
 whoever ingested one is never held behind an agent that is mid-turn.
-``/webhooks/linear`` receives what Linear pushes and feeds that same queue
-(§8, Q8), alongside the tick.
+``/webhooks/linear`` receives what Linear pushes and feeds that same queue,
+alongside the tick.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -58,9 +58,9 @@ mcp = FastMCP("foregent", stateless_http=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    # Where agents will run is now resolved, not fixed (docs/PLAN.md §5.10),
-    # so say it once at startup: everything after this — dispatch, recovery,
-    # the operator's `herdr --session` — depends on it being the intended one.
+    # Where agents will run is resolved, not fixed, so say it once at
+    # startup: everything after this — dispatch, recovery, the operator's
+    # `herdr --session` — depends on it being the intended one.
     logger.info("running agents in %s", manager.describe())
     await run_in_threadpool(check_herdr_protocol)
     await run_in_threadpool(check_agent_mcp)
@@ -85,15 +85,15 @@ app = FastAPI(title="foregent", lifespan=lifespan)
 store = IssueStore()
 
 # The harness foregent runs agents on. One process-wide manager, swapped
-# wholesale to change harness (docs/PLAN.md §5.13).
+# wholesale to change harness.
 manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
 
-# Events waiting for the agent they are for, oldest first (docs/PLAN.md
-# §5.1). One queue and one drainer, so two events for one agent reach it one
-# at a time and in the order they were written, and whoever ingested them
-# waited on neither. A long wait on one agent therefore holds up deliveries
-# to another; capacity is one agent (§5.6), so there is no other agent to
-# hold up, and a queue per agent is the change when capacity grows.
+# Events waiting for the agent they are for, oldest first. One queue and one
+# drainer, so two events for one agent reach it one at a time and in the order
+# they were written, and whoever ingested them waited on neither. A long wait
+# on one agent therefore holds up deliveries to another; capacity is one agent,
+# so there is no other agent to hold up, and a queue per agent is the change
+# when capacity grows.
 deliveries: queue.Queue[tuple[str, str]] = queue.Queue()
 
 # How long to pause before offering a message to a busy agent again. `send`
@@ -103,13 +103,13 @@ DELIVERY_RETRY_SECONDS = 5.0
 
 
 def check_herdr_protocol() -> None:
-    """Refuse to start if herdr speaks a different protocol (docs/PLAN.md §5.8).
+    """Refuse to start if herdr speaks a different protocol.
 
-    herdr is a hard dependency (§7): every later call assumes the protocol
+    herdr is a hard dependency: every later call assumes the protocol
     this client was built against, so a drift raises here and stops the
     bridge outright instead of surfacing as a mystery error mid-dispatch.
     Talks to herdr directly rather than through ``manager`` — the dispatch
-    path is harness-agnostic (§5.13), but this check is inherently herdr-
+    path is harness-agnostic, but this check is inherently herdr-
     specific.
     """
     herdr.HerdrClient(session=config.herdr_session()).check_protocol()
@@ -118,7 +118,7 @@ def check_herdr_protocol() -> None:
 def rebuild_store() -> None:
     """Reconstruct the issue<->agent map from live agents (JIM-52).
 
-    The store is a volatile in-memory cache (docs/PLAN.md §5.11); on startup
+    The store is a volatile in-memory cache; on startup
     every dispatched agent is recovered by parsing the issue key out of its
     label. Best-effort: a harness hiccup logs and leaves the store empty
     rather than blocking startup.
@@ -132,10 +132,10 @@ def rebuild_store() -> None:
         key = issue_key_from_label(record.ref.label)
         if key is None:
             continue
-        # Reconstructed as IN_PROGRESS: enough to hold the capacity-1 slot
-        # and prevent double-launch. A BLOCKED issue also holds a live
-        # agent, but distinguishing that (and full orphan reconciliation)
-        # is docs/PLAN.md §5.12, out of scope here.
+        # Reconstructed as IN_PROGRESS: enough to hold the capacity-1 slot and
+        # prevent double-launch. A BLOCKED issue also holds a live agent, but
+        # distinguishing that (and full orphan reconciliation) is out of scope
+        # here.
         store.add(
             Issue(
                 key=key,
@@ -151,7 +151,7 @@ def watch_agents() -> None:
     """Consume harness events, orphaning issues whose agent dies (JIM-87).
 
     The bridge learns about agent death from a subscription rather than a
-    probe (docs/PLAN.md §5.6). The consumer is a daemon thread because the
+    probe. The consumer is a daemon thread because the
     manager's stream is blocking and endless; it needs no shutdown path,
     since it holds nothing the process cares about losing at exit.
     """
@@ -165,16 +165,16 @@ def watch_agents() -> None:
                 continue
             issue = store.orphan(key)
             if issue is not None:
-                # Orphaned frees the capacity slot: a dead agent must not go
-                # on holding one. Deciding what happens next — re-dispatch,
-                # defer, escalate — is the scheduler's (docs/PLAN.md §5.12).
+                # Orphaned frees the capacity slot: a dead agent must not go on
+                # holding one. Deciding what happens next — re-dispatch, defer,
+                # escalate — is the scheduler's.
                 logger.warning("agent for %s exited; issue orphaned", key)
 
     threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
 
 
 def watch_deliveries() -> None:
-    """Hand queued messages to their agents, on a daemon thread (§5.1).
+    """Hand queued messages to their agents, on a daemon thread.
 
     In the shape of :func:`watch_agents`, and for the same reason: a send
     blocks for as long as its agent stays busy, which can be a whole turn,
@@ -207,7 +207,7 @@ def send_queued(key: str, message: str) -> None:
     there is dropped and logged rather than delivered to whatever holds the
     key next.
 
-    **Sends first, unblocks second** (docs/PLAN.md §5.6): an agent that has
+    **Sends first, unblocks second**: an agent that has
     not received the message is not awake yet, and a send that failed leaves
     the issue BLOCKED, with no rollback path to get wrong.
     """
@@ -299,7 +299,7 @@ def own_viewer() -> str:
 
 
 def deliver(event: Event, viewer: str) -> None:
-    """Hand ``event`` to whichever agent it was for, if any (docs/PLAN.md §5.1).
+    """Hand ``event`` to whichever agent it was for, if any.
 
     Goes through :func:`deliver_issue` rather than the queue directly, so that
     the live-agent guard and the 409 for an issue with nobody behind it stay
@@ -354,14 +354,14 @@ def poll_tick(cursor: str, viewer: str) -> tuple[str, str]:
 
 
 def poll_linear() -> None:
-    """Run :func:`poll_tick` forever, on its own thread (docs/PLAN.md §5.1).
+    """Run :func:`poll_tick` forever, on its own thread.
 
     A daemon thread, like :func:`watch_agents`: it holds nothing the process
     would miss at exit, and its state is a cursor it can rebuild from the
     clock on the next boot.
 
     The first cursor is the clock — the only time it legitimately is one.
-    Foregent has no durable record of what it has already delivered (§5.11),
+    Foregent has no durable record of what it has already delivered,
     so a restart starts watching from now rather than replaying a backlog of
     comments its agents have most likely already acted on.
     """
@@ -406,7 +406,7 @@ def agent_mcp_servers() -> dict[str, dict]:
     Linear and GitHub are deliberately absent, and `strict_mcp` stays off:
     they are provisioned once per box by `foregent setup`
     (:mod:`foregent.mcp_servers`) and inherited, so one configuration serves
-    agents and the operator's own sessions alike (JIM-93, docs/PLAN.md §5.2).
+    agents and the operator's own sessions alike (JIM-93).
     """
     return {"foregent": {"type": "http", "url": f"{config.api_url()}/mcp"}}
 
@@ -448,7 +448,7 @@ def ensure_skills() -> None:
     not dispatching at all.
 
     Knowing where a Claude Code session looks for skills is a harness detail
-    leaking through the `AgentManager` seam (docs/PLAN.md §5.13). Acceptable
+    leaking through the `AgentManager` seam. Acceptable
     while there is one harness; a second one makes this a manager method.
     """
     try:
@@ -464,9 +464,9 @@ def dispatch() -> None:
     """Launch an agent for the oldest Queued issue, capacity allowing.
 
     Capacity is hardcoded at one concurrently running agent, occupied by an
-    IN_PROGRESS or a parked-alive BLOCKED issue (docs/PLAN.md §5.6). Before
+    IN_PROGRESS or a parked-alive BLOCKED issue. Before
     launch, the issue is claimed directly in Linear (assignee + In Progress
-    state, docs/PLAN.md §5.11-5.12) — no agent runs without a durable
+    state) — no agent runs without a durable
     ownership record. On a Linear or harness failure the issue stays Queued
     and the caller's request fails with 502. Foregent's skills are installed
     first (:func:`ensure_skills`), because the agent cannot pick up one that
@@ -478,7 +478,7 @@ def dispatch() -> None:
     a second one for the same issue. If the claim succeeds but the launch
     fails, Linear is left In Progress while the store keeps the issue Queued;
     that self-heals on retry, because claiming is idempotent — the durable
-    fix for both is the reconciliation of §5.12.
+    fix for both is orphan reconciliation.
     """
     occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
     if any(issue.status in occupied for issue in store):
@@ -552,7 +552,7 @@ def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str
     """Mark issue ``key`` Blocked with ``blocker`` and return the record.
 
     Does not dispatch: a blocked agent parks alive in its workspace and keeps
-    holding its capacity slot (docs/PLAN.md §5.6), so blocking must not free
+    holding its capacity slot, so blocking must not free
     capacity or launch another agent.
     """
     issue = store.block(key, blocker)
@@ -567,7 +567,7 @@ def deliver_issue(
 
     Every agent foregent has running is reachable, not only a parked one: a
     worker should see activity on its own issue as soon as it happens
-    (docs/PLAN.md §5.1). The send itself waits for whatever the agent is
+   . The send itself waits for whatever the agent is
     doing to finish, so it happens on the drainer thread
     (:func:`watch_deliveries`) and this route only enqueues. What the caller
     is told is therefore that the message is *accepted*, not that it has been
@@ -596,7 +596,7 @@ def deliver_issue(
 
 @app.post("/webhooks/linear")
 async def linear_webhook(request: Request) -> dict[str, str]:
-    """Deliver what Linear pushes to the agent it is for (docs/PLAN.md §5.1).
+    """Deliver what Linear pushes to the agent it is for.
 
     Authenticate, map the payload to an :class:`~foregent.events.Event`, and
     hand it to :func:`deliver` — the same matching, queue and drainer the tick
@@ -690,7 +690,7 @@ async def report_blocked(issue_key: str, blocker: str) -> str:
 
     The agent stays parked alive in its workspace: this only records state,
     nothing is terminated, and there is no wake mechanism here (the bridge
-    prompts the agent with the resolving event later; see docs/PLAN.md §5.6).
+    prompts the agent with the resolving event later).
     """
     await run_in_threadpool(block_issue, issue_key, blocker)
     return f"Recorded blocker {blocker!r} on {issue_key}."

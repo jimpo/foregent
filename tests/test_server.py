@@ -149,8 +149,7 @@ class DispatchTests(unittest.TestCase):
         server.store.queue(key, directory)
 
     def test_dispatch_claims_before_launching(self) -> None:
-        # Nothing runs without a durable ownership record in Linear
-        # (docs/PLAN.md §5.12).
+        # Nothing runs without a durable ownership record in Linear .
         self.queue()
         server.dispatch()
         self.claim.assert_called_once_with("JIM-88")
@@ -193,7 +192,7 @@ class DispatchTests(unittest.TestCase):
         assert issue is not None and issue.agent is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
         self.assertEqual(issue.agent, ref)
-        # The conversation id is the half that outlives the process (§5.11).
+        # The conversation id is the half that outlives the process.
         self.assertEqual(issue.agent.conversation_id, "conversation-1")
 
     def test_dispatch_installs_a_missing_skill_before_the_agent_starts(self) -> None:
@@ -273,8 +272,8 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
 
     def test_a_parked_agent_still_holds_its_slot(self) -> None:
-        # A blocked agent is alive in its workspace (docs/PLAN.md §5.6), so
-        # it must keep occupying capacity.
+        # A blocked agent is alive in its workspace, so it must keep occupying
+        # capacity.
         self.queue()
         server.dispatch()
         server.store.block("JIM-88", "a review of the PR")
@@ -440,8 +439,8 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(self.manager.sent, [(self.ref, "second")])
 
     def test_delivering_does_not_dispatch_anything_else(self) -> None:
-        # The agent held its capacity slot the whole time, parked or not
-        # (docs/PLAN.md §5.6), so prompting it frees nothing.
+        # The agent held its capacity slot the whole time, parked or not , so
+        # prompting it frees nothing.
         self.park()
         server.store.queue("JIM-89", "/ws/JIM-89")
         server.deliver_issue("JIM-88", "go on")
@@ -491,7 +490,7 @@ class DeliverTests(unittest.TestCase):
 
 
 class CheckHerdrProtocolTests(unittest.TestCase):
-    """Refusing to start on a herdr protocol drift (docs/PLAN.md §5.8)."""
+    """Refusing to start on a herdr protocol drift."""
 
     def check(self, client: mock.Mock) -> None:
         with mock.patch.object(server.herdr, "HerdrClient", return_value=client):
@@ -545,7 +544,7 @@ class CheckAgentMCPTests(unittest.TestCase):
 
 
 class RebuildStoreTests(unittest.TestCase):
-    """Recovering the issue<->agent map from the harness (docs/PLAN.md §5.11)."""
+    """Recovering the issue<->agent map from the harness."""
 
     def setUp(self) -> None:
         server.store = IssueStore()
@@ -580,7 +579,7 @@ class RebuildStoreTests(unittest.TestCase):
 
 
 class WatchAgentsTests(unittest.TestCase):
-    """Agent death arrives as an event, not a probe (docs/PLAN.md §5.6)."""
+    """Agent death arrives as an event, not a probe."""
 
     def setUp(self) -> None:
         server.store = IssueStore()
@@ -682,7 +681,7 @@ class WatchAgentsTests(unittest.TestCase):
 
 
 class PollTickTests(unittest.TestCase):
-    """The tick that feeds the matcher (JIM-36, docs/PLAN.md §5.1).
+    """The tick that feeds the matcher (JIM-36).
 
     Linear is stubbed: the live query shape is covered by
     ``tests.test_linear_integration``, and what matters here is what the
@@ -842,7 +841,7 @@ class PollTickTests(unittest.TestCase):
 
 
 class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
-    """The agent-facing completion tool, teardown included (docs/PLAN.md §5.6)."""
+    """The agent-facing completion tool, teardown included."""
 
     async def test_completion_survives_the_teardown_it_triggers(self) -> None:
         # The whole loop in order (JIM-100): the tool marks the issue Done and

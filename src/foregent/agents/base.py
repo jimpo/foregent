@@ -1,12 +1,12 @@
 """The harness seam: what an agent is, independent of how it is run.
 
 Foregent owns *what an agent is for*; an :class:`AgentManager` owns *how a
-harness is driven* (``docs/PLAN.md`` §5.13). The bridge speaks only the
+harness is driven*. The bridge speaks only the
 vocabulary in this module, so a second harness can be added without touching
 dispatch.
 
-Two constraints shape the interface, both from §9's rejected-but-supported
-CAO design:
+Two constraints shape the interface, so a harness with weaker eventing than
+herdr's still fits:
 
 - :meth:`AgentManager.events` may be implemented as a polling loop, so no
   caller may assume a push stream exists.
@@ -25,11 +25,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-# Agent labels are the bridge's own persistence scheme (docs/PLAN.md §5.11):
-# an issue's agent is found again after a restart by name alone. The form is
-# the lowest common denominator across harnesses — herdr requires
-# `[a-z][a-z0-9_-]{0,31}`, and tmux-backed runtimes forbid "/" — so the same
-# label works whoever runs the agent.
+# Agent labels are the bridge's own persistence scheme: an issue's agent is
+# found again after a restart by name alone. The form is the lowest common
+# denominator across harnesses — herdr requires `[a-z][a-z0-9_-]{0,31}`, and
+# tmux-backed runtimes forbid "/" — so the same label works whoever runs the
+# agent.
 LABEL_PREFIX = "fg-"
 _LABEL = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 
@@ -48,7 +48,7 @@ def label_for(issue_key: str) -> str:
 
     Launching twice for one issue must be impossible rather than merely
     unlikely: the second launch asks the harness for a name that is already
-    taken and is refused (docs/PLAN.md §5.11).
+    taken and is refused.
     """
     label = f"{LABEL_PREFIX}{issue_key.lower()}"
     if not _LABEL.fullmatch(label):
@@ -88,8 +88,8 @@ class LaunchSpec:
     """
 
     # Harness-level agent name, derived from the issue key. It is the handle
-    # the bridge rebuilds its state from on boot (docs/PLAN.md §5.11), so it
-    # must be deterministic per issue.
+    # the bridge rebuilds its state from on boot, so it must be deterministic
+    # per issue.
     label: str
     cwd: str
     env: Mapping[str, str] = field(default_factory=dict)
@@ -117,7 +117,7 @@ class AgentRef:
     """Handle for one agent: where it runs, and what conversation it holds.
 
     ``label`` locates the live process; ``conversation_id`` outlives it and
-    is what a later resume needs (docs/PLAN.md §5.11, §5.12).
+    is what a later resume needs.
     """
 
     label: str
@@ -174,7 +174,7 @@ class AgentManager(Protocol):
         """Deliver ``text`` to the agent.
 
         With ``when_idle`` the manager waits for the agent to be free first,
-        which is the delivery gating a blocked-agent wake needs (§5.6).
+        which is the delivery gating a blocked-agent wake needs.
         """
         ...
 
@@ -200,7 +200,7 @@ class AgentManager(Protocol):
         ...
 
     def list_agents(self) -> list[AgentRecord]:
-        """Every live agent this manager owns (docs/PLAN.md §5.11)."""
+        """Every live agent this manager owns."""
         ...
 
     def events(self) -> Iterator[AgentEvent]:
