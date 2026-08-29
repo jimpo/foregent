@@ -28,12 +28,6 @@ route answers Linear at once instead of waiting on a busy agent. The agent
 reports back through two MCP tools the bridge serves: `report_blocked` and
 `complete_task`.
 
-> **Migration in progress.** A 30-second poll of Linear still runs beside the
-> webhook route, and both feed the same delivery queue, so an agent can be
-> told about the same comment twice. That is harmless — it re-reads its issue
-> and carries on — and JIM-134 ends it by deleting the tick and
-> `FOREGENT_POLL_INTERVAL` with it.
-
 The bridge keeps no database. Its issue → agent map is in memory and is rebuilt
 from the live herdr agents at startup.
 
@@ -261,12 +255,11 @@ state.
 
 | Variable | Purpose |
 | --- | --- |
-| `LINEAR_API_KEY` | The bridge polls and claims with it; agents authenticate the Linear MCP with it. Required. |
+| `LINEAR_API_KEY` | The bridge claims issues with it; agents authenticate the Linear MCP with it. Required. |
 | `GITHUB_TOKEN` | Agents authenticate the GitHub MCP with it. |
 | `LINEAR_WEBHOOK_SECRET` | The signing secret of the Linear webhook, checked against every delivery. Required: without it `POST /webhooks/linear` answers 503. |
 | `FOREGENT_HERDR_SESSION` | The herdr session to run agents in. Falls back to the session the bridge process runs in, then herdr's default. |
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
-| `FOREGENT_POLL_INTERVAL` | Seconds between Linear polls (default 30). Transitional — it goes away with the tick (JIM-134). |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
 

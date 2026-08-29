@@ -4,7 +4,8 @@ Driven over HTTP rather than by calling the handler, because the thing under
 test is what arrives on the wire: the exact bytes of the body, and a header
 the route reads for itself. The client is built without its context manager on
 purpose — entering it would run the app's lifespan, which talks to herdr and
-starts the poll thread, neither of which a webhook has anything to do with.
+starts the delivery threads, neither of which a webhook route has anything to
+do with.
 
 The delivery half borrows the fake harness and the drainer from
 ``tests.test_server``: what a message does once it is queued is that module's

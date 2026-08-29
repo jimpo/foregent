@@ -165,9 +165,8 @@ instead of starting a second one for the same issue.
 ### 4.2 Delivery
 
 Linear posts to `POST /webhooks/linear`. The body is authenticated by
-HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. A
-periodic tick also asks Linear what changed on tracked issues, cursored on
-the last comment served; it feeds the same queue and is being removed.
+HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. This is
+foregent's only inbound path: nothing asks Linear what changed.
 
 1. **Match.** `wakes(event, viewer)` returns the issue key, or nothing. A
    lookup, not a scan — the event names its own issue.
@@ -229,8 +228,8 @@ reads Linear and reacts to it; it does not narrate the work.
 
 The bridge logs the herdr session it resolved, refuses to start on a protocol
 mismatch, warns if the machine's MCP servers or their credentials are absent,
-rebuilds the issue store, then starts three daemon threads: the harness-event
-watcher, the delivery drainer, and the poll tick.
+rebuilds the issue store, then starts two daemon threads: the harness-event
+watcher and the delivery drainer.
 
 ## 5. State
 
@@ -507,7 +506,6 @@ installed.
 |---|---|---|
 | `FOREGENT_API_URL` | CLI, agents | Where the bridge is. Default `http://127.0.0.1:8577`. |
 | `FOREGENT_HERDR_SESSION` | bridge | Which herdr session agents run in. |
-| `FOREGENT_POLL_INTERVAL` | bridge | Seconds between poll ticks. |
 | `FOREGENT_WORKSPACE_ROOT` | bridge | Where per-issue workspaces are built. Default `~/.foregent/workspaces`. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
