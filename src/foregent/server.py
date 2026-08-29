@@ -4,13 +4,11 @@ Owns the authoritative :class:`~foregent.store.IssueStore` and exposes it over
 HTTP so the CLI can stay a thin client.
 Queued issues are dispatched to agents as capacity allows, through the
 :class:`~foregent.agents.AgentManager` seam rather than to any one
-harness, and a periodic tick asks Linear what changed on the issues it is
-tracking, so an agent sees activity on its own issue whether it is working
-or parked.
-Events reach an agent through a queue drained by a daemon thread, so
+harness.
+``/webhooks/linear`` receives what Linear pushes about the issues foregent is
+tracking, so an agent sees activity on its own issue whether it is working or
+parked. Events reach an agent through a queue drained by a daemon thread, so
 whoever ingested one is never held behind an agent that is mid-turn.
-``/webhooks/linear`` receives what Linear pushes and feeds that same queue,
-alongside the tick.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -26,7 +24,6 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -47,7 +44,7 @@ from foregent.agents import (
     label_for,
 )
 from foregent.agents.herdr_claude import HerdrClaudeManager
-from foregent.events import Event, delivery_message, wakes
+from foregent.events import delivery_message, wakes
 from foregent.models import Issue, IssueStatus
 from foregent.store import IN_FLIGHT, IssueStore
 
@@ -69,7 +66,6 @@ async def lifespan(_app: FastAPI):
     await run_in_threadpool(rebuild_store)
     watch_agents()
     watch_deliveries()
-    poll_linear()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -301,92 +297,11 @@ def own_viewer() -> str:
     own writes, and a wake that causes a write is a loop.
 
     Blocking: it is an HTTP call, so an async caller runs it in a threadpool.
-    The tick carries its own viewer in its loop, where the cursor already
-    lives.
     """
     global _viewer
     if not _viewer:
         _viewer = linear.viewer_id()
     return _viewer
-
-
-def deliver(event: Event, viewer: str) -> None:
-    """Hand ``event`` to whichever agent it was for, if any.
-
-    Goes through :func:`deliver_issue` rather than the queue directly, so that
-    the live-agent guard and the 409 for an issue with nobody behind it stay
-    decided in one place. An event with nowhere to go is the normal case, not
-    an error: the tick polls every in-flight issue, and a person comments on
-    issues foregent is not tracking at all.
-
-    The status is read once here only to word the prompt: a parked agent is
-    being woken and a working one is not, and only the caller of a plain
-    ``message`` endpoint can know which.
-    """
-    key = wakes(event, viewer)
-    if not key:
-        return
-    issue = store.get(key)
-    parked = issue is not None and issue.status is IssueStatus.BLOCKED
-    try:
-        deliver_issue(key, delivery_message(event, parked=parked))
-    except HTTPException as exc:
-        logger.debug("event on %s reached nobody: %s", key, exc.detail)
-        return
-    logger.info("queued for %s on activity by %s", key, event.author or "someone")
-
-
-def poll_tick(cursor: str, viewer: str) -> tuple[str, str]:
-    """Ask Linear what changed since ``cursor``, and deliver it. One pass.
-
-    Returns the cursor and viewer to run the next pass with; both are held by
-    the caller's loop rather than in module state, which is what lets a test
-    drive a tick without a thread or a clock.
-
-    The cursor only ever advances past comments this pass has served
-    (:func:`~foregent.linear.poll_comments`), so a failure anywhere here
-    leaves the window intact and the next pass re-reads it. **The viewer is
-    resolved before anything is polled and the pass is abandoned without it**:
-    a poll that cannot recognize foregent's own writes wakes agents with them,
-    and a wake that causes a write is a loop.
-    """
-    try:
-        viewer = viewer or linear.viewer_id()
-        events, cursor = linear.poll_comments(
-            [issue.key for issue in store.in_flight()], cursor, viewer
-        )
-    except linear.LinearError as exc:
-        # Lateness is polling's failure mode and it is self-healing: the
-        # cursor did not move, so the next tick asks for the same window.
-        logger.warning("event poll failed, retrying next tick: %s", exc)
-        return cursor, viewer
-    for event in events:
-        deliver(event, viewer)
-    return cursor, viewer
-
-
-def poll_linear() -> None:
-    """Run :func:`poll_tick` forever, on its own thread.
-
-    A daemon thread, like :func:`watch_agents`: it holds nothing the process
-    would miss at exit, and its state is a cursor it can rebuild from the
-    clock on the next boot.
-
-    The first cursor is the clock — the only time it legitimately is one.
-    Foregent has no durable record of what it has already delivered,
-    so a restart starts watching from now rather than replaying a backlog of
-    comments its agents have most likely already acted on.
-    """
-    interval = config.poll_interval()
-    logger.info("polling Linear for events every %gs", interval)
-
-    def tick() -> None:
-        cursor, viewer = datetime.now(UTC).isoformat(), ""
-        while True:
-            time.sleep(interval)
-            cursor, viewer = poll_tick(cursor, viewer)
-
-    threading.Thread(target=tick, name="foregent-linear-poll", daemon=True).start()
 
 
 def _record(issue: Issue) -> dict[str, str]:
@@ -632,9 +547,13 @@ def deliver_issue(
 async def linear_webhook(request: Request) -> dict[str, str]:
     """Deliver what Linear pushes to the agent it is for.
 
-    Authenticate, map the payload to an :class:`~foregent.events.Event`, and
-    hand it to :func:`deliver` — the same matching, queue and drainer the tick
-    feeds, so push is a second source rather than a second delivery path.
+    Push is the whole of foregent's inbound path: authenticate, map the
+    payload to an :class:`~foregent.events.Event`, match it to an issue, and
+    queue it for that issue's agent. The enqueue goes through
+    :func:`deliver_issue` rather than the queue directly, so the live-agent
+    guard and the 409 for an issue with nobody behind it stay decided in one
+    place. The issue's status is read here only to word the prompt: a parked
+    agent is being woken and a working one is not.
 
     **A delivery foregent does nothing with is still a success.** Most of what
     Linear sends is about issues no agent here is working, and a 200 is the
@@ -648,11 +567,6 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     without it would wake an agent with its own comment. Linear's retry is
     worth more here than a wake foregent has to guess at, so it answers 503
     and asks to be sent it again.
-
-    The tick delivers the same comments in parallel with this, so an agent can
-    be told about one twice, in whichever order the two paths land it. That is
-    accepted rather than de-duplicated: an agent told twice re-reads its issue
-    and carries on, and JIM-134 removes the tick, which ends it.
 
     Reads the raw bytes rather than a parsed body, because that is what the
     signature covers (:func:`~foregent.linear.webhook_authentic`). 401 for a
@@ -688,7 +602,17 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     except linear.LinearError as exc:
         logger.error("cannot tell foregent's own writes apart: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    deliver(event, viewer)
+    key = wakes(event, viewer)
+    if not key:
+        return {"status": "ok"}
+    issue = store.get(key)
+    parked = issue is not None and issue.status is IssueStatus.BLOCKED
+    try:
+        deliver_issue(key, delivery_message(event, parked=parked))
+    except HTTPException as exc:
+        logger.debug("event on %s reached nobody: %s", key, exc.detail)
+        return {"status": "ok"}
+    logger.info("queued for %s on activity by %s", key, event.author or "someone")
     return {"status": "ok"}
 
 

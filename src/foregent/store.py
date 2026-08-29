@@ -131,9 +131,10 @@ class IssueStore:
     def in_flight(self) -> list[Issue]:
         """Every issue with a live agent working it, busy or parked.
 
-        What the event tick polls Linear about: activity
-        only matters on issues foregent has an agent for, and only those cost
-        anything to watch.
+        The issues a Linear delivery can reach: activity only matters on
+        issues foregent has an agent for. Library code, with the catch-up
+        read it names the issues for
+        (:func:`~foregent.linear.poll_comments`); nothing calls either today.
         """
         return [i for i in self.list_issues() if i.status in IN_FLIGHT]
 

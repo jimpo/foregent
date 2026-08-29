@@ -29,7 +29,6 @@ from foregent.agents import (
     AgentStatus,
     LaunchSpec,
 )
-from foregent.events import Event, EventKind
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 from foregent.workspaces import WorkspaceError
@@ -105,13 +104,6 @@ class FakeManager:
 
     def events(self) -> Iterator[AgentEvent]:
         return iter(self.stream)
-
-
-def comment(key: str, actor: str = "operator", body: str = "") -> Event:
-    """A comment event of the shape the Linear poll builds."""
-    return Event(
-        kind=EventKind.COMMENT, issue_key=key, actor=actor, author="AJ", body=body
-    )
 
 
 def drain_events(manager: FakeManager) -> None:
@@ -718,166 +710,6 @@ class WatchAgentsTests(unittest.TestCase):
         self.watch(manager)
         occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
         self.assertFalse(any(i.status in occupied for i in server.store))
-
-
-class PollTickTests(unittest.TestCase):
-    """The tick that feeds the matcher (JIM-36).
-
-    Linear is stubbed: the live query shape is covered by
-    ``tests.test_linear_integration``, and what matters here is what the
-    bridge does with what comes back.
-    """
-
-    # Foregent's own Linear account, which it writes as on every claim and
-    # every comment an agent posts through the Linear MCP.
-    VIEWER = "viewer-id"
-
-    def setUp(self) -> None:
-        server.store = IssueStore()
-        self.manager = FakeManager()
-        self.enterContext(mock.patch.object(server, "manager", self.manager))
-        self.enterContext(mock.patch.object(server, "deliveries", queue.Queue()))
-        self.viewer = self.enterContext(
-            mock.patch.object(server.linear, "viewer_id", return_value=self.VIEWER)
-        )
-        self.poll = self.enterContext(
-            mock.patch.object(server.linear, "poll_comments")
-        )
-        self.answer([])
-
-    def answer(self, events: list[Event], cursor: str = "T0") -> None:
-        """Have the next poll return ``events`` and hand back ``cursor``."""
-        self.poll.return_value = (events, cursor)
-
-    def park(self, key: str = "JIM-36") -> None:
-        server.store.add(
-            Issue(
-                key=key,
-                title="",
-                status=IssueStatus.BLOCKED,
-                blocker="a review",
-                agent=AgentRef(f"fg-{key.lower()}", "conversation-1"),
-            )
-        )
-
-    def work(self, key: str = "JIM-36") -> None:
-        server.store.add(
-            Issue(
-                key=key,
-                title="",
-                status=IssueStatus.IN_PROGRESS,
-                agent=AgentRef(f"fg-{key.lower()}", "conversation-1"),
-            )
-        )
-
-    def tick(self, cursor: str = "T0", viewer: str = "") -> tuple[str, str]:
-        """One pass, plus the drainer that hands what it found to the agents."""
-        result = server.poll_tick(cursor, viewer)
-        drain_deliveries()
-        return result
-
-    def test_a_comment_on_a_parked_issue_wakes_its_agent(self) -> None:
-        self.park()
-        self.answer([comment("JIM-36", body="ship it")], cursor="T1")
-        self.tick()
-        _, text = self.manager.sent[0]
-        self.assertIn("Waking", text)
-        self.assertIn("ship it", text)
-        issue = server.store.get("JIM-36")
-        assert issue is not None
-        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
-
-    def test_a_comment_on_a_working_issue_reaches_its_agent_too(self) -> None:
-        # JIM-131: a worker sees activity on its own issue as it happens, and
-        # is not told it is being woken from a block it never reported.
-        self.work()
-        self.answer([comment("JIM-36", body="ship it")], cursor="T1")
-        self.tick()
-        _, text = self.manager.sent[0]
-        self.assertNotIn("Waking", text)
-        self.assertIn("ship it", text)
-
-    def test_a_delivery_to_a_working_agent_leaves_its_issue_alone(self) -> None:
-        # Nothing about it was waiting: not its status, and not its slot.
-        self.work()
-        server.store.queue("JIM-41", "/ws/JIM-41")
-        self.answer([comment("JIM-36")], cursor="T1")
-        self.tick()
-        issue = server.store.get("JIM-36")
-        assert issue is not None
-        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
-        self.assertEqual(self.manager.launched, [])
-
-    def test_the_cursor_advances_only_over_what_was_served(self) -> None:
-        # Cursor, not clock (JIM-36): the next window starts at the last
-        # comment actually seen, so a slow or restarted tick cannot skip one.
-        self.park()
-        self.answer([comment("JIM-36")], cursor="T1")
-        cursor, _ = self.tick("T0")
-        self.assertEqual(cursor, "T1")
-
-    def test_a_quiet_window_leaves_the_cursor_where_it_was(self) -> None:
-        self.park()
-        self.answer([], cursor="T0")
-        cursor, _ = self.tick("T0")
-        self.assertEqual(cursor, "T0")
-        self.assertEqual(self.manager.sent, [])
-
-    def test_only_in_flight_issues_are_polled(self) -> None:
-        # Cost scales with work in progress, not with workspace size.
-        self.park("JIM-36")
-        server.store.add(Issue(key="JIM-40", title="", status=IssueStatus.DONE))
-        server.store.queue("JIM-41", "/ws/JIM-41")
-        self.tick()
-        self.assertEqual(self.poll.call_args.args[0], ["JIM-36"])
-
-    def test_foregents_own_comment_wakes_nobody(self) -> None:
-        # A wake that causes a write is a loop. The query drops these
-        # server-side too; this is the second half of the same guard.
-        self.park()
-        self.answer([comment("JIM-36", actor=self.VIEWER)])
-        self.tick()
-        self.assertEqual(self.manager.sent, [])
-        issue = server.store.get("JIM-36")
-        assert issue is not None
-        self.assertEqual(issue.status, IssueStatus.BLOCKED)
-
-    def test_an_event_for_an_issue_with_no_agent_is_dropped(self) -> None:
-        # The normal case, not an error: an in-flight issue can be recorded
-        # with nothing behind it, and a person comments on issues foregent is
-        # not tracking at all. Neither may stop the pass.
-        server.store.add(
-            Issue(key="JIM-36", title="", status=IssueStatus.IN_PROGRESS)
-        )
-        self.answer([comment("JIM-36"), comment("JIM-99")], cursor="T1")
-        cursor, _ = self.tick("T0")
-        self.assertEqual(self.manager.sent, [])
-        self.assertEqual(cursor, "T1")
-
-    def test_a_linear_outage_is_survived_and_retried(self) -> None:
-        # Lateness is polling's failure mode, and it self-heals: the cursor
-        # does not move, so the next tick asks for the same window.
-        self.park()
-        self.poll.side_effect = server.linear.LinearError("502 from Linear")
-        cursor, _ = self.tick("T0")
-        self.assertEqual(cursor, "T0")
-
-    def test_nothing_is_polled_until_the_viewer_is_known(self) -> None:
-        # Without it foregent cannot tell its own writes apart, so it must not
-        # poll at all rather than poll and wake agents with themselves.
-        self.park()
-        self.viewer.side_effect = server.linear.LinearError("no API key")
-        cursor, viewer = self.tick("T0")
-        self.assertEqual(self.poll.call_count, 0)
-        self.assertEqual((cursor, viewer), ("T0", ""))
-
-    def test_the_viewer_is_resolved_once_and_carried(self) -> None:
-        self.park()
-        _, viewer = self.tick()
-        self.assertEqual(viewer, self.VIEWER)
-        self.tick(viewer=viewer)
-        self.viewer.assert_called_once()
-        self.assertEqual(self.poll.call_args.args[2], self.VIEWER)
 
 
 @unittest.skipUnless(shutil.which("jj"), "jj is not installed")

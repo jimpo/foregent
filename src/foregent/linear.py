@@ -32,8 +32,8 @@ TIMEOUT = 30
 # The header Linear signs every webhook delivery with (:func:`webhook_authentic`).
 SIGNATURE_HEADER = "Linear-Signature"
 
-# Comments read per tick. A window with more than this is served oldest-first
-# across consecutive ticks rather than truncated; see :func:`poll_comments`.
+# Comments read per call. A window with more than this is served oldest-first
+# across consecutive calls rather than truncated; see :func:`poll_comments`.
 PAGE = 50
 
 _CLAIM_QUERY = """
@@ -69,7 +69,7 @@ query Viewer {
 # newest-first, so `first` would serve the *newest* page of the window and a
 # cursor advanced to it would skip everything older that did not fit. `last`
 # serves the oldest page, ascending, so the cursor advances to the end of a
-# contiguous prefix and the next tick collects the remainder.
+# contiguous prefix and the next call collects the remainder.
 _POLL_QUERY = f"""
 query Poll($since: DateTimeOrDuration!, $keys: [ID!], $viewer: ID) {{
   comments(
@@ -154,8 +154,8 @@ def viewer_id() -> str:
 
     Everything the bridge does to Linear — claiming an issue, and every
     comment an agent posts through the Linear MCP — is written as this
-    account and comes straight back as a change, so the poll has to know it
-    to leave its own writes alone.
+    account and comes straight back as a delivery, so the bridge has to know
+    it to leave its own writes alone.
     """
     return _request(_VIEWER_QUERY, {})["viewer"]["id"]
 
@@ -181,7 +181,13 @@ def webhook_authentic(body: bytes, signature: str) -> bool:
 def poll_comments(
     keys: list[str], since: str, viewer: str = ""
 ) -> tuple[list[Event], str]:
-    """Comments left on ``keys`` after ``since``, with the cursor to poll from next.
+    """Comments left on ``keys`` after ``since``, with the cursor to read from next.
+
+    **Library code with no caller.** Webhooks are how a comment reaches an
+    agent; this is the catch-up read a reconciliation would use to find what
+    a deliver-once path missed — a restart, an outage, a delivery Linear gave
+    up retrying. It is deliberately outside the startup path, so adding that
+    reconciliation is a matter of calling this, not of writing it.
 
     One query for the whole fleet, keyed on the issues the
     bridge is tracking so cost scales with work in progress rather than with
@@ -190,14 +196,14 @@ def poll_comments(
 
     ``since`` is a cursor, not a clock: the returned one is the ``createdAt``
     of the last comment served, or ``since`` unchanged when nothing came back.
-    A tick that runs late or restarts therefore resumes from what it has
-    actually seen instead of assuming the interval elapsed exactly, and
+    A caller that runs late or restarts therefore resumes from what it has
+    actually seen instead of assuming an interval elapsed exactly, and
     because ``gt`` is compared against a timestamp Linear itself issued, the
     comment the cursor names is never served twice.
 
     ``viewer`` drops foregent's own writes server-side, one step earlier than
     :func:`~foregent.events.wakes` does; pass it. An empty ``viewer`` matches
-    nothing and so filters nothing — polling that way wakes agents with their
+    nothing and so filters nothing — reading that way wakes agents with their
     own writes, and a wake that causes a write is a loop.
     """
     if not keys:
