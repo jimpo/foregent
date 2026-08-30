@@ -1,6 +1,6 @@
 ---
 name: foregent-worker
-description: "How to work a Linear issue as a foregent agent — the lifecycle foregent expects of you, from reading your assignment to landing the change and reporting done. Activate when your opening message assigns you a Linear issue, or when you need to report yourself blocked or complete. Covers the foregent MCP lifecycle tools, bootstrap vs Pull Request mode, and the linear-history rule."
+description: "How to work a Linear issue as a foregent agent — the lifecycle foregent expects of you, from reading your assignment to landing the change and reporting done. Activate when your opening message assigns you a Linear issue, or when you need to report yourself blocked or complete. Covers the foregent MCP lifecycle tools, the bootstrap and pull-request modes, and the linear-history rule."
 ---
 
 # Working an issue for foregent
@@ -12,6 +12,10 @@ may attach to observe, but never to answer questions.
 
 Your issue key is in the message that started you (e.g. `JIM-42`). Every
 foregent tool takes it as an argument.
+
+The word after it is the **mode** the project lands work in — `bootstrap` or
+`pull-request` — which foregent reads off the repo's git remotes and tells
+you, so you never have to work it out. See *Landing the change*.
 
 ## The two tools that matter
 
@@ -25,6 +29,11 @@ these. Both take your issue key.
 **`complete_task` ends your session.** Foregent tears your agent down as soon
 as it returns, so it is the last thing you do — never a checkpoint in the
 middle. Anything you meant to do afterwards will not happen.
+
+The one exception is a completion foregent refuses, which it tells you in the
+result: in `bootstrap` mode it cannot move `main` onto work that is not
+descended from it. You are still alive and your workspace is still there, so
+rebase onto `main` and call the tool again.
 
 ## The lifecycle
 
@@ -51,21 +60,24 @@ finishing.
 
 ## Landing the change
 
-**Bootstrap mode** (the default): there is no pull request. Rebase onto
-`main`, fast-forward `main` locally, and you are done.
+Your brief names the mode. It is foregent's answer, read off the repo's
+remotes, so nothing in the repository overrides it — and if you were started
+by hand with no mode, assume `bootstrap`.
 
-**Pull Request mode**: push a branch and open a PR through the GitHub MCP, then
+**`bootstrap`**: there is no pull request. Rebase onto `main` and commit your
+work there. **Do not move the `main` bookmark** — foregent moves it for you
+when you call `complete_task`, at the repo root where jj exports it to git.
+
+**`pull-request`**: push a branch and open a PR through the GitHub MCP, then
 report yourself blocked on the review rather than waiting. Push the branch
 Linear names on the issue, so the PR is linked to it and foregent can find you
 when the review lands.
 
-If nothing tells you which mode you are in, assume bootstrap.
-
 ### History is linear, always
 
 Rebase; never merge. Every project foregent manages requires linear history —
-bootstrap mode exists to produce history clean enough to graduate to Pull
-Request mode later, and a merge commit spoils that.
+bootstrap mode exists to produce history clean enough to graduate to
+`pull-request` mode later, and a merge commit spoils that.
 
 Version control is Jujutsu (`jj`), colocated with git. In a `jj` repo, drive it
 with `jj` — raw `git` commands can corrupt its state. Keep each commit to one

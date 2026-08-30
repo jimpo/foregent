@@ -1,8 +1,5 @@
 # Handling Linear tickets in this project
 
-This project is in **Pull Request mode**: land your work as a pull request and
-report yourself blocked on the review, as the worker skill describes.
-
 Read the ticket's labels first. If it has none, treat it as **feature**.
 
 ## Scope of a change

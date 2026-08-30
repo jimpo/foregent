@@ -320,13 +320,18 @@ def _record(issue: Issue) -> dict[str, str]:
     }
 
 
-def brief_for(key: str) -> str:
+def brief_for(key: str, mode: Mode) -> str:
     """The opening message an agent is given for issue ``key``.
 
     Invoking the skill by name leaves the lifecycle in one place — the skill —
     instead of half-restating it here, where the two would drift.
+
+    The mode rides along because it is the bridge's answer, not the agent's to
+    look up: it is read off the repo's git remotes
+    (:func:`foregent.workspaces.mode_for`), and the same answer decides
+    whether the bridge advances ``main`` when the issue completes.
     """
-    return f"/foregent-worker {key}"
+    return f"/foregent-worker {key} {mode}"
 
 
 def agent_mcp_servers() -> dict[str, dict]:
@@ -421,6 +426,7 @@ def dispatch() -> None:
     if issue is None:
         return
     label = label_for(issue.key)
+    repo = Path(issue.repo)
     ensure_skills()
     try:
         linear.claim_issue(issue.key)
@@ -432,7 +438,7 @@ def dispatch() -> None:
             ref, cwd = running.ref, running.cwd
         else:
             # Before the launch, because the workspace is the agent's cwd.
-            cwd = str(workspaces.create(Path(issue.repo), issue.key))
+            cwd = str(workspaces.create(repo, issue.key))
             ref = manager.launch(
                 LaunchSpec(
                     label=label,
@@ -440,7 +446,10 @@ def dispatch() -> None:
                     mcp_servers=agent_mcp_servers(),
                 )
             )
-        manager.send(ref, brief_for(issue.key))
+        # The mode is read off the repo rather than the workspace: a secondary
+        # workspace shares the repo's remotes, and an adopted agent's dispatch
+        # never built one to read.
+        manager.send(ref, brief_for(issue.key, workspaces.mode_for(repo)))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:

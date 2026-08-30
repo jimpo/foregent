@@ -193,6 +193,10 @@ class DispatchTests(unittest.TestCase):
         # The brief names the skill outright: an agent that never loads it
         # does the work and then stops, telling foregent nothing.
         self.assertIn("foregent-worker", text)
+        # And names the mode, so the agent is told how to land the work rather
+        # than left to work it out (JIM-152). A queued directory that is no jj
+        # repo has no remote to read, which is bootstrap.
+        self.assertEqual(text, "/foregent-worker JIM-88 bootstrap")
         issue = server.store.get("JIM-88")
         assert issue is not None and issue.agent is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
@@ -776,6 +780,28 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         assert issue is not None
         self.assertEqual(issue.repo, str(self.repo))
         self.assertEqual(issue.directory, str(cwd))
+
+    def test_dispatch_briefs_the_mode_the_repos_remotes_name(self) -> None:
+        # An `origin` on GitHub is somewhere a pull request can be opened, so
+        # the agent is told to open one (JIM-152).
+        subprocess.run(
+            ["jj", "--no-pager", "git", "remote", "add", "origin",
+             "https://github.com/jimpo/foregent"],
+            cwd=self.repo,
+            check=True,
+        )
+        server.store.queue("JIM-88", str(self.repo))
+
+        server.dispatch()
+
+        self.assertEqual(self.manager.sent[0][1], "/foregent-worker JIM-88 pull-request")
+
+    def test_dispatch_briefs_bootstrap_for_a_repo_with_no_origin(self) -> None:
+        server.store.queue("JIM-88", str(self.repo))
+
+        server.dispatch()
+
+        self.assertEqual(self.manager.sent[0][1], "/foregent-worker JIM-88 bootstrap")
 
     def test_a_workspace_that_cannot_be_built_fails_the_dispatch(self) -> None:
         # And leaves the issue Queued, so a retry picks it up rather than

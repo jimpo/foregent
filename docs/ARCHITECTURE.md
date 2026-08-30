@@ -156,8 +156,9 @@ the bridge through the foregent MCP server.
 5. **Launch.** A herdr workspace opens at that directory and Claude Code
    starts in it, with a conversation id foregent generates rather than
    scrapes.
-6. **Brief.** The agent is prompted with `/foregent-worker JIM-42`, so the
-   lifecycle has one definition — the skill.
+6. **Brief.** The agent is prompted with `/foregent-worker JIM-42 bootstrap`
+   or `… pull-request`, so the lifecycle has one definition — the skill — and
+   the mode is told to the agent rather than looked up by it (§6.4).
 
 Dispatch is not atomic. The deterministic agent label `fg-jim-42` is what
 makes that survivable: a retry after a failed brief adopts the running agent
@@ -324,7 +325,8 @@ of how foregent runs agents at all (§1.1), so the manager always sets it.
 `foregent-worker` tells the agent its lifecycle: reading its assignment, the
 mode rules, when to report blocked, when to call `complete_task`, and the
 rebase requirement. The brief is one line, so the lifecycle has one
-definition.
+definition. Its second word is the mode (§6.4), which is the one thing about
+the lifecycle the skill cannot work out for itself.
 
 Skills ship inside the installed package, so they travel with a
 `uv tool install`. Two paths put them on disk, both through
@@ -354,14 +356,23 @@ server's environment.
 
 ### 6.4 Project modes
 
-- **bootstrap** — no GitHub surface. The agent rebases onto `main` and
-  fast-forwards `main` locally.
+- **bootstrap** — no GitHub surface. The agent rebases onto `main` and commits
+  there; the bridge moves the bookmark when the issue completes (§4.3).
 - **pull request** — the agent pushes a branch and opens a pull request
   through the GitHub MCP, then reports blocked on the review. This is how
   foregent develops itself.
 
-A project declares its mode at the top of its `FOREGENT.md`; a project that
-declares nothing is in bootstrap mode.
+**A project's mode is derived, not declared.** `jj git remote list` decides it
+at dispatch: an `origin` remote on GitHub is where a pull request can be
+opened, and everything else — no remotes, an origin hosted elsewhere, a
+directory that is not a jj repo — is bootstrap, which needs nothing. The
+answer travels to the agent in the brief (§4.1), and the same call answers
+again at completion, because it is a pure function of the repo and a stored
+copy would be one more thing a restart cannot recover (§5.4).
+
+Derived rather than declared because the alternative is two places to
+disagree. A file saying `pull request` in a repository with no GitHub remote
+describes a mode nobody can land work in.
 
 Rebase, never merge: bootstrap mode must produce history clean enough to
 graduate a repository to pull request mode.
