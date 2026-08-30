@@ -156,8 +156,9 @@ the bridge through the foregent MCP server.
 5. **Launch.** A herdr workspace opens at that directory and Claude Code
    starts in it, with a conversation id foregent generates rather than
    scrapes.
-6. **Brief.** The agent is prompted with `/foregent-worker JIM-42`, so the
-   lifecycle has one definition — the skill.
+6. **Brief.** The agent is prompted with `/foregent-worker JIM-42 bootstrap`
+   or `… pull-request`, so the lifecycle has one definition — the skill — and
+   the mode is told to the agent rather than looked up by it (§6.4).
 
 Dispatch is not atomic. The deterministic agent label `fg-jim-42` is what
 makes that survivable: a retry after a failed brief adopts the running agent
@@ -222,14 +223,29 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
 
 - **`report_blocked(issue_key, blocker)`** records the note and marks the
   issue Blocked. Nothing is terminated and capacity does not change.
-- **`complete_task(issue_key)`** marks the issue Done, dispatches the next
-  queued issue, stops the calling agent, and removes its jj workspace — in
-  that order, because removing a live agent's own cwd is worse than leaking a
-  directory. Neither teardown can fail the tool, since the issue is Done
-  either way. They are not equally quiet: the agent stop is best-effort, while
-  a workspace that cannot be removed is logged as an error and reported in the
-  tool's result, because forgetting it is what exports the agent's work to git
-  (§6.5).
+- **`complete_task(issue_key)`** advances `main` onto the issue's work in
+  bootstrap mode, marks the issue Done, dispatches the next queued issue,
+  stops the calling agent, and removes its jj workspace — in that order.
+
+  **Advancing comes first because the next dispatch builds its workspace on
+  `main`**: move the bookmark after that, and the next agent starts from a
+  trunk this issue never reached. It also has to precede the teardown, since
+  the revision it names lives in the workspace being removed. Pull Request
+  mode skips it — the agent has pushed its own branch, and `main` is the
+  reviewer's to move.
+
+  Neither teardown can fail the tool, since the issue is Done either way;
+  removing a live agent's own cwd is worse than leaking a directory, so the
+  stop precedes the removal. The agent stop is quiet and best-effort, while a
+  workspace that cannot be removed is logged and reported, because nobody owns
+  the leftovers.
+
+  **A refusal to advance is the one thing that stops the completion**, before
+  anything else has happened. jj declines to move `main` onto work that is not
+  descended from it (§6.5), which means an agent that never rebased: its
+  commits exist only in the workspace, so tearing that workspace down would
+  take them with it. The issue stays in flight, the workspace stays on disk,
+  and the tool says so.
 
 The tools are mounted in the bridge's own process, so they mutate the store
 directly instead of looping back over HTTP.
@@ -309,7 +325,8 @@ of how foregent runs agents at all (§1.1), so the manager always sets it.
 `foregent-worker` tells the agent its lifecycle: reading its assignment, the
 mode rules, when to report blocked, when to call `complete_task`, and the
 rebase requirement. The brief is one line, so the lifecycle has one
-definition.
+definition. Its second word is the mode (§6.4), which is the one thing about
+the lifecycle the skill cannot work out for itself.
 
 Skills ship inside the installed package, so they travel with a
 `uv tool install`. Two paths put them on disk, both through
@@ -339,14 +356,23 @@ server's environment.
 
 ### 6.4 Project modes
 
-- **bootstrap** — no GitHub surface. The agent rebases onto `main` and
-  fast-forwards `main` locally.
+- **bootstrap** — no GitHub surface. The agent rebases onto `main` and commits
+  there; the bridge moves the bookmark when the issue completes (§4.3).
 - **pull request** — the agent pushes a branch and opens a pull request
   through the GitHub MCP, then reports blocked on the review. This is how
   foregent develops itself.
 
-A project declares its mode at the top of its `FOREGENT.md`; a project that
-declares nothing is in bootstrap mode.
+**A project's mode is derived, not declared.** `jj git remote list` decides it
+at dispatch: an `origin` remote on GitHub is where a pull request can be
+opened, and everything else — no remotes, an origin hosted elsewhere, a
+directory that is not a jj repo — is bootstrap, which needs nothing. The
+answer travels to the agent in the brief (§4.1), and the same call answers
+again at completion, because it is a pure function of the repo and a stored
+copy would be one more thing a restart cannot recover (§5.4).
+
+Derived rather than declared because the alternative is two places to
+disagree. A file saying `pull request` in a repository with no GitHub remote
+describes a mode nobody can land work in.
 
 Rebase, never merge: bootstrap mode must produce history clean enough to
 graduate a repository to pull request mode.
@@ -387,10 +413,19 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   its pull request through the GitHub MCP. What degrades is agent-side git
   convenience — a quality cost, not a correctness one.
 - **A bookmark moved inside one is invisible to git** until a mutating jj
-  command runs at the colocated root. Bootstrap mode advances `main` from
-  inside the workspace, so **teardown is what publishes the work to git**, and
-  `forget` runs even when the workspace directory is already gone. This is why
-  a failed teardown is reported rather than passed over (§4.3).
+  command runs at the colocated root, and a workspace's working copy is
+  reachable from that root as the revset `<name>@`. Together they are why
+  bootstrap mode lands its work with `jj bookmark move main --to <KEY>@-` run
+  at the repo root, rather than from inside the workspace where git would not
+  see it. `@-` and not `@`: the working-copy commit is jj's scratch space, and
+  publishing it would put an empty commit at the head of `main`. An agent that
+  committed nothing leaves `@-` on `main`, which jj answers with "No bookmarks
+  to update" and a zero exit.
+
+  **`bookmark move` is fast-forward-only** without `--allow-backwards`, so jj
+  refuses work that is not descended from `main` and leaves the bookmark where
+  it was. The rebase requirement the worker skill states is enforced by jj for
+  free, with no ancestry revset of foregent's own to get wrong (§4.3).
 - **A secondary workspace names the repo it belongs to.** Its `.jj/repo` is a
   file holding the path of the shared repo directory, so the repo a teardown
   has to run `forget` in is read back out of the agent's cwd instead of

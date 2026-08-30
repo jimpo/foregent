@@ -258,8 +258,9 @@ config/secrets.json
 
 What the agent does next is the `foregent-worker` skill
 (`src/foregent/skills/foregent-worker/SKILL.md`): read the issue, do the work,
-keep Linear current, land the change in the mode the project's `FOREGENT.md`
-declares — for foregent itself, as a pull request — then call `complete_task`.
+keep Linear current, land the change in the mode foregent read off the repo's
+git remotes and named in the brief — for foregent itself, as a pull request —
+then call `complete_task`.
 Completion tears the agent down and dispatches the next queued issue.
 
 An agent that hits an external dependency calls `report_blocked` and **stays
@@ -304,7 +305,7 @@ state.
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 291 unit tests, ~4s
+uv run python -m unittest discover -s tests -t .   # 312 unit tests, ~6s
 uv run ty check                                    # type check
 ```
 

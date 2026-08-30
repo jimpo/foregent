@@ -48,7 +48,7 @@ from foregent.agents import (
 )
 from foregent.agents.herdr_claude import HerdrClaudeManager
 from foregent.events import delivery_message, wakes
-from foregent.models import Issue, IssueStatus
+from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
 
 logger = logging.getLogger(__name__)
@@ -320,13 +320,18 @@ def _record(issue: Issue) -> dict[str, str]:
     }
 
 
-def brief_for(key: str) -> str:
+def brief_for(key: str, mode: Mode) -> str:
     """The opening message an agent is given for issue ``key``.
 
     Invoking the skill by name leaves the lifecycle in one place — the skill —
     instead of half-restating it here, where the two would drift.
+
+    The mode rides along because it is the bridge's answer, not the agent's to
+    look up: it is read off the repo's git remotes
+    (:func:`foregent.workspaces.mode_for`), and the same answer decides
+    whether the bridge advances ``main`` when the issue completes.
     """
-    return f"/foregent-worker {key}"
+    return f"/foregent-worker {key} {mode}"
 
 
 def agent_mcp_servers() -> dict[str, dict]:
@@ -421,6 +426,7 @@ def dispatch() -> None:
     if issue is None:
         return
     label = label_for(issue.key)
+    repo = Path(issue.repo)
     ensure_skills()
     try:
         linear.claim_issue(issue.key)
@@ -432,7 +438,7 @@ def dispatch() -> None:
             ref, cwd = running.ref, running.cwd
         else:
             # Before the launch, because the workspace is the agent's cwd.
-            cwd = str(workspaces.create(Path(issue.repo), issue.key))
+            cwd = str(workspaces.create(repo, issue.key))
             ref = manager.launch(
                 LaunchSpec(
                     label=label,
@@ -440,7 +446,10 @@ def dispatch() -> None:
                     mcp_servers=agent_mcp_servers(),
                 )
             )
-        manager.send(ref, brief_for(issue.key))
+        # The mode is read off the repo rather than the workspace: a secondary
+        # workspace shares the repo's remotes, and an adopted agent's dispatch
+        # never built one to read.
+        manager.send(ref, brief_for(issue.key, workspaces.mode_for(repo)))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:
@@ -677,7 +686,20 @@ async def github_webhook(request: Request) -> dict[str, str]:
 
 @mcp.tool()
 async def complete_task(issue_key: str) -> str:
-    """Record ``issue_key`` as Done and shut down its agent."""
+    """Record ``issue_key`` as Done, land its work, and shut down its agent.
+
+    The order is load-bearing, and the reason is the next issue. Completing
+    dispatches whatever is queued behind this one, and that dispatch builds
+    its workspace on ``main`` — so in bootstrap mode ``main`` has to be moved
+    onto this issue's work *first*, or the next agent starts from a trunk this
+    issue never reached and silently drops it from its base. Advancing also
+    has to come before the teardown below, because the revision it names lives
+    in the workspace it would remove.
+    """
+    issue = store.get(issue_key)
+    landed = await land(issue_key, issue)
+    if landed is not None:
+        return landed
     # complete_issue's dispatch() call can block on the harness for a minute
     # or more; FastMCP runs sync tools inline on the event loop (no
     # auto-offload like Starlette gives sync FastAPI routes), so this must be
@@ -692,7 +714,6 @@ async def complete_task(issue_key: str) -> str:
         result = f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
     # Tear down the agent that called this. Best-effort: the issue is already
     # Done, so a failed teardown must not fail the tool.
-    issue = store.get(issue_key)
     if issue is not None and issue.agent is not None:
         try:
             await run_in_threadpool(manager.stop, issue.agent)
@@ -700,13 +721,9 @@ async def complete_task(issue_key: str) -> str:
             return f"{result} Agent teardown failed: {exc}"
     # Then the workspace, and only after the agent is gone — removing a live
     # agent's own cwd out from under it is worse than leaking a directory.
-    #
-    # This is not the same best-effort as the teardown above. Forgetting the
-    # workspace is the mutating jj command at the colocated root that exports
-    # the bookmark the agent moved from inside it, so a failure here can leave
-    # the issue's work outside git's view of `main` with the issue already
-    # Done. It cannot fail the tool for that reason, but it is logged as an
-    # error and said out loud in the result rather than passed over.
+    # The work is already in git by now, so a failure here costs a directory
+    # and not the issue's commits; it is still logged rather than passed over,
+    # because nobody owns the leftovers.
     if issue is not None and issue.repo and issue.directory:
         try:
             await run_in_threadpool(
@@ -717,11 +734,52 @@ async def complete_task(issue_key: str) -> str:
             )
         except workspaces.WorkspaceError as exc:
             logger.error("could not remove the %s workspace: %s", issue_key, exc)
-            return (
-                f"{result} The workspace was left behind ({exc}); if this issue "
-                f"advanced {workspaces.TRUNK}, that may not have reached git yet."
-            )
+            return f"{result} The workspace was left behind ({exc})."
     return result
+
+
+async def land(issue_key: str, issue: Issue | None) -> str | None:
+    """Move ``main`` onto a bootstrap issue's work; a refusal, or ``None``.
+
+    Bootstrap mode has no pull request to carry the work out of the
+    workspace, so this is what lands it: the bridge moves the bookmark at the
+    colocated repo root, where jj exports it to git
+    (:func:`foregent.workspaces.advance`). Pull Request mode has already
+    pushed its own branch, so there is nothing to do and ``main`` is the
+    reviewer's to move.
+
+    The mode is read off the repo again rather than remembered from dispatch.
+    It is a pure function of the remotes, and ``issue.repo`` survives a
+    restart where a stored mode would not (:func:`rebuild_store`).
+
+    **A refusal stops the completion short**, and is the one thing in this
+    path that does. jj declines to move ``main`` onto work that is not
+    descended from it, which means an agent that never rebased: its commits
+    exist only in the workspace, and going on would tear that workspace down
+    and take them with it. Returning the message leaves the issue in flight
+    and the workspace on disk for the operator, which is the recoverable half
+    of a bad outcome.
+
+    Only an in-flight issue is landed, which is what keeps completing twice
+    safe. The second call has no workspace left to name a revision in, and jj
+    would refuse the move for a reason that says nothing about the work.
+    """
+    if issue is None or issue.status not in IN_FLIGHT or not issue.repo:
+        return None
+    repo = Path(issue.repo)
+    if workspaces.mode_for(repo) is not Mode.BOOTSTRAP:
+        return None
+    try:
+        await run_in_threadpool(workspaces.advance, repo, issue_key)
+    except workspaces.WorkspaceError as exc:
+        logger.error("could not advance %s for %s: %s", workspaces.TRUNK, issue_key, exc)
+        return (
+            f"{issue_key} was not completed: {workspaces.TRUNK} could not be "
+            f"moved onto its work ({exc}). The workspace is still there, and "
+            f"the commits are only in it. Rebase onto {workspaces.TRUNK} and "
+            f"call complete_task again."
+        )
+    return None
 
 
 @mcp.tool()
