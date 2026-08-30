@@ -127,6 +127,7 @@ the bridge through the foregent MCP server.
 | `models.py` | `Issue` and `IssueStatus`. |
 | `events.py` | `Event`, `EventKind`, and the pure `wakes()` and `delivery_message()`. No transport, no server. |
 | `linear.py` | Linear GraphQL client: claim an issue, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
+| `github.py` | The inbound half of GitHub: authenticate a webhook delivery. Agents reach GitHub through the MCP server, so the bridge needs no API client. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
 | `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
@@ -165,8 +166,8 @@ instead of starting a second one for the same issue.
 ### 4.2 Delivery
 
 Linear posts to `POST /webhooks/linear`. The body is authenticated by
-HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. This is
-foregent's only inbound path: nothing asks Linear what changed.
+HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. Push is
+the whole of foregent's inbound path: nothing asks Linear what changed.
 
 1. **Match.** `wakes(event, viewer)` returns the issue key, or nothing. A
    lookup, not a scan — the event names its own issue.
@@ -201,6 +202,19 @@ working, and a failure code buys three pointless retries. A delivery arriving
 before foregent knows its own account id is answered 503, the one delivery
 not accepted, because matching without that id wakes an agent with its own
 comment.
+
+GitHub posts to `POST /webhooks/github`, the second inbound path, for what
+happens to the pull requests agents open in GitHub mode. Authentication is the
+same shape — HMAC-SHA256 over the exact bytes received, against
+`GITHUB_WEBHOOK_SECRET`, compared against the `sha256=` prefixed digest GitHub
+sends in `X-Hub-Signature-256` — and so are the answers: 401 for a signature
+that does not prove the delivery, 503 when the bridge holds no secret, 400 for
+a body that is not a JSON object, 200 for everything else. Only the header
+`X-GitHub-Event` says what a delivery is about; the body names the repository
+and the pull request. Mapping a delivery to an `Event`, resolving the pull
+request back to the Linear issue it is linked to, and the delivery that
+follows are JIM-141; until then an authenticated delivery is logged and
+dropped.
 
 ### 4.3 Completion and blocking
 
@@ -540,3 +554,4 @@ installed.
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
 | `GITHUB_TOKEN` | agents | GitHub MCP authentication. |
+| `GITHUB_WEBHOOK_SECRET` | bridge | GitHub webhook signature verification. |
