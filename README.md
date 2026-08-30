@@ -219,6 +219,22 @@ directory that is not a jj repo is used as the agent's cwd as it stands.
 Inside a workspace there is no `.git`, so raw `git` and `gh` do not work there;
 `jj` does, and reaches the same repository.
 
+A fresh workspace holds only what version control tracks, so an untracked
+`.env` or local settings file is not in it. List those in a
+**`.worktreeinclude`** file at the repository root and dispatch copies them
+into every workspace it builds. The file is
+[Claude Code's convention](https://code.claude.com/docs/en/worktrees#copy-gitignored-files-into-worktrees)
+and uses `.gitignore` syntax; a path is copied when it matches the file *and*
+is itself gitignored, so tracked files are never duplicated. A symlink is
+recreated as a symlink to the file it originally named, not followed and
+copied.
+
+```text
+.env
+.env.local
+config/secrets.json
+```
+
 What the agent does next is the `foregent-worker` skill
 (`src/foregent/skills/foregent-worker/SKILL.md`): read the issue, do the work,
 keep Linear current, rebase onto `main` and fast-forward it (bootstrap mode),

@@ -130,7 +130,7 @@ the bridge through the foregent MCP server.
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
 | `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
-| `workspaces.py` | Per-issue jj workspaces: create at dispatch, remove at completion, and record the path as trusted for Claude Code. |
+| `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for Claude Code. |
 | `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's user-level Claude Code config. |
 | `skills/` | The packaged `foregent-worker` skill and its installer. |
 | `cli.py` | `status`, `queue`, `setup`, `serve`. A thin HTTP client of the bridge, except `setup`. |
@@ -150,8 +150,8 @@ the bridge through the foregent MCP server.
 3. **Claim.** Assignee and In Progress are set in Linear in one step. Nothing
    is dispatched without a durable ownership record.
 4. **Workspace.** A fresh jj workspace is built from the queued repo, named
-   for the issue key (§6.5). Before the launch, because it is the agent's
-   cwd.
+   for the issue key, and the repo's `.worktreeinclude` files are copied into
+   it (§6.5). Before the launch, because it is the agent's cwd.
 5. **Launch.** A herdr workspace opens at that directory and Claude Code
    starts in it, with a conversation id foregent generates rather than
    scrapes.
@@ -368,6 +368,36 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   inside the workspace, so **teardown is what publishes the work to git**, and
   `forget` runs even when the workspace directory is already gone. This is why
   a failed teardown is reported rather than passed over (§4.3).
+
+A fresh workspace holds only what version control tracks, so the untracked
+files a project needs to run — `.env`, a local settings file, a key — are not
+in it. Foregent carries them over from a **`.worktreeinclude`** manifest at the
+repo root, [Claude Code's own
+convention](https://code.claude.com/docs/en/worktrees#copy-gitignored-files-into-worktrees)
+for naming them, so a project that already feeds `claude --worktree` gets the
+same set here with nothing to configure twice. The file is `.gitignore` syntax,
+and a path is carried over when it **matches the manifest and is itself
+ignored** — the convention's own rule, and what stops a tracked file becoming
+an untracked copy of itself in the workspace.
+
+Both halves are answered by `git ls-files --others --ignored`, once against the
+manifest and once against the standard excludes, and the two sets intersected.
+Handing the patterns to git rather than matching them in foregent is what makes
+the syntax git's own down to the corners, and it costs no dependency. Three
+consequences follow from that choice:
+
+- **A symlink is one entry and is never followed**, a directory symlink
+  included, so the workspace gets a link rather than a recursive copy of
+  everything behind it. A relative target is made absolute against the source's
+  directory before the new link is written: a workspace lives under
+  `FOREGENT_WORKSPACE_ROOT`, nowhere near the repo, so the link text cannot
+  travel unchanged without dangling.
+- **A repo that is not colocated with git copies nothing**, logged and not
+  raised. The manifest is a convenience; a project that cannot use it must
+  still dispatch.
+- **A listed file that cannot be copied fails the dispatch.** Launching an
+  agent quietly missing the credentials the operator asked to be there is the
+  worse failure, and the only one nobody would notice.
 
 Unbuilt: teardown after a restart. The agent's cwd is recovered from herdr but
 the repo it was made from is not (§5.4), so a workspace whose bridge restarted
