@@ -46,7 +46,7 @@ Install these on the machine that runs the agents:
 - **[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)**
   — the public HTTPS front for the webhook endpoint. The bridge listens on
   localhost and Linear will not deliver to it directly.
-- A **Linear API key** and, for GitHub mode, a **GitHub token**.
+- A **Linear API key** and, for Pull Request mode, a **GitHub token**.
 
 ## Install
 
@@ -72,7 +72,7 @@ The rest of this document writes `foregent`; from a checkout, prefix it with
 
 ```sh
 export LINEAR_API_KEY=lin_api_...      # bridge and agents
-export GITHUB_TOKEN=ghp_...            # agents, GitHub mode
+export GITHUB_TOKEN=ghp_...            # agents, Pull Request mode
 ```
 
 The Linear key identifies foregent itself: the bridge assigns claimed issues to
@@ -169,7 +169,7 @@ webhook is wired up, comment on an issue an agent is actually working.
 
 ### The GitHub webhook
 
-In GitHub mode, the same tunnel carries what GitHub says about the pull
+In Pull Request mode, the same tunnel carries what GitHub says about the pull
 requests agents open. Create an
 [organization webhook](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks#creating-an-organization-webhook)
 — one hook covers every repository foregent works — pointed at
