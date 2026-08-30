@@ -335,12 +335,16 @@ server's environment.
 ### 6.4 Project modes
 
 - **bootstrap** — no GitHub surface. The agent rebases onto `main` and
-  fast-forwards `main` locally. This is how foregent develops itself.
-- **full** — the agent pushes a branch and opens a pull request through the
-  GitHub MCP. Unbuilt.
+  fast-forwards `main` locally.
+- **pull request** — the agent pushes a branch and opens a pull request
+  through the GitHub MCP, then reports blocked on the review. This is how
+  foregent develops itself.
+
+A project declares its mode at the top of its `FOREGENT.md`; a project that
+declares nothing is in bootstrap mode.
 
 Rebase, never merge: bootstrap mode must produce history clean enough to
-graduate a repository to full mode.
+graduate a repository to pull request mode.
 
 ### 6.5 Workspaces
 

@@ -1,13 +1,15 @@
 # Handling Linear tickets in this project
 
+This project is in **Pull Request mode**: land your work as a pull request and
+report yourself blocked on the review, as the worker skill describes.
+
 Read the ticket's labels first. If it has none, treat it as **feature**.
 
 ## Scope of a change
 
 Not every ticket ends in a code change. Those that do are one pull request,
-which may have several commits. In bootstrap mode nothing is submitted through
-GitHub, but scope the work as if it were: one pull request's worth, split into
-commits that each capture one logical change and make review easier.
+which may have several commits. Split it into commits that each capture one
+logical change and make review easier.
 
 ## Labels
 

@@ -51,9 +51,8 @@ finishing.
 
 ## Landing the change
 
-**Bootstrap mode** (the default, and what foregent's own repo uses): there is
-no pull request. Rebase onto `main`, fast-forward `main` locally, and you are
-done.
+**Bootstrap mode** (the default): there is no pull request. Rebase onto
+`main`, fast-forward `main` locally, and you are done.
 
 **Pull Request mode**: push a branch and open a PR through the GitHub MCP, then
 report yourself blocked on the review rather than waiting. Push the branch

@@ -258,9 +258,9 @@ config/secrets.json
 
 What the agent does next is the `foregent-worker` skill
 (`src/foregent/skills/foregent-worker/SKILL.md`): read the issue, do the work,
-keep Linear current, rebase onto `main` and fast-forward it (bootstrap mode),
-then call `complete_task`. Completion tears the agent down and dispatches the
-next queued issue.
+keep Linear current, land the change in the mode the project's `FOREGENT.md`
+declares — for foregent itself, as a pull request — then call `complete_task`.
+Completion tears the agent down and dispatches the next queued issue.
 
 An agent that hits an external dependency calls `report_blocked` and **stays
 alive** in its workspace with its context intact. It keeps holding the capacity
