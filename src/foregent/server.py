@@ -9,6 +9,9 @@ harness.
 tracking, so an agent sees activity on its own issue whether it is working or
 parked. Events reach an agent through a queue drained by a daemon thread, so
 whoever ingested one is never held behind an agent that is mid-turn.
+``/webhooks/github`` is the same door for what GitHub pushes about the pull
+requests those agents open; it authenticates a delivery and, for now, stops
+there.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -31,7 +34,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from mcp.server.fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 
-from foregent import config, herdr, linear, mcp_servers, skills, workspaces
+from foregent import config, github, herdr, linear, mcp_servers, skills, workspaces
 from foregent.agents import (
     AgentError,
     AgentEventKind,
@@ -543,6 +546,23 @@ def deliver_issue(
     return _record(issue)
 
 
+def _payload(body: bytes) -> dict:
+    """The JSON object an authenticated delivery holds.
+
+    Raises a 400 for anything else. Both providers are configured for JSON
+    delivery and neither sends anything but an object, so a body that is not
+    one is not a delivery either of them makes — saying so beats pretending
+    it was handled.
+    """
+    try:
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("not a JSON object")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"not a delivery: {exc}") from exc
+    return payload
+
+
 @app.post("/webhooks/linear")
 async def linear_webhook(request: Request) -> dict[str, str]:
     """Deliver what Linear pushes to the agent it is for.
@@ -585,14 +605,7 @@ async def linear_webhook(request: Request) -> dict[str, str]:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not authentic:
         raise HTTPException(status_code=401, detail="signature does not match")
-    try:
-        payload = json.loads(body)
-        if not isinstance(payload, dict):
-            raise ValueError("not a JSON object")
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=400, detail=f"not a Linear delivery: {exc}"
-        ) from exc
+    payload = _payload(body)
     event = linear.webhook_event(payload)
     if event is None:
         logger.debug("Linear webhook is about no issue foregent knows: %s", payload)
@@ -613,6 +626,48 @@ async def linear_webhook(request: Request) -> dict[str, str]:
         logger.debug("event on %s reached nobody: %s", key, exc.detail)
         return {"status": "ok"}
     logger.info("queued for %s on activity by %s", key, event.author or "someone")
+    return {"status": "ok"}
+
+
+@app.post("/webhooks/github")
+async def github_webhook(request: Request) -> dict[str, str]:
+    """Accept what GitHub pushes about the pull requests foregent's agents open.
+
+    Receipt and authentication. Mapping a delivery to an
+    :class:`~foregent.events.Event`, resolving the pull request back to the
+    Linear issue it is linked to, and prompting that issue's agent land in
+    JIM-141; until they do, an authenticated delivery is logged and dropped.
+
+    **A delivery foregent does nothing with is still a success**, as on the
+    Linear side: an organization webhook carries every repository and every
+    pull request, most of them none of foregent's business, and a failure
+    code buys retries of an event that would be dropped again. The `ping`
+    GitHub sends when the webhook is created is accepted on the same terms,
+    which is what tells an operator the endpoint is wired up.
+
+    Reads the raw bytes rather than a parsed body, because that is what the
+    signature covers (:func:`~foregent.github.webhook_authentic`). 401 for a
+    delivery that does not prove it came from GitHub, absent signature
+    included; 503 when this bridge holds no secret to check one against,
+    which is an operator's misconfiguration and not the caller's fault; 400
+    for a signed body that is not a JSON object, which is what a webhook set
+    to form-encoded delivery sends.
+    """
+    body = await request.body()
+    try:
+        authentic = github.webhook_authentic(
+            body, request.headers.get(github.SIGNATURE_HEADER, "")
+        )
+    except github.GitHubError as exc:
+        logger.error("cannot authenticate GitHub webhooks: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not authentic:
+        raise HTTPException(status_code=401, detail="signature does not match")
+    payload = _payload(body)
+    # The body names the repository and the pull request; only the header says
+    # what happened to them.
+    kind = request.headers.get(github.EVENT_HEADER) or "nameless"
+    logger.debug("GitHub delivered a %s event: %s", kind, payload)
     return {"status": "ok"}
 
 

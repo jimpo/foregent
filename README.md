@@ -130,8 +130,8 @@ and the entry above means foregent never has to touch it.
 
 ## Webhook ingress (Cloudflare tunnel)
 
-Linear delivers to a public HTTPS URL, and the bridge listens on localhost, so
-something has to front it. `cloudflared` does, and a quick tunnel needs no
+Linear and GitHub deliver to a public HTTPS URL, and the bridge listens on
+localhost, so something has to front it. `cloudflared` does, and a quick tunnel needs no
 account and no domain:
 
 ```sh
@@ -166,6 +166,27 @@ most of them — is answered 200 and dropped, so Linear is never told a delivery
 failed for being none of foregent's business. The bridge logs the deliveries
 it queues for an agent and stays quiet about the rest, so to confirm the
 webhook is wired up, comment on an issue an agent is actually working.
+
+### The GitHub webhook
+
+In GitHub mode, the same tunnel carries what GitHub says about the pull
+requests agents open. Create an
+[organization webhook](https://docs.github.com/en/webhooks/using-webhooks/creating-webhooks#creating-an-organization-webhook)
+— one hook covers every repository foregent works — pointed at
+`<tunnel URL>/webhooks/github`, with **content type `application/json`**;
+foregent does not read the form-encoded delivery and answers 400 for one.
+Subscribe it to pull request reviews and review comments. Put the secret
+GitHub asks you to invent in the bridge's environment:
+
+```sh
+export GITHUB_WEBHOOK_SECRET=...
+```
+
+The same answers as the Linear endpoint: 401 for a signature that does not
+match, 503 when the bridge holds no secret to check one against, and 200 for
+everything it accepts. GitHub keeps every attempt and the code it got back
+under **Recent Deliveries** on the hook's own page, so the `ping` it sends on
+creating the hook is the quickest confirmation the endpoint is reachable.
 
 ## Running the bridge
 
@@ -274,6 +295,7 @@ state.
 | `LINEAR_API_KEY` | The bridge claims issues with it; agents authenticate the Linear MCP with it. Required. |
 | `GITHUB_TOKEN` | Agents authenticate the GitHub MCP with it. |
 | `LINEAR_WEBHOOK_SECRET` | The signing secret of the Linear webhook, checked against every delivery. Required: without it `POST /webhooks/linear` answers 503. |
+| `GITHUB_WEBHOOK_SECRET` | The secret of the GitHub webhook, checked against every delivery. Without it `POST /webhooks/github` answers 503. |
 | `FOREGENT_HERDR_SESSION` | The herdr session to run agents in. Falls back to the session the bridge process runs in, then herdr's default. |
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
@@ -282,7 +304,7 @@ state.
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 272 unit tests, ~4s
+uv run python -m unittest discover -s tests -t .   # 291 unit tests, ~4s
 uv run ty check                                    # type check
 ```
 

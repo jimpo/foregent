@@ -1,4 +1,4 @@
-"""Tests for the Linear webhook endpoint (JIM-128, JIM-133).
+"""Tests for the webhook endpoints (JIM-128, JIM-133, JIM-139).
 
 Driven over HTTP rather than by calling the handler, because the thing under
 test is what arrives on the wire: the exact bytes of the body, and a header
@@ -10,6 +10,9 @@ do with.
 The delivery half borrows the fake harness and the drainer from
 ``tests.test_server``: what a message does once it is queued is that module's
 subject, and what is queued for whom is this one's.
+
+The GitHub endpoint is receipt and authentication only, so its tests stop
+where it does: who a delivery reaches is JIM-141's subject.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from foregent import linear, server
+from foregent import github, linear, server
 from foregent.agents import AgentRef
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
@@ -41,6 +44,11 @@ PAYLOAD = {
 
 def sign(body: bytes, secret: str = SECRET) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def sign_github(body: bytes, secret: str = SECRET) -> str:
+    """The same digest, prefixed the way GitHub names the algorithm it used."""
+    return f"sha256={sign(body, secret)}"
 
 
 class WebhookAuthenticTests(unittest.TestCase):
@@ -277,6 +285,111 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.deliver(self.comment())
         self.deliver(self.comment())
         self.viewer.assert_called_once()
+
+
+class GitHubWebhookAuthenticTests(unittest.TestCase):
+    """The signature check itself (JIM-139)."""
+
+    def setUp(self) -> None:
+        self.enterContext(
+            mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": SECRET})
+        )
+
+    def test_a_signature_over_the_body_is_authentic(self) -> None:
+        body = b'{"action":"opened"}'
+        self.assertTrue(github.webhook_authentic(body, sign_github(body)))
+
+    def test_a_signature_for_other_bytes_is_not(self) -> None:
+        # The delivery GitHub signed is not the one that arrived.
+        self.assertFalse(
+            github.webhook_authentic(b'{"action":"closed"}', sign_github(b"{}"))
+        )
+
+    def test_another_secret_is_not(self) -> None:
+        body = b"{}"
+        self.assertFalse(github.webhook_authentic(body, sign_github(body, "wrong")))
+
+    def test_the_digest_alone_is_not(self) -> None:
+        # GitHub always names the algorithm, so a bare hex digest is not a
+        # signature it sent — and comparing without the prefix would accept
+        # the same digest under any algorithm a caller cared to claim.
+        body = b"{}"
+        self.assertFalse(github.webhook_authentic(body, sign(body)))
+
+    def test_an_unset_secret_refuses_rather_than_accepts(self) -> None:
+        # A bridge that cannot check a signature must not wave the body
+        # through; the caller turns this into a 503.
+        with mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": ""}):
+            with self.assertRaises(github.GitHubError):
+                github.webhook_authentic(b"{}", "")
+
+
+class GitHubWebhookRouteTests(unittest.TestCase):
+    """Which deliveries ``POST /webhooks/github`` accepts at all (JIM-139)."""
+
+    PULL_REQUEST = {
+        "action": "submitted",
+        "pull_request": {"number": 3},
+        "repository": {"full_name": "jimpo/foregent"},
+    }
+
+    def setUp(self) -> None:
+        self.client = TestClient(server.app)
+        self.enterContext(
+            mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": SECRET})
+        )
+
+    def post(self, body: bytes, signature: str | None, event: str = "pull_request"):
+        headers = {"Content-Type": "application/json", github.EVENT_HEADER: event}
+        if signature is not None:
+            headers[github.SIGNATURE_HEADER] = signature
+        return self.client.post("/webhooks/github", content=body, headers=headers)
+
+    def test_the_signature_is_checked_against_the_bytes_that_arrived(self) -> None:
+        # Signing a re-serialization of the payload instead of the delivery
+        # is the mistake this route must not make: same JSON, different
+        # whitespace, different digest.
+        body = json.dumps(self.PULL_REQUEST, indent=2).encode()
+        compact = sign_github(json.dumps(self.PULL_REQUEST).encode())
+        self.assertEqual(self.post(body, compact).status_code, 401)
+        self.assertEqual(self.post(body, sign_github(body)).status_code, 200)
+
+    def test_a_forged_delivery_is_rejected(self) -> None:
+        forged = self.post(b'{"action":"opened"}', sign_github(b"{}"))
+        self.assertEqual(forged.status_code, 401)
+
+    def test_a_delivery_with_no_signature_is_rejected(self) -> None:
+        # Absent proves as little as wrong does.
+        self.assertEqual(self.post(b"{}", None).status_code, 401)
+
+    def test_an_unconfigured_bridge_says_so_rather_than_accepting(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": ""}):
+            with self.assertLogs(server.logger, "ERROR"):
+                response = self.post(b"{}", sign_github(b"{}"))
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("GITHUB_WEBHOOK_SECRET", response.json()["detail"])
+
+    def test_the_ping_that_confirms_the_hook_is_accepted(self) -> None:
+        # GitHub sends this when the webhook is created; accepting it is what
+        # tells an operator the endpoint is wired up.
+        body = json.dumps({"zen": "Design for failure.", "hook_id": 1}).encode()
+        response = self.post(body, sign_github(body), event="ping")
+        self.assertEqual(response.status_code, 200)
+
+    def test_a_delivery_about_a_pull_request_nobody_is_working_is_accepted(
+        self,
+    ) -> None:
+        # An organization webhook carries every repository; a failure code
+        # would buy retries of an event that would be dropped again.
+        body = json.dumps(self.PULL_REQUEST).encode()
+        self.assertEqual(self.post(body, sign_github(body)).status_code, 200)
+
+    def test_a_signed_body_that_is_not_a_delivery_is_rejected(self) -> None:
+        # What a webhook set to form-encoded delivery sends, and what nothing
+        # else GitHub sends looks like.
+        form = b"payload=%7B%7D"
+        self.assertEqual(self.post(form, sign_github(form)).status_code, 400)
+        self.assertEqual(self.post(b"[]", sign_github(b"[]")).status_code, 400)
 
 
 if __name__ == "__main__":
