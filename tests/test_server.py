@@ -740,7 +740,27 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
             ("new",),
             ("bookmark", "create", "main", "-r", "@-"),
         ):
-            subprocess.run(["jj", "--no-pager", *args], cwd=self.repo, check=True)
+            self.jj(self.repo, *args)
+
+    def jj(self, cwd: Path, *args: str) -> None:
+        """Run one jj command, for arranging and inspecting fixtures."""
+        subprocess.run(["jj", "--no-pager", *args], cwd=cwd, check=True)
+
+    def git_head(self) -> str:
+        """The subject of the commit git's ``main`` points at.
+
+        Git's view rather than jj's, because reaching it is the whole point:
+        a bookmark moved inside a workspace is invisible to git until a
+        mutating jj command runs at the colocated root.
+        """
+        done = subprocess.run(
+            ["git", "log", "-1", "--format=%s", "main"],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return done.stdout.strip()
 
     def test_dispatch_launches_in_a_workspace_not_in_the_repo(self) -> None:
         server.store.queue("JIM-88", str(self.repo))
@@ -815,8 +835,8 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(alive, [True])
 
     async def test_a_failed_teardown_is_reported_not_swallowed(self) -> None:
-        # It is the step that exports the agent's `main` to git, so it does not
-        # get the silent best-effort treatment agent teardown gets.
+        # Nobody owns the leftovers, so this does not get the silent
+        # best-effort treatment agent teardown gets.
         server.store.queue("JIM-88", str(self.repo))
         server.dispatch()
 
@@ -829,6 +849,91 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         issue = server.store.get("JIM-88")
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.DONE)
+
+    async def test_completion_advances_trunk_onto_the_agents_work(self) -> None:
+        # Bootstrap mode has no pull request to carry the work out of the
+        # workspace, so the bridge lands it (JIM-152). The repo has no origin,
+        # which is what makes this bootstrap.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        (cwd / "b.txt").write_text("the agent's work\n")
+        self.jj(cwd, "commit", "-m", "the agent's work")
+
+        await server.complete_task("JIM-88")
+
+        self.assertEqual(self.git_head(), "the agent's work")
+
+    async def test_trunk_is_advanced_before_the_next_issue_is_dispatched(self) -> None:
+        # The next dispatch builds its workspace on `main`, so a bookmark
+        # moved after it would leave the next agent on a trunk this issue
+        # never reached — silently dropping this issue's work from its base.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        (cwd / "b.txt").write_text("the agent's work\n")
+        self.jj(cwd, "commit", "-m", "the agent's work")
+        server.store.queue("JIM-89", str(self.repo))
+
+        await server.complete_task("JIM-88")
+
+        second = Path(self.manager.launched[1].cwd)
+        self.assertTrue((second / "b.txt").is_file())
+
+    async def test_completing_twice_is_safe(self) -> None:
+        # Retrying a completion has always been safe, and landing must not
+        # change that: the second call has no workspace left to name a
+        # revision in, so jj would refuse for a reason about nothing.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        (cwd / "b.txt").write_text("the agent's work\n")
+        self.jj(cwd, "commit", "-m", "the agent's work")
+
+        await server.complete_task("JIM-88")
+        result = await server.complete_task("JIM-88")
+
+        self.assertIn("complete", result)
+        self.assertNotIn("not completed", result)
+        self.assertEqual(self.git_head(), "the agent's work")
+
+    async def test_a_pull_request_project_leaves_trunk_to_the_reviewer(self) -> None:
+        self.jj(self.repo, "git", "remote", "add", "origin",
+                "https://github.com/jimpo/foregent")
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        (cwd / "b.txt").write_text("pushed on a branch\n")
+        self.jj(cwd, "commit", "-m", "pushed on a branch")
+
+        await server.complete_task("JIM-88")
+
+        self.assertEqual(self.git_head(), "first")
+
+    async def test_work_that_never_rebased_stops_the_completion(self) -> None:
+        # jj refuses to move `main` onto commits it is not an ancestor of, and
+        # those commits exist only in the workspace — so tearing it down would
+        # take them with it. The issue stays in flight and the workspace stays
+        # on disk (JIM-152).
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        (cwd / "b.txt").write_text("work off a stale trunk\n")
+        self.jj(cwd, "commit", "-m", "work off a stale trunk")
+        # Trunk moves on underneath the agent, the way another issue landing
+        # would.
+        (self.repo / "c.txt").write_text("landed elsewhere\n")
+        self.jj(self.repo, "commit", "-m", "another issue landed")
+        self.jj(self.repo, "bookmark", "set", "main", "-r", "@-")
+
+        result = await server.complete_task("JIM-88")
+
+        self.assertIn("not completed", result)
+        self.assertTrue(cwd.is_dir())
+        self.assertEqual(self.manager.stopped, [])
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
 
 
 class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):

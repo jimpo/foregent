@@ -120,32 +120,85 @@ class WorkspaceTest(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertNotIn("JIM-1", _names(self.repo))
 
-    def test_destroy_exports_the_bookmark_the_agent_moved(self) -> None:
-        """Teardown is what publishes bootstrap-mode work to git.
+    def commit(self, path: Path, subject: str, name: str = "b.txt") -> None:
+        """Leave one committed change in the workspace at ``path``.
+
+        Committed, not merely described: the working-copy commit is jj's
+        scratch space, and :func:`workspaces.advance` publishes its parent.
+        """
+        (path / name).write_text(f"{subject}\n")
+        jj(path, "commit", "-m", subject)
+
+    def test_advance_publishes_the_workspaces_work_to_git(self) -> None:
+        """Bootstrap mode lands its work here, and git must see it at once.
 
         A bookmark moved inside a secondary workspace is invisible to git until
-        a mutating jj command runs at the colocated root. If ``destroy`` ever
-        stops running ``forget`` there, an agent's fast-forward of ``main``
-        silently stops reaching git, and nothing else in the system notices.
+        a mutating jj command runs at the colocated root, so ``advance`` runs
+        there. If it ever stops doing so, bootstrap work silently stops
+        reaching git and nothing else in the system notices.
         """
         path = workspaces.create(self.repo, "JIM-1")
-        (path / "b.txt").write_text("the agent's work\n")
-        jj(path, "describe", "-m", "the agent's work")
-        jj(path, "new")
-        jj(path, "bookmark", "set", "main", "-r", "@-")
+        self.commit(path, "the agent's work")
+        # Left in the working copy, which is jj's scratch space: `main` must
+        # head at the commit, not at the empty change sitting on top of it.
+        (path / "unfinished.txt").write_text("not committed\n")
         self.assertEqual(_git_head(self.repo), "first")
 
-        workspaces.destroy(self.repo, "JIM-1", path)
+        workspaces.advance(self.repo, "JIM-1")
 
         self.assertEqual(_git_head(self.repo), "the agent's work")
 
-    def test_destroy_forgets_even_when_the_directory_is_gone(self) -> None:
-        """The export must not be skipped because the checkout vanished."""
+    def test_advance_takes_every_commit_the_agent_made(self) -> None:
         path = workspaces.create(self.repo, "JIM-1")
-        jj(path, "bookmark", "set", "main", "-r", "@")
-        (path / "b.txt").write_text("work\n")
-        jj(path, "describe", "-m", "work in a doomed directory")
-        jj(path, "bookmark", "set", "main", "-r", "@")
+        self.commit(path, "first of two", "b.txt")
+        self.commit(path, "second of two", "c.txt")
+
+        workspaces.advance(self.repo, "JIM-1")
+
+        self.assertEqual(_git_head(self.repo), "second of two")
+
+    def test_advance_is_a_no_op_when_nothing_was_committed(self) -> None:
+        """An issue that ends in no code change still completes."""
+        path = workspaces.create(self.repo, "JIM-1")
+
+        workspaces.advance(self.repo, "JIM-1")
+
+        self.assertEqual(_git_head(self.repo), "first")
+        self.assertTrue(path.is_dir())
+
+    def test_advance_refuses_work_that_is_not_descended_from_trunk(self) -> None:
+        """jj's own fast-forward rule is the rebase requirement, enforced.
+
+        An agent that rebased onto something else leaves commits that would
+        drop trunk's own history if ``main`` were moved onto them, so jj
+        declines and the completion stops rather than tearing the workspace
+        down over them.
+        """
+        path = workspaces.create(self.repo, "JIM-1")
+        # Move trunk on underneath the agent, the way another issue landing
+        # would, and leave the agent's work where it was.
+        (self.repo / "c.txt").write_text("landed elsewhere\n")
+        jj(self.repo, "commit", "-m", "another issue landed")
+        jj(self.repo, "bookmark", "set", "main", "-r", "@-")
+        self.commit(path, "work off a stale trunk")
+
+        with self.assertRaises(workspaces.WorkspaceError) as caught:
+            workspaces.advance(self.repo, "JIM-1")
+
+        self.assertIn("backwards or sideways", str(caught.exception))
+        self.assertEqual(_git_head(self.repo), "another issue landed")
+
+    def test_advance_leaves_a_plain_directory_alone(self) -> None:
+        plain = self.tmp / "plain"
+        plain.mkdir()
+
+        workspaces.advance(plain, "JIM-1")
+
+    def test_destroy_forgets_even_when_the_directory_is_gone(self) -> None:
+        """A crash that took the checkout must not leave jj tracking it."""
+        path = workspaces.create(self.repo, "JIM-1")
+        self.commit(path, "work in a doomed directory")
+        workspaces.advance(self.repo, "JIM-1")
         shutil.rmtree(path)
 
         workspaces.destroy(self.repo, "JIM-1", path)

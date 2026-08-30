@@ -17,10 +17,10 @@ established by driving jj 0.43 directly:
   write paths survive because ``jj git push`` reaches the shared git backend
   and Pull Request mode opens its pull request over the API.
 - A bookmark it moves is **not exported to git** until a mutating jj command
-  runs at the colocated root. Bootstrap mode advances ``main`` from inside the
-  workspace, so :func:`destroy` is what publishes the agent's work to git —
-  see the ``forget`` call there, which must run even when the directory is
-  already gone.
+  runs at the colocated root, and a workspace's own working copy is reachable
+  from the root as the revset ``<name>@``. Both are why bootstrap mode lands
+  its work through :func:`advance`, run at the repo root, rather than from
+  inside the workspace where git would not see it.
 
 A fresh workspace holds only what version control tracks, so the untracked
 files a project needs to run — ``.env`` and its kind — are carried over from
@@ -92,10 +92,9 @@ def mode_for(repo: Path) -> Mode:
     the SSH spelling alike.
 
     Derived rather than declared: a project that says one thing in a file and
-    another in its remotes can only disagree with itself, and both halves of
-    the contract — the mode the agent is briefed with (:func:`
-    foregent.server.brief_for`) and the one the bridge completes it in — come
-    from here.
+    another in its remotes can only disagree with itself. Both halves of the
+    contract come from here — the mode the agent is briefed with at dispatch,
+    and the one the bridge completes the issue in.
 
     A jj command that fails answers bootstrap rather than raising. Refusing to
     dispatch over an unreadable remote list would be a worse answer than
@@ -177,14 +176,47 @@ def create(repo: Path, key: str) -> Path:
     return path
 
 
-def destroy(repo: Path, key: str, path: Path) -> None:
-    """Remove the workspace for ``key``, publishing the work it holds.
+def advance(repo: Path, key: str) -> None:
+    """Move ``TRUNK`` onto the work the ``key`` workspace holds.
 
-    ``forget`` runs even when ``path`` is already gone, and that ordering is
-    load-bearing rather than tidy: it is the mutating jj command at the
-    colocated root that exports the bookmark the agent moved from inside the
-    workspace. Skipping it because the directory vanished would leave the
-    issue's work outside git's view of ``main``.
+    This is how bootstrap mode lands a change: the agent commits on top of
+    ``main`` and stops there, and the bridge moves the bookmark when the issue
+    completes. Keeping it here rather than in the agent means one worker that
+    forgets, or moves it somewhere else, cannot decide what ``main`` is.
+
+    Two details are load-bearing, both established by driving jj 0.43:
+
+    - **The revision is** ``<key>@-``, the parent of the workspace's
+      working-copy commit. ``<key>@`` is a revset for another workspace's
+      working copy, so the repo root can name the agent's tip without entering
+      the workspace; its parent, rather than itself, because the working-copy
+      commit is jj's scratch space and publishing it would put an empty commit
+      at the head of ``main``. An agent that committed nothing leaves ``@-``
+      *on* ``main``, which jj answers with "No bookmarks to update" and a zero
+      exit.
+    - **``bookmark move`` is fast-forward-only** without ``--allow-backwards``,
+      so jj refuses work that is not descended from ``main`` and leaves the
+      bookmark where it was. The rebase requirement the worker skill states is
+      enforced here for free, with no ancestry revset of foregent's own to get
+      wrong.
+
+    Running at the colocated repo root is also what exports the bookmark to
+    git: a mutating jj command there is what git's view of ``main`` waits for.
+    """
+    if not is_repo(repo):
+        return
+    _jj(repo, "bookmark", "move", TRUNK, "--to", f"{key}@-")
+    logger.info("advanced %s onto the work in the %s workspace", TRUNK, key)
+
+
+def destroy(repo: Path, key: str, path: Path) -> None:
+    """Remove the workspace for ``key``.
+
+    ``forget`` runs even when ``path`` is already gone, so a workspace whose
+    directory a crash took with it stops being one jj still knows about.
+    Nothing is published here: :func:`advance` has already moved the bookmark
+    at the colocated root, so this is cleanup and a failure costs a directory
+    rather than the work in it.
     """
     if not is_repo(repo):
         return
