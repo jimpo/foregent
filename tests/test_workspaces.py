@@ -146,6 +146,23 @@ class WorkspaceTest(unittest.TestCase):
         self.assertTrue((first / "a.txt").is_file())
         self.assertTrue((second / "a.txt").is_file())
 
+    def test_create_carries_the_worktreeinclude_files_over(self) -> None:
+        """The whole point of the manifest: an agent's checkout can run (JIM-147).
+
+        Held here as well as in ``IncludeTest`` because this is the claim that
+        the copy reaches a workspace jj actually built, rather than one the
+        test made with ``mkdir``.
+        """
+        (self.repo / ".gitignore").write_text(".env\n")
+        (self.repo / workspaces.INCLUDE_FILE).write_text(".env\n")
+        (self.repo / ".env").write_text("SECRET=1\n")
+
+        path = workspaces.create(self.repo, "JIM-1")
+
+        self.assertEqual((path / ".env").read_text(), "SECRET=1\n")
+        # And the tracked checkout is untouched by it.
+        self.assertTrue((path / "a.txt").is_file())
+
     def test_a_non_jj_directory_is_used_directly(self) -> None:
         """A project foregent cannot isolate still gets its agent."""
         plain = self.tmp / "plain"
@@ -186,6 +203,195 @@ def _git_head(repo: Path) -> str:
         check=True,
     )
     return done.stdout.strip()
+
+
+class IncludeTest(unittest.TestCase):
+    """Carrying ``.worktreeinclude`` files into a fresh workspace (JIM-147).
+
+    These drive a real ``git`` against a throwaway repo for the same reason the
+    tests above drive a real ``jj``: the feature is a claim about which paths
+    ``git ls-files`` reports for a ``.gitignore``-syntax manifest, and a mocked
+    subprocess would assert only that foregent still passes the flags it used
+    to.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.repo, check=True)
+        (self.repo / "tracked.txt").write_text("tracked\n")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "in"],
+            cwd=self.repo,
+            check=True,
+        )
+        self.workspace = self.tmp / "workspace"
+        self.workspace.mkdir()
+
+    def write(self, name: str, body: str) -> Path:
+        """Put a file at ``name`` under the repo, making its directories."""
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        return path
+
+    def arrange(self, *, ignore: str, include: str) -> None:
+        """Give the repo a ``.gitignore`` and a ``.worktreeinclude``."""
+        self.write(".gitignore", ignore)
+        self.write(workspaces.INCLUDE_FILE, include)
+
+    def test_an_ignored_file_named_in_the_manifest_is_copied(self) -> None:
+        self.arrange(ignore=".env\n", include=".env\n")
+        self.write(".env", "SECRET=1\n")
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(copied, [".env"])
+        self.assertEqual((self.workspace / ".env").read_text(), "SECRET=1\n")
+
+    def test_an_ignored_file_the_manifest_omits_is_left_behind(self) -> None:
+        """The manifest is a whitelist, not a description of what is ignored."""
+        self.arrange(ignore=".env\nscratch.log\n", include=".env\n")
+        self.write(".env", "SECRET=1\n")
+        self.write("scratch.log", "noise\n")
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(copied, [".env"])
+        self.assertFalse((self.workspace / "scratch.log").exists())
+
+    def test_a_tracked_file_is_never_duplicated(self) -> None:
+        """jj already put it there; a copy would be an untracked shadow of it.
+
+        This is the half of the rule that a plain pattern match would miss, and
+        it is why the manifest is intersected with what git ignores rather than
+        applied on its own.
+        """
+        self.arrange(ignore=".env\n", include=".env\ntracked.txt\n")
+        self.write(".env", "SECRET=1\n")
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(copied, [".env"])
+        self.assertFalse((self.workspace / "tracked.txt").exists())
+
+    def test_an_untracked_file_that_is_not_ignored_is_left_behind(self) -> None:
+        """Matching the manifest is not enough; the file must be ignored too."""
+        self.arrange(ignore=".env\n", include=".env\nnotes.md\n")
+        self.write(".env", "SECRET=1\n")
+        self.write("notes.md", "the operator's scratch notes\n")
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(copied, [".env"])
+        self.assertFalse((self.workspace / "notes.md").exists())
+
+    def test_the_manifest_uses_gitignore_syntax(self) -> None:
+        """A bare directory name and a glob both mean what git says they mean."""
+        self.arrange(ignore="secrets/\n*.local\n", include="secrets/\n*.local\n")
+        self.write("secrets/key.json", "{}\n")
+        self.write("secrets/nested/other.json", "{}\n")
+        self.write("settings.local", "x\n")
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(
+            copied,
+            ["secrets/key.json", "secrets/nested/other.json", "settings.local"],
+        )
+        self.assertEqual((self.workspace / "secrets/nested/other.json").read_text(), "{}\n")
+
+    def test_a_file_inside_a_wholly_ignored_directory_is_reached(self) -> None:
+        """git collapses such a directory in some listings; it must not here."""
+        self.arrange(ignore="vendor/\n", include="vendor/**/config.json\n")
+        self.write("vendor/pkg/config.json", "{}\n")
+        self.write("vendor/pkg/huge.bin", "not wanted\n")
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(copied, ["vendor/pkg/config.json"])
+        self.assertFalse((self.workspace / "vendor/pkg/huge.bin").exists())
+
+    def test_a_symlink_is_recreated_rather_than_followed(self) -> None:
+        """The ticket's caveat: the workspace gets a link, not a copy."""
+        outside = self.tmp / "outside.env"
+        outside.write_text("SECRET=1\n")
+        self.arrange(ignore=".env\n", include=".env\n")
+        (self.repo / ".env").symlink_to(outside)
+
+        workspaces.copy_included(self.repo, self.workspace)
+
+        copied = self.workspace / ".env"
+        self.assertTrue(copied.is_symlink())
+        self.assertEqual(Path(os.readlink(copied)), outside)
+        self.assertEqual(copied.read_text(), "SECRET=1\n")
+
+    def test_a_relative_symlink_still_points_at_the_original_target(self) -> None:
+        """A workspace lives nowhere near the repo, so the link text cannot travel.
+
+        Copied verbatim, ``../shared/creds`` would resolve against the
+        workspace root and dangle. Made absolute against the source, it names
+        the file the operator meant.
+        """
+        self.write("shared/creds", "SECRET=1\n")
+        self.arrange(ignore="app/.env\n", include="app/.env\n")
+        (self.repo / "app").mkdir()
+        (self.repo / "app/.env").symlink_to(Path("../shared/creds"))
+
+        workspaces.copy_included(self.repo, self.workspace)
+
+        copied = self.workspace / "app/.env"
+        self.assertTrue(copied.is_symlink())
+        self.assertEqual(copied.read_text(), "SECRET=1\n")
+
+    def test_a_symlinked_directory_is_relinked_not_walked(self) -> None:
+        """One link entry, not a recursive copy of everything behind it."""
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "deep.txt").write_text("deep\n")
+        self.arrange(ignore="linked\n", include="linked\n")
+        (self.repo / "linked").symlink_to(outside)
+
+        copied = workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertEqual(copied, ["linked"])
+        self.assertTrue((self.workspace / "linked").is_symlink())
+        self.assertEqual((self.workspace / "linked/deep.txt").read_text(), "deep\n")
+
+    def test_no_manifest_copies_nothing(self) -> None:
+        """The overwhelmingly common repo, and it must cost no subprocess."""
+        self.write(".gitignore", ".env\n")
+        self.write(".env", "SECRET=1\n")
+
+        with mock.patch.object(workspaces.subprocess, "run") as run:
+            self.assertEqual(workspaces.copy_included(self.repo, self.workspace), [])
+
+        run.assert_not_called()
+
+    def test_an_empty_workspace_is_left_alone_when_git_cannot_answer(self) -> None:
+        """A jj repo that is not colocated has no ``.git``; it still dispatches."""
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        (plain / workspaces.INCLUDE_FILE).write_text(".env\n")
+        (plain / ".env").write_text("SECRET=1\n")
+
+        self.assertEqual(workspaces.copy_included(plain, self.workspace), [])
+
+        self.assertFalse((self.workspace / ".env").exists())
+
+    def test_a_file_that_cannot_be_copied_fails_the_dispatch(self) -> None:
+        """Better than launching an agent quietly missing its credentials."""
+        self.arrange(ignore=".env\n", include=".env\n")
+        self.write(".env", "SECRET=1\n")
+
+        with mock.patch.object(workspaces.shutil, "copy2", side_effect=OSError("nope")):
+            with self.assertRaises(workspaces.WorkspaceError) as caught:
+                workspaces.copy_included(self.repo, self.workspace)
+
+        self.assertIn(".env", str(caught.exception))
 
 
 class TrustTest(unittest.TestCase):

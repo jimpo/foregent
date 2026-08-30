@@ -21,6 +21,11 @@ established by driving jj 0.43 directly:
   workspace, so :func:`destroy` is what publishes the agent's work to git —
   see the ``forget`` call there, which must run even when the directory is
   already gone.
+
+A fresh workspace holds only what version control tracks, so the untracked
+files a project needs to run — ``.env`` and its kind — are carried over from
+a ``.worktreeinclude`` manifest at the repo root (JIM-147). See
+:func:`copy_included`.
 """
 
 from __future__ import annotations
@@ -42,6 +47,12 @@ logger = logging.getLogger(__name__)
 # fast-forwards (docs/ARCHITECTURE.md §6.4), and the worker skill tells agents
 # the same, so a second name for it would be a third place to disagree.
 TRUNK = "main"
+
+# The manifest of untracked files to carry into every workspace, read at the
+# repo root. The name and the format are Claude Code's convention rather than
+# foregent's, so a project already carrying files into `claude --worktree`
+# checkouts gets the same set here with nothing to configure twice.
+INCLUDE_FILE = ".worktreeinclude"
 
 # Per-call budget for a jj subprocess. Creating a workspace writes a whole
 # working copy, so this is generous; it exists to stop a wedged jj from
@@ -93,6 +104,7 @@ def create(repo: Path, key: str) -> Path:
     # commit the operator's own checkout happens to be sitting on — so the
     # agent would start from wherever they last were.
     _jj(repo, "workspace", "add", "--name", key, "-r", TRUNK, str(path))
+    copy_included(repo, path)
     ensure_trusted(path)
     logger.info("created the %s workspace at %s", key, path)
     return path
@@ -152,6 +164,93 @@ def _jj(repo: Path, *args: str) -> str:
         detail = (exc.stderr or exc.stdout or "").strip()
         raise WorkspaceError(f"jj {' '.join(args)} failed: {detail}") from exc
     return done.stdout
+
+
+def copy_included(repo: Path, path: Path) -> list[str]:
+    """Carry ``repo``'s ``.worktreeinclude`` files into the workspace at ``path``.
+
+    A fresh workspace checks out only what version control tracks, so the
+    untracked files a project needs to run — ``.env``, a local settings file, a
+    key — are not in it. ``.worktreeinclude`` is `Claude Code's convention
+    <https://code.claude.com/docs/en/worktrees#copy-gitignored-files-into-worktrees>`_
+    for naming them: a manifest at the repo root in ``.gitignore`` syntax,
+    whose entries are copied into every new checkout.
+
+    A file is carried over when it matches the manifest **and** is itself
+    ignored, which is the convention's own rule and keeps a tracked file from
+    being duplicated as an untracked copy of itself. Both halves are answered
+    by :func:`_listed` rather than by a pattern matcher here, so the syntax is
+    git's own down to the corners — a bare directory name expands to the files
+    under it, and a file inside a wholly ignored directory is still found.
+
+    Returns the paths copied, relative to the repo. Absence of the manifest,
+    of git, or of the ``.git`` a colocated repo has is not an error: a project
+    that carries nothing over still dispatches.
+    """
+    if not (repo / INCLUDE_FILE).is_file():
+        return []
+    try:
+        wanted = _listed(repo, "--exclude-from", INCLUDE_FILE)
+        ignored = _listed(repo, "--exclude-standard")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("could not read %s in %s: %s", INCLUDE_FILE, repo, exc)
+        return []
+    names = sorted(wanted & ignored)
+    for name in names:
+        _copy(repo / name, path / name)
+    if names:
+        logger.info("copied %d %s file(s) into %s", len(names), INCLUDE_FILE, path)
+    return names
+
+
+def _listed(repo: Path, *exclude: str) -> set[str]:
+    """The untracked files in ``repo`` that ``exclude``'s patterns match.
+
+    ``--others --ignored`` is what pairs with an exclude option to mean "the
+    files these patterns pick out", so the same call answers both halves of
+    :func:`copy_included`'s rule by being handed a different source of
+    patterns. A symlink is one entry and is never followed, a directory
+    symlink included, which is what lets the copy re-point it rather than
+    walking through it.
+
+    Raises ``OSError`` when git cannot answer — it is missing, or the repo is
+    a jj repo that is not colocated and so has no ``.git`` — and
+    ``TimeoutExpired`` when it wedges. Both leave the manifest uncopied rather
+    than the dispatch failed.
+    """
+    done = subprocess.run(
+        ["git", "ls-files", "-z", "--others", "--ignored", *exclude],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+    )
+    if done.returncode != 0:
+        raise OSError((done.stderr or done.stdout or "").strip())
+    return {name for name in done.stdout.split("\0") if name}
+
+
+def _copy(source: Path, destination: Path) -> None:
+    """Reproduce ``source`` at ``destination``, preserving a symlink as one.
+
+    A symlink is re-pointed at the file the original names, not merely given
+    the same link text: a workspace lives under ``FOREGENT_WORKSPACE_ROOT``,
+    nowhere near the repo, so a relative target copied verbatim would resolve
+    against the wrong directory and dangle. It is made absolute against the
+    source's own directory; an already-absolute target is written through
+    unchanged.
+    """
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target = Path(os.readlink(source))
+            if not target.is_absolute():
+                target = source.parent / target
+            destination.symlink_to(target)
+        else:
+            shutil.copy2(source, destination)
+    except OSError as exc:
+        raise WorkspaceError(f"could not copy {source} to {destination}: {exc}") from exc
 
 
 def ensure_trusted(path: Path) -> bool:
