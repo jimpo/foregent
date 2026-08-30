@@ -204,8 +204,8 @@ not accepted, because matching without that id wakes an agent with its own
 comment.
 
 GitHub posts to `POST /webhooks/github`, the second inbound path, for what
-happens to the pull requests agents open in GitHub mode. Authentication is the
-same shape — HMAC-SHA256 over the exact bytes received, against
+happens to the pull requests agents open in Pull Request mode. Authentication
+is the same shape — HMAC-SHA256 over the exact bytes received, against
 `GITHUB_WEBHOOK_SECRET`, compared against the `sha256=` prefixed digest GitHub
 sends in `X-Hub-Signature-256` — and so are the answers: 401 for a signature
 that does not prove the delivery, 503 when the bridge holds no secret, 400 for
@@ -335,12 +335,16 @@ server's environment.
 ### 6.4 Project modes
 
 - **bootstrap** — no GitHub surface. The agent rebases onto `main` and
-  fast-forwards `main` locally. This is how foregent develops itself.
-- **full** — the agent pushes a branch and opens a pull request through the
-  GitHub MCP. Unbuilt.
+  fast-forwards `main` locally.
+- **pull request** — the agent pushes a branch and opens a pull request
+  through the GitHub MCP, then reports blocked on the review. This is how
+  foregent develops itself.
+
+A project declares its mode at the top of its `FOREGENT.md`; a project that
+declares nothing is in bootstrap mode.
 
 Rebase, never merge: bootstrap mode must produce history clean enough to
-graduate a repository to full mode.
+graduate a repository to pull request mode.
 
 ### 6.5 Workspaces
 
@@ -374,8 +378,8 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   third place to disagree.
 - **A secondary workspace has no `.git`.** Raw `git`, `gh`, and the harness's
   git integration are blind inside one. The write paths do not need them:
-  `jj git push` reaches the shared git backend, and GitHub mode opens its pull
-  request through the GitHub MCP. What degrades is agent-side git
+  `jj git push` reaches the shared git backend, and Pull Request mode opens
+  its pull request through the GitHub MCP. What degrades is agent-side git
   convenience — a quality cost, not a correctness one.
 - **A bookmark moved inside one is invisible to git** until a mutating jj
   command runs at the colocated root. Bootstrap mode advances `main` from

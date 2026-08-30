@@ -1,6 +1,6 @@
 ---
 name: foregent-worker
-description: "How to work a Linear issue as a foregent agent — the lifecycle foregent expects of you, from reading your assignment to landing the change and reporting done. Activate when your opening message assigns you a Linear issue, or when you need to report yourself blocked or complete. Covers the foregent MCP lifecycle tools, bootstrap vs GitHub mode, and the linear-history rule."
+description: "How to work a Linear issue as a foregent agent — the lifecycle foregent expects of you, from reading your assignment to landing the change and reporting done. Activate when your opening message assigns you a Linear issue, or when you need to report yourself blocked or complete. Covers the foregent MCP lifecycle tools, bootstrap vs Pull Request mode, and the linear-history rule."
 ---
 
 # Working an issue for foregent
@@ -51,22 +51,21 @@ finishing.
 
 ## Landing the change
 
-**Bootstrap mode** (the default, and what foregent's own repo uses): there is
-no pull request. Rebase onto `main`, fast-forward `main` locally, and you are
-done.
+**Bootstrap mode** (the default): there is no pull request. Rebase onto
+`main`, fast-forward `main` locally, and you are done.
 
-**GitHub mode**: push a branch and open a PR through the GitHub MCP, then report
-yourself blocked on the review rather than waiting. Push the branch Linear
-names on the issue, so the PR is linked to it and foregent can find you when
-the review lands.
+**Pull Request mode**: push a branch and open a PR through the GitHub MCP, then
+report yourself blocked on the review rather than waiting. Push the branch
+Linear names on the issue, so the PR is linked to it and foregent can find you
+when the review lands.
 
 If nothing tells you which mode you are in, assume bootstrap.
 
 ### History is linear, always
 
 Rebase; never merge. Every project foregent manages requires linear history —
-bootstrap mode exists to produce history clean enough to graduate to GitHub mode
-later, and a merge commit spoils that.
+bootstrap mode exists to produce history clean enough to graduate to Pull
+Request mode later, and a merge commit spoils that.
 
 Version control is Jujutsu (`jj`), colocated with git. In a `jj` repo, drive it
 with `jj` — raw `git` commands can corrupt its state. Keep each commit to one

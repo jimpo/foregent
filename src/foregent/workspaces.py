@@ -15,7 +15,7 @@ established by driving jj 0.43 directly:
 
 - It has no ``.git``. Raw ``git`` and ``gh`` are blind inside one, which the
   write paths survive because ``jj git push`` reaches the shared git backend
-  and GitHub mode opens its pull request over the API.
+  and Pull Request mode opens its pull request over the API.
 - A bookmark it moves is **not exported to git** until a mutating jj command
   runs at the colocated root. Bootstrap mode advances ``main`` from inside the
   workspace, so :func:`destroy` is what publishes the agent's work to git —
