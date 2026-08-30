@@ -1,4 +1,4 @@
-"""Tests for the Linear webhook endpoint (JIM-128, JIM-133).
+"""Tests for the webhook endpoints (JIM-128, JIM-133, JIM-139).
 
 Driven over HTTP rather than by calling the handler, because the thing under
 test is what arrives on the wire: the exact bytes of the body, and a header
@@ -24,7 +24,7 @@ from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from foregent import linear, server
+from foregent import github, linear, server
 from foregent.agents import AgentRef
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
@@ -41,6 +41,11 @@ PAYLOAD = {
 
 def sign(body: bytes, secret: str = SECRET) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
+def sign_github(body: bytes, secret: str = SECRET) -> str:
+    """The same digest, prefixed the way GitHub names the algorithm it used."""
+    return f"sha256={sign(body, secret)}"
 
 
 class WebhookAuthenticTests(unittest.TestCase):
@@ -277,6 +282,43 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.deliver(self.comment())
         self.deliver(self.comment())
         self.viewer.assert_called_once()
+
+
+class GitHubWebhookAuthenticTests(unittest.TestCase):
+    """The signature check itself (JIM-139)."""
+
+    def setUp(self) -> None:
+        self.enterContext(
+            mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": SECRET})
+        )
+
+    def test_a_signature_over_the_body_is_authentic(self) -> None:
+        body = b'{"action":"opened"}'
+        self.assertTrue(github.webhook_authentic(body, sign_github(body)))
+
+    def test_a_signature_for_other_bytes_is_not(self) -> None:
+        # The delivery GitHub signed is not the one that arrived.
+        self.assertFalse(
+            github.webhook_authentic(b'{"action":"closed"}', sign_github(b"{}"))
+        )
+
+    def test_another_secret_is_not(self) -> None:
+        body = b"{}"
+        self.assertFalse(github.webhook_authentic(body, sign_github(body, "wrong")))
+
+    def test_the_digest_alone_is_not(self) -> None:
+        # GitHub always names the algorithm, so a bare hex digest is not a
+        # signature it sent — and comparing without the prefix would accept
+        # the same digest under any algorithm a caller cared to claim.
+        body = b"{}"
+        self.assertFalse(github.webhook_authentic(body, sign(body)))
+
+    def test_an_unset_secret_refuses_rather_than_accepts(self) -> None:
+        # A bridge that cannot check a signature must not wave the body
+        # through; the caller turns this into a 503.
+        with mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": ""}):
+            with self.assertRaises(github.GitHubError):
+                github.webhook_authentic(b"{}", "")
 
 
 if __name__ == "__main__":
