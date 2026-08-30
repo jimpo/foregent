@@ -13,6 +13,21 @@ from enum import StrEnum
 from foregent.agents import AgentRef
 
 
+class Mode(StrEnum):
+    """How a project wants its work landed.
+
+    Derived from the repo's git remotes rather than declared anywhere
+    (:func:`foregent.workspaces.mode_for`), and named to the agent in its
+    brief, so the two halves of the contract cannot disagree.
+    """
+
+    # The agent commits on top of `main` and stops there; the bridge moves the
+    # bookmark when the issue completes.
+    BOOTSTRAP = "bootstrap"
+    # The agent pushes a branch, opens a pull request, and parks on the review.
+    PULL_REQUEST = "pull-request"
+
+
 class IssueStatus(StrEnum):
     """Lifecycle state of an issue as foregent sees it.
 

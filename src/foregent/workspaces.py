@@ -39,6 +39,7 @@ import tempfile
 from pathlib import Path
 
 from foregent import config, mcp_servers
+from foregent.models import Mode
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ TRUNK = "main"
 # foregent's, so a project already carrying files into `claude --worktree`
 # checkouts gets the same set here with nothing to configure twice.
 INCLUDE_FILE = ".worktreeinclude"
+
+# The remote whose URL decides a project's mode, and what makes that URL a
+# GitHub one. `origin` is git's own name for the remote a repo was cloned
+# from, so a project with a pull request to open has one; a repo with no
+# remote at all has nowhere to open one.
+ORIGIN = "origin"
+GITHUB = "github.com"
 
 # Per-call budget for a jj subprocess. Creating a workspace writes a whole
 # working copy, so this is generous; it exists to stop a wedged jj from
@@ -71,6 +79,40 @@ def is_repo(directory: Path) -> bool:
     no subprocess and gives the same answer on a box with no jj installed.
     """
     return (directory / ".jj").is_dir()
+
+
+def mode_for(repo: Path) -> Mode:
+    """How ``repo`` wants its work landed, read off its git remotes.
+
+    Pull Request mode needs somewhere to open a pull request, so the question
+    is whether one exists: an ``origin`` remote on GitHub means yes, and
+    anything else — no remotes, an ``origin`` hosted elsewhere, a directory
+    that is not a jj repo at all — means bootstrap, which needs nothing.
+    ``github.com`` is matched anywhere in the URL, which covers the HTTPS and
+    the SSH spelling alike.
+
+    Derived rather than declared: a project that says one thing in a file and
+    another in its remotes can only disagree with itself, and both halves of
+    the contract — the mode the agent is briefed with (:func:`
+    foregent.server.brief_for`) and the one the bridge completes it in — come
+    from here.
+
+    A jj command that fails answers bootstrap rather than raising. Refusing to
+    dispatch over an unreadable remote list would be a worse answer than
+    dispatching an agent that commits locally.
+    """
+    if not is_repo(repo):
+        return Mode.BOOTSTRAP
+    try:
+        listed = _jj(repo, "git", "remote", "list")
+    except WorkspaceError as exc:
+        logger.warning("could not read %s's git remotes: %s", repo, exc)
+        return Mode.BOOTSTRAP
+    for line in listed.splitlines():
+        name, _, url = line.partition(" ")
+        if name == ORIGIN and GITHUB in url:
+            return Mode.PULL_REQUEST
+    return Mode.BOOTSTRAP
 
 
 def path_for(key: str) -> Path:

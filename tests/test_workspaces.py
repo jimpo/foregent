@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from foregent import workspaces
+from foregent.models import Mode
 
 JJ = shutil.which("jj")
 
@@ -206,6 +207,65 @@ class WorkspaceTest(unittest.TestCase):
                 workspaces.create(self.repo, "JIM-1")
 
         self.assertIn("no-such-bookmark", str(caught.exception))
+
+
+@unittest.skipUnless(JJ, "jj is not installed")
+class ModeTest(unittest.TestCase):
+    """Reading a project's mode off its git remotes (JIM-152).
+
+    The mode is a claim about what ``jj git remote list`` prints, so these
+    drive a real jj against throwaway repos rather than a stubbed one.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        jj(self.repo, "git", "init")
+
+    def remote(self, name: str, url: str) -> None:
+        jj(self.repo, "git", "remote", "add", name, url)
+
+    def test_a_github_origin_is_pull_request_mode(self) -> None:
+        self.remote("origin", "https://github.com/jimpo/foregent")
+
+        self.assertIs(workspaces.mode_for(self.repo), Mode.PULL_REQUEST)
+
+    def test_an_ssh_github_origin_is_pull_request_mode(self) -> None:
+        """The SSH spelling names the same host and means the same thing."""
+        self.remote("origin", "git@github.com:jimpo/foregent.git")
+
+        self.assertIs(workspaces.mode_for(self.repo), Mode.PULL_REQUEST)
+
+    def test_a_repo_with_no_remotes_is_bootstrap(self) -> None:
+        self.assertIs(workspaces.mode_for(self.repo), Mode.BOOTSTRAP)
+
+    def test_an_origin_off_github_is_bootstrap(self) -> None:
+        """There is no pull request to open where the GitHub MCP cannot reach."""
+        self.remote("origin", "https://gitlab.com/jimpo/foregent.git")
+
+        self.assertIs(workspaces.mode_for(self.repo), Mode.BOOTSTRAP)
+
+    def test_a_github_remote_that_is_not_origin_is_bootstrap(self) -> None:
+        """Only ``origin`` decides; a fork or an upstream is not the project."""
+        self.remote("upstream", "https://github.com/someone/foregent.git")
+
+        self.assertIs(workspaces.mode_for(self.repo), Mode.BOOTSTRAP)
+
+    def test_a_non_jj_directory_is_bootstrap(self) -> None:
+        """jj cannot be asked, and bootstrap is the mode that needs nothing."""
+        plain = self.tmp / "plain"
+        plain.mkdir()
+
+        self.assertIs(workspaces.mode_for(plain), Mode.BOOTSTRAP)
+
+    def test_a_failing_jj_answers_bootstrap(self) -> None:
+        """An unreadable remote list dispatches an agent rather than nothing."""
+        with mock.patch.object(
+            workspaces, "_jj", side_effect=workspaces.WorkspaceError("boom")
+        ):
+            self.assertIs(workspaces.mode_for(self.repo), Mode.BOOTSTRAP)
 
 
 def _names(repo: Path) -> list[str]:
