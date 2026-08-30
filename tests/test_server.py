@@ -784,6 +784,23 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(cwd.exists())
 
+    async def test_completion_removes_a_workspace_recovered_after_a_restart(
+        self,
+    ) -> None:
+        # The bridge is restarted between dispatch and completion — the way an
+        # operator picks up a merged change — so the issue foregent completes
+        # is the one `rebuild_store` reconstructed from the live agent, not
+        # the one dispatch wrote (JIM-150).
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        server.store = IssueStore()
+        server.rebuild_store()
+
+        await server.complete_task("JIM-88")
+
+        self.assertFalse(cwd.exists())
+
     async def test_the_workspace_outlives_the_agent_that_used_it(self) -> None:
         # Removing a live agent's own cwd is worse than leaking a directory,
         # so teardown waits for the stop.

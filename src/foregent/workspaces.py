@@ -78,6 +78,31 @@ def path_for(key: str) -> Path:
     return config.workspace_root() / key
 
 
+def repo_for(path: Path) -> Path | None:
+    """The repo the workspace at ``path`` belongs to, or ``None`` if it is not one.
+
+    A secondary workspace's ``.jj/repo`` is a *file* naming the shared repo
+    directory, written relative to the ``.jj`` that holds it; the repo root is
+    that directory's grandparent. Reading it is what lets foregent tear a
+    workspace down after a restart, where the agent's cwd is recoverable from
+    the harness but the repo it was built from is remembered nowhere
+    (:func:`foregent.server.rebuild_store`).
+
+    Anything else answers ``None`` and is left alone: a repo's own root, whose
+    ``.jj/repo`` is a directory rather than a file, and a plain directory
+    foregent ran an agent in because the project is not a jj repo at all.
+    """
+    jj = path / ".jj"
+    try:
+        named = (jj / "repo").read_text().strip()
+    except OSError:
+        return None
+    # `named` is absolute in some jj versions and relative to `.jj` in others;
+    # joining handles both, since a `/` with an absolute right-hand side is
+    # that path.
+    return (jj / named).resolve().parent.parent
+
+
 def create(repo: Path, key: str) -> Path:
     """Build a fresh workspace for ``key`` under ``repo`` and return its path.
 

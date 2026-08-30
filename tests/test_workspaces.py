@@ -90,6 +90,27 @@ class WorkspaceTest(unittest.TestCase):
         self.assertFalse((second / "leftover.txt").exists())
         self.assertEqual(_names(self.repo).count("JIM-1"), 1)
 
+    def test_the_repo_is_readable_back_out_of_a_workspace(self) -> None:
+        """What the workspace knows is enough to tear it down (JIM-150).
+
+        The repo a workspace was built from is remembered nowhere that
+        survives a bridge restart, so teardown reads it off the workspace
+        itself.
+        """
+        path = workspaces.create(self.repo, "JIM-1")
+
+        self.assertEqual(workspaces.repo_for(path), self.repo.resolve())
+
+    def test_a_directory_that_is_no_workspace_names_no_repo(self) -> None:
+        # The repo's own root among them: its `.jj/repo` is a directory, and
+        # answering with itself would invite a teardown that deletes the
+        # project.
+        plain = self.tmp / "elsewhere"
+        plain.mkdir()
+
+        self.assertIsNone(workspaces.repo_for(self.repo))
+        self.assertIsNone(workspaces.repo_for(plain))
+
     def test_destroy_removes_the_workspace(self) -> None:
         path = workspaces.create(self.repo, "JIM-1")
 
