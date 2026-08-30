@@ -278,9 +278,14 @@ labels, finding every live agent including parked ones.
 
 It recovers no more than that. Every agent returns as In Progress, because
 the label does not record that it was blocked, and titles, blockers and
-conversation ids are lost. So is the repo each workspace was built from: the
-agent's cwd comes back, but not what it was made from, so a restarted bridge
-cannot tear that workspace down (§6.5).
+conversation ids are lost.
+
+The repo each workspace was built from is not lost with them, because it is
+not recovered from the label at all: a secondary workspace's `.jj/repo` names
+the repo it belongs to, so the agent's cwd is read for it (§6.5). Teardown
+needs that repo to forget the workspace, and a restart between dispatch and
+completion is the ordinary case rather than the exception — the operator
+merges an agent's pull request and restarts the bridge on the change.
 
 Unbuilt: orphan reconciliation — querying Linear on boot for owned in-flight
 issues, moving the ones whose agents are gone to Orphaned, and re-dispatching
@@ -386,6 +391,12 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   inside the workspace, so **teardown is what publishes the work to git**, and
   `forget` runs even when the workspace directory is already gone. This is why
   a failed teardown is reported rather than passed over (§4.3).
+- **A secondary workspace names the repo it belongs to.** Its `.jj/repo` is a
+  file holding the path of the shared repo directory, so the repo a teardown
+  has to run `forget` in is read back out of the agent's cwd instead of
+  remembered. That is what makes a restart between dispatch and completion
+  survivable (§5.4). A repo's own root answers nothing — there `.jj/repo` is a
+  directory — so nothing mistakes a project for a disposable workspace.
 
 A fresh workspace holds only what version control tracks, so the untracked
 files a project needs to run — `.env`, a local settings file, a key — are not
@@ -416,10 +427,6 @@ consequences follow from that choice:
 - **A listed file that cannot be copied fails the dispatch.** Launching an
   agent quietly missing the credentials the operator asked to be there is the
   worse failure, and the only one nobody would notice.
-
-Unbuilt: teardown after a restart. The agent's cwd is recovered from herdr but
-the repo it was made from is not (§5.4), so a workspace whose bridge restarted
-is left for the next dispatch of that key to reclaim.
 
 The pool is deliberately absent. Capacity is one concurrent agent (§5.2), so N
 slots with issue-keyed acquisition would be structure for a number that never

@@ -137,16 +137,20 @@ def rebuild_store() -> None:
         # prevent double-launch. A BLOCKED issue also holds a live agent, but
         # distinguishing that (and full orphan reconciliation) is out of scope
         # here.
-        # `repo` is left empty: the agent's cwd is recoverable but the repo the
-        # workspace was made from is not, so a restart cannot tear that
-        # workspace down. It goes with the rest of the durable per-issue
-        # metadata (docs/ARCHITECTURE.md §1.4); until then the leak is
-        # reclaimed by the next dispatch for that key.
+        # `repo` is read back out of the workspace the agent is sitting in,
+        # not remembered: a restart between dispatch and completion is the
+        # ordinary case — the operator merges an agent's pull request and
+        # picks the change up — and teardown needs the repo to forget the
+        # workspace, so recovering an issue without it leaked a workspace
+        # every time (JIM-150). Empty for an agent whose cwd is not a
+        # workspace, which is the answer teardown wants there too.
+        repo = workspaces.repo_for(Path(record.cwd)) if record.cwd else None
         store.add(
             Issue(
                 key=key,
                 title="",
                 status=IssueStatus.IN_PROGRESS,
+                repo=str(repo) if repo else "",
                 directory=record.cwd,
                 agent=record.ref,
             )
