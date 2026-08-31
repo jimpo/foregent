@@ -226,6 +226,10 @@ foregent queue JIM-42 -d ~/src/myrepo   # queue an issue against a repo
 foregent status                         # what is tracked, and its state
 ```
 
+`status` heads its table with when Linear last delivered. Agents are woken by
+webhook and nothing else, so a hook that has stopped looks exactly like a
+quiet morning; a timestamp hours old is what tells the two apart.
+
 `queue` records the issue and dispatches it if there is capacity. **How many
 agents run at once is the project's mode**: bootstrap mode is one at a time,
 because the bridge advances `main` onto each agent's work and the next
@@ -311,7 +315,7 @@ state.
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 326 unit tests, ~6s
+uv run python -m unittest discover -s tests -t .   # 340 unit tests, ~6s
 uv run ty check                                    # type check
 ```
 

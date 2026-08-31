@@ -26,6 +26,7 @@ import threading
 import time
 import unittest
 from collections import deque
+from datetime import datetime
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -125,6 +126,8 @@ class WebhookRouteTests(unittest.TestCase):
         self.enterContext(
             mock.patch.object(server, "_recent", deque(maxlen=server.RECENT_DELIVERIES))
         )
+        # As is the last-delivery mark, which starts each test unset.
+        self.enterContext(mock.patch.object(server, "_last_delivery", ""))
 
     def post(self, body: bytes, signature: str | None):
         headers = {"Content-Type": "application/json"}
@@ -197,6 +200,8 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.enterContext(
             mock.patch.object(server, "_recent", deque(maxlen=server.RECENT_DELIVERIES))
         )
+        # As is the last-delivery mark, which starts each test unset.
+        self.enterContext(mock.patch.object(server, "_last_delivery", ""))
 
     def track(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
         """Put ``KEY`` in the store with an agent behind it."""
@@ -217,6 +222,10 @@ class WebhookDeliveryTests(unittest.TestCase):
             "actor": {"id": actor, "name": "AJ"},
             "data": {"body": "ship it", "issue": {"identifier": key}},
         }
+
+    def last_delivery(self) -> str:
+        """When the server says Linear last delivered to it."""
+        return self.client.get("/health").json()["last_linear_delivery"]
 
     def deliver(self, payload: dict):
         """Post ``payload`` signed, then hand what it queued to the agents."""
@@ -350,6 +359,28 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.deliver(dict(payload, webhookTimestamp=time.time() * 1000))
         self.deliver(payload)
         self.assertEqual(len(self.manager.sent), 3)
+
+    def test_when_linear_last_delivered_is_readable(self) -> None:
+        # Nothing else on the surface separates a hook that has stopped from a
+        # quiet morning, so an authentic delivery has to leave a mark.
+        self.assertEqual(self.last_delivery(), "")
+        self.deliver(self.comment())
+        self.assertAlmostEqual(
+            datetime.fromisoformat(self.last_delivery()).timestamp(),
+            time.time(),
+            delta=60,
+        )
+
+    def test_a_delivery_that_reaches_nobody_still_counts_as_one(self) -> None:
+        # Liveness is the webhook's, not any agent's: most of what Linear
+        # sends is about issues nobody here is working, and that is a
+        # delivering hook all the same.
+        self.deliver(self.comment(key="JIM-999"))
+        self.assertNotEqual(self.last_delivery(), "")
+
+    def test_a_delivery_that_proves_nothing_does_not_count(self) -> None:
+        self.client.post("/webhooks/linear", content=b"{}")
+        self.assertEqual(self.last_delivery(), "")
 
     def test_a_delivery_about_no_issue_is_accepted_and_dropped(self) -> None:
         self.track()

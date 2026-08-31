@@ -181,6 +181,11 @@ Linear posts to `POST /webhooks/linear`. The body is authenticated by
 HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. Push is
 the whole of foregent's inbound path: nothing asks Linear what changed.
 
+When an authentic delivery last arrived is recorded and served from
+`GET /health`, which `foregent status` prints above its table. Push is the
+only thing that wakes an agent, so a hook that has stopped delivering leaves a
+fleet that looks merely idle; the timestamp is what tells the two apart.
+
 A signature proves Linear sent these bytes, not that it sent them just now,
 so the delivery's own `webhookTimestamp` is checked against a one-minute
 window beside it and a delivery from outside that window is refused 400. Both
