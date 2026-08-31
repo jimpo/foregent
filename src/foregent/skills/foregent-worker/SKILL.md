@@ -47,7 +47,10 @@ rebase onto `main` and call the tool again.
    comment — you cannot ask.
 2. **Do the work.** How you break it up is your call: work straight through,
    or spawn subagents for parts of it. Foregent has no opinion and no worker
-   pool — there is nobody to hand tasks to but yourself.
+   pool — there is nobody to hand tasks to but yourself. An issue that already
+   has sub-issues arrives with that call made: the sub-issues are the plan. Do
+   them all yourself, as one pull request with **at least one commit per
+   sub-issue**, and close each sub-issue in Linear as its work lands.
 3. **Keep Linear current** as you go. Comment on meaningful findings and
    decisions; the issue is the only record an operator reads.
 4. **Land the change** per the project's mode (below).

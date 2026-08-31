@@ -15,10 +15,9 @@ logical change and make review easier.
   so on the ticket and in the commit message, then land the fix anyway. If you
   cannot reproduce it, comment with what you tried, cancel the ticket, and
   report the task complete.
-* **feature** — plan it and post the plan as a comment. If it is too large for
-  one pull request, split it into sub-issues, say so in a comment, and report
-  the task complete without writing code; foregent dispatches the sub-issues
-  separately.
+* **feature** — plan it and post the plan as a comment. If the ticket already
+  has sub-issues, they are the plan: do them all yourself in one pull request,
+  at least one commit per sub-issue, closing each sub-issue as its work lands.
 * **refactor** — cleanup, performance, quality, or preparing the ground for a
   feature. Handle it as a feature.
 * **design** — may be combined with feature or refactor, and **takes precedence
