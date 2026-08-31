@@ -11,8 +11,8 @@ The delivery half borrows the fake harness and the drainer from
 ``tests.test_server``: what a message does once it is queued is that module's
 subject, and what is queued for whom is this one's.
 
-The GitHub endpoint is receipt and authentication only, so its tests stop
-where it does: who a delivery reaches is JIM-141's subject.
+The GitHub half is the same, over a payload of its own: which deliveries the
+endpoint accepts, and what one maps to once it is in (JIM-141).
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from fastapi.testclient import TestClient
 
 from foregent import github, linear, server
 from foregent.agents import AgentRef
+from foregent.events import EventKind
 from foregent.models import Issue, IssueStatus
 from foregent.store import IssueStore
 from tests.test_server import FakeManager, drain_deliveries
@@ -518,3 +519,99 @@ class GitHubWebhookRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A pull request an agent opened for JIM-141, on the branch Linear named after
+# the issue and links the pull request by.
+BRANCH = "aj/jim-141-deliver-github-pr-updates-to-workers"
+AGENT_LOGIN = "foregent-bot"
+
+
+def review(
+    *,
+    branch: str = BRANCH,
+    sender: str = "jimpo",
+    state: str = "changes_requested",
+    body: str = "rename this",
+) -> dict:
+    return {
+        "action": "submitted",
+        "review": {"state": state, "body": body},
+        "pull_request": {
+            "number": 9,
+            "head": {"ref": branch},
+            "user": {"login": AGENT_LOGIN},
+        },
+        "repository": {"full_name": "jimpo/foregent"},
+        "sender": {"login": sender},
+    }
+
+
+def review_comment(**overrides) -> dict:
+    payload = {
+        "action": "created",
+        "comment": {"path": "src/foregent/github.py", "line": 42, "body": "why?"},
+        "pull_request": {
+            "number": 9,
+            "head": {"ref": BRANCH},
+            "user": {"login": AGENT_LOGIN},
+        },
+        "repository": {"full_name": "jimpo/foregent"},
+        "sender": {"login": "jimpo"},
+    }
+    payload.update(overrides)
+    return payload
+
+
+class GitHubWebhookEventTests(unittest.TestCase):
+    """What a GitHub delivery maps to, before anyone is looked up (JIM-141)."""
+
+    def test_a_submitted_review_carries_its_state_and_what_was_written(self) -> None:
+        event = github.webhook_event(review(), "pull_request_review")
+        assert event is not None
+        self.assertEqual(event.kind, EventKind.PR_REVIEW)
+        self.assertEqual(event.issue_key, "JIM-141")
+        self.assertEqual(event.repo, "jimpo/foregent")
+        self.assertEqual(event.number, 9)
+        self.assertEqual(event.author, "jimpo")
+        self.assertIn("changes requested", event.body)
+        self.assertIn("rename this", event.body)
+
+    def test_an_inline_comment_carries_the_line_it_hangs_off(self) -> None:
+        # The agent has to act on the feedback; the file and line are half of
+        # knowing what it is about.
+        event = github.webhook_event(review_comment(), "pull_request_review_comment")
+        assert event is not None
+        self.assertEqual(event.issue_key, "JIM-141")
+        self.assertIn("src/foregent/github.py:42", event.body)
+        self.assertIn("why?", event.body)
+
+    def test_the_issue_comes_from_the_branch_however_it_is_written(self) -> None:
+        # Linear lower-cases the key in the branch it names; a key written any
+        # other way reads the same.
+        self.assertEqual(github.issue_key(BRANCH), "JIM-141")
+        self.assertEqual(github.issue_key("JIM-141"), "JIM-141")
+        self.assertEqual(github.issue_key("jimpo/fix-the-thing"), "")
+
+    def test_the_pull_request_authors_own_review_comment_maps_to_nothing(self) -> None:
+        # The agent opened the pull request, so what it writes there comes
+        # back here as an event about its own issue. A wake that causes a
+        # write is a loop.
+        event = github.webhook_event(
+            review_comment(sender={"login": AGENT_LOGIN}), "pull_request_review_comment"
+        )
+        self.assertIsNone(event)
+
+    def test_deliveries_foregent_has_no_use_for_map_to_nothing(self) -> None:
+        for kind, payload in (
+            # An organization webhook carries every repository's every event.
+            ("push", {"ref": "refs/heads/main"}),
+            ("ping", {"zen": "Design for failure."}),
+            # A reviewer amending themselves is not new feedback to act on.
+            ("pull_request_review", review() | {"action": "edited"}),
+            ("pull_request_review_comment", review_comment(action="deleted")),
+            # The pull request opening and closing is foregent's own doing.
+            ("pull_request", review() | {"action": "opened"}),
+        ):
+            with self.subTest(kind=kind):
+                self.assertIsNone(github.webhook_event(payload, kind))
