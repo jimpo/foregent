@@ -7,8 +7,11 @@ settings the server needs.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_URL = "http://127.0.0.1:8577"
 
@@ -16,6 +19,11 @@ DEFAULT_API_URL = "http://127.0.0.1:8577"
 # a workspace is disposable and is removed when its issue completes, so it has
 # no business living inside the checkout it was made from.
 DEFAULT_WORKSPACE_ROOT = "~/.foregent/workspaces"
+
+# How many agents may work at once in Pull Request mode (JIM-151). Bootstrap
+# mode is one whatever this says, because it is the repo's trunk that
+# serialises it rather than a policy anyone can raise.
+DEFAULT_MAX_AGENTS = 3
 
 
 def api_url() -> str:
@@ -31,6 +39,31 @@ def workspace_root() -> Path:
     """
     root = os.environ.get("FOREGENT_WORKSPACE_ROOT") or DEFAULT_WORKSPACE_ROOT
     return Path(root).expanduser()
+
+
+def max_agents() -> int:
+    """How many agents may run at once (``FOREGENT_MAX_AGENTS``).
+
+    The lever an operator has over a box: every parked agent goes on holding
+    its slot, so in Pull Request mode this is really the number of pull
+    requests that may be open and waiting for review at once, and what one box
+    and one reviewer can carry is the thing being tuned.
+
+    **Never less than one.** A value that cannot be read, or reads as zero,
+    would otherwise stop dispatch on the whole box with nothing to say why.
+    """
+    setting = os.environ.get("FOREGENT_MAX_AGENTS")
+    if not setting:
+        return DEFAULT_MAX_AGENTS
+    try:
+        return max(1, int(setting))
+    except ValueError:
+        logger.warning(
+            "FOREGENT_MAX_AGENTS is %r, which is not a number; running %d agents",
+            setting,
+            DEFAULT_MAX_AGENTS,
+        )
+        return DEFAULT_MAX_AGENTS
 
 
 def herdr_session() -> str | None:

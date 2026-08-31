@@ -29,8 +29,8 @@ from foregent.agents import (
     AgentStatus,
     LaunchSpec,
 )
-from foregent.models import Issue, IssueStatus
-from foregent.store import IssueStore
+from foregent.models import Issue, IssueStatus, Mode
+from foregent.store import IN_FLIGHT, IssueStore
 from foregent.workspaces import WorkspaceError
 
 
@@ -118,15 +118,16 @@ def drain_events(manager: FakeManager) -> None:
 
 
 def drain_deliveries() -> None:
-    """Run the delivery drainer until everything queued has been handled.
+    """Wait until every queued delivery has been handled.
 
-    Bounded, because the drainer is endless by design: a delivery that never
-    finishes fails the test instead of hanging it.
+    The drainers start themselves on the first delivery to an issue, so this
+    only waits. Bounded, because a drainer is endless by design: a delivery
+    that never finishes fails the test instead of hanging it.
     """
-    server.watch_deliveries()
-    waiter = threading.Thread(target=server.deliveries.join, daemon=True)
-    waiter.start()
-    waiter.join(timeout=5)
+    for pending in list(server.deliveries.values()):
+        waiter = threading.Thread(target=pending.join, daemon=True)
+        waiter.start()
+        waiter.join(timeout=5)
 
 
 class DispatchTests(unittest.TestCase):
@@ -277,12 +278,96 @@ class DispatchTests(unittest.TestCase):
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
 
-    def test_capacity_is_one_agent(self) -> None:
+    def pull_request(self) -> None:
+        """Read every repo in this test as Pull Request mode."""
+        self.enterContext(
+            mock.patch.object(
+                server.workspaces, "mode_for", return_value=Mode.PULL_REQUEST
+            )
+        )
+
+    def test_bootstrap_mode_runs_one_agent_at_a_time(self) -> None:
+        # `main` is the bridge's to advance and every workspace is built on it,
+        # so a second bootstrap agent would branch from a commit the first is
+        # about to move past. The directories here are not jj repos, which is
+        # bootstrap (JIM-151).
         self.queue("JIM-88", "/ws/JIM-88")
         server.dispatch()
         self.queue("JIM-89", "/ws/JIM-89")
         server.dispatch()
         self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+    def test_pull_request_mode_runs_several_agents_at_once(self) -> None:
+        # Nothing in the repo serialises them: each pushes its own branch and
+        # `main` is the reviewer's to move. One dispatch drains the queue.
+        self.pull_request()
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+
+        server.dispatch()
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched],
+            ["fg-jim-88", "fg-jim-89", "fg-jim-90"],
+        )
+
+    def test_pull_request_mode_stops_at_the_limit(self) -> None:
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+
+        server.dispatch()
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
+        )
+
+    def test_a_parked_agent_still_holds_one_of_several_slots(self) -> None:
+        # A blocked agent is alive in its workspace holding a pane, so parking
+        # frees nothing here either (JIM-151).
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+        server.dispatch()
+
+        server.store.block("JIM-88", "a review of the PR")
+        server.dispatch()
+
+        self.assertEqual(len(self.manager.launched), 2)
+
+    def test_a_queued_bootstrap_issue_stalls_the_queue_behind_it(self) -> None:
+        # Strictly FIFO: the head is never skipped, so the pull-request issue
+        # behind it waits too rather than queue order becoming policy.
+        modes = {"/bs/repo": Mode.BOOTSTRAP, "/pr/repo": Mode.PULL_REQUEST}
+        self.enterContext(
+            mock.patch.object(
+                server.workspaces, "mode_for", lambda repo: modes[str(repo)]
+            )
+        )
+        self.queue("JIM-88", "/pr/repo")
+        server.dispatch()
+
+        self.queue("JIM-89", "/bs/repo")
+        self.queue("JIM-90", "/pr/repo")
+        server.dispatch()
+
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+    def test_one_completion_starts_everything_the_queue_was_waiting_on(self) -> None:
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90", "JIM-91"):
+            self.queue(key, "/ws/repo")
+        server.dispatch()
+
+        server.complete_issue("JIM-88")
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched],
+            ["fg-jim-88", "fg-jim-89", "fg-jim-90"],
+        )
 
     def test_a_parked_agent_still_holds_its_slot(self) -> None:
         # A blocked agent is alive in its workspace, so it must keep occupying
@@ -294,6 +379,25 @@ class DispatchTests(unittest.TestCase):
         server.dispatch()
         self.assertEqual(len(self.manager.launched), 1)
 
+    def test_dispatch_waits_for_a_dispatch_already_running(self) -> None:
+        # Dispatch reads the store for a free slot and writes the launched
+        # agent back several harness calls later, so a second caller that ran
+        # in that window would read a store nobody had written yet and launch
+        # the same issue again. Holding the lock here stands in for the first
+        # caller being mid-launch.
+        self.queue()
+        launched = threading.Event()
+
+        with server._dispatching:
+            threading.Thread(
+                target=lambda: (server.dispatch(), launched.set()), daemon=True
+            ).start()
+            self.assertFalse(launched.wait(0.2))
+            self.assertEqual(self.manager.launched, [])
+
+        self.assertTrue(launched.wait(5))
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
     def test_completing_an_issue_dispatches_the_next(self) -> None:
         self.queue()
         server.dispatch()
@@ -304,6 +408,30 @@ class DispatchTests(unittest.TestCase):
         )
 
 
+class ModeTests(unittest.TestCase):
+    """The mode an issue is briefed in and completed in (JIM-151)."""
+
+    def test_an_issue_with_no_repo_is_bootstrap_without_reading_a_repo(self) -> None:
+        # `Path("")` is the current directory, so an unguarded lookup reads the
+        # bridge's *own* checkout — foregent's, which has an origin on GitHub.
+        def never(repo: Path) -> Mode:
+            raise AssertionError(f"read the mode of {repo}")
+
+        with mock.patch.object(server.workspaces, "mode_for", never):
+            mode = server.mode_of(Issue(key="JIM-88", title=""))
+
+        self.assertIs(mode, Mode.BOOTSTRAP)
+
+    def test_an_issue_with_a_repo_is_the_mode_its_remotes_name(self) -> None:
+        with mock.patch.object(
+            server.workspaces, "mode_for", return_value=Mode.PULL_REQUEST
+        ) as mode_for:
+            mode = server.mode_of(Issue(key="JIM-88", title="", repo="/ws/repo"))
+
+        self.assertIs(mode, Mode.PULL_REQUEST)
+        mode_for.assert_called_once_with(Path("/ws/repo"))
+
+
 class DeliverTests(unittest.TestCase):
     """Queueing an event for the agent it was for (JIM-131, JIM-132)."""
 
@@ -311,9 +439,9 @@ class DeliverTests(unittest.TestCase):
         server.store = IssueStore()
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
-        # A queue per test, so a drainer left over from an earlier one cannot
-        # take this test's messages.
-        self.enterContext(mock.patch.object(server, "deliveries", queue.Queue()))
+        # A fresh set of queues per test, so a drainer left over from an
+        # earlier one cannot take this test's messages.
+        self.enterContext(mock.patch.object(server, "deliveries", {}))
         # The drainer paces its retries against a real agent's turn; nothing
         # here is really busy.
         self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
@@ -474,6 +602,54 @@ class DeliverTests(unittest.TestCase):
             drain_deliveries()
         self.assertEqual(self.manager.sent, [(self.ref, "second")])
 
+    def test_an_unreachable_agent_does_not_hold_up_another_agents_messages(
+        self,
+    ) -> None:
+        # One queue for the fleet meant the first stuck send silenced every
+        # agent behind it, because a refused message is offered again until
+        # its agent is gone (JIM-151).
+        stuck = AgentRef("fg-jim-88", "conversation-1")
+        free = AgentRef("fg-jim-89", "conversation-2")
+        server.store.add(
+            Issue(key="JIM-88", title="", status=IssueStatus.IN_PROGRESS, agent=stuck)
+        )
+        server.store.add(
+            Issue(key="JIM-89", title="", status=IssueStatus.IN_PROGRESS, agent=free)
+        )
+        held = threading.Event()
+        sent = self.manager.send
+
+        def hold(ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
+            if ref == stuck:
+                held.wait(5)
+            sent(ref, text, when_idle=when_idle)
+
+        self.enterContext(mock.patch.object(self.manager, "send", hold))
+        self.addCleanup(held.set)
+
+        server.deliver_issue("JIM-88", "wedged")
+        server.deliver_issue("JIM-89", "go on")
+
+        waiter = threading.Thread(
+            target=server.deliveries["JIM-89"].join, daemon=True
+        )
+        waiter.start()
+        waiter.join(timeout=5)
+        self.assertEqual(self.manager.sent, [(free, "go on")])
+
+    def test_a_completed_issue_stops_its_drainer(self) -> None:
+        self.work()
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        drain_deliveries()
+
+        server.stop_deliveries("JIM-88")
+
+        self.assertEqual(server.deliveries, {})
+        for thread in threading.enumerate():
+            if thread.name == "foregent-deliveries-JIM-88":
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+
     def test_delivering_does_not_dispatch_anything_else(self) -> None:
         # The agent held its capacity slot the whole time, parked or not , so
         # prompting it frees nothing.
@@ -487,7 +663,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_a_queued_issue_is_a_conflict(self) -> None:
         # Nothing is running yet: the brief at dispatch is what it will read.
@@ -495,7 +671,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_an_orphaned_issue_is_a_conflict(self) -> None:
         self.work()
@@ -503,7 +679,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_a_completed_issue_is_a_conflict(self) -> None:
         # Done keeps the ref of the agent foregent has since stopped, so the
@@ -513,7 +689,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
         # `block()` upserts an unknown key, so an issue can carry a blocker
@@ -522,7 +698,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
 
 class CheckHerdrProtocolTests(unittest.TestCase):
@@ -712,8 +888,7 @@ class WatchAgentsTests(unittest.TestCase):
             AgentEvent(AgentEventKind.EXITED, AgentRef("fg-jim-88"), AgentStatus.GONE)
         ]
         self.watch(manager)
-        occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
-        self.assertFalse(any(i.status in occupied for i in server.store))
+        self.assertFalse(any(i.status in IN_FLIGHT for i in server.store))
 
 
 @unittest.skipUnless(shutil.which("jj"), "jj is not installed")

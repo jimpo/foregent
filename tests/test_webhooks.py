@@ -22,6 +22,7 @@ import hmac
 import json
 import os
 import queue
+import threading
 import unittest
 from unittest import mock
 
@@ -140,7 +141,7 @@ class WebhookDeliveryTests(unittest.TestCase):
         server.store = IssueStore()
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
-        self.enterContext(mock.patch.object(server, "deliveries", queue.Queue()))
+        self.enterContext(mock.patch.object(server, "deliveries", {}))
         # The account id is remembered process-wide, so each test starts
         # without one and says for itself whether Linear can be asked.
         self.enterContext(mock.patch.object(server, "_viewer", ""))
@@ -226,13 +227,28 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.assertIn("state: state-was → Todo", text)
 
     def test_the_route_answers_before_the_agent_is_sent_anything(self) -> None:
-        # Linear retries a delivery the bridge is slow to answer, so the
-        # route queues and returns; the send waits on the agent elsewhere.
+        # Linear retries a delivery the bridge is slow to answer, so the route
+        # queues and returns; the send waits on the agent elsewhere. Held
+        # inside the send, so the route is answering while a delivery it
+        # started is provably still outstanding.
         self.track()
+        sending = threading.Event()
+        holding = threading.Event()
+        sent = self.manager.send
+
+        def hold(ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
+            sending.set()
+            holding.wait(5)
+            sent(ref, text, when_idle=when_idle)
+
+        self.enterContext(mock.patch.object(self.manager, "send", hold))
+        self.addCleanup(holding.set)
+
         response = self.post(self.comment())
+
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(sending.wait(5))
         self.assertEqual(self.manager.sent, [])
-        self.assertEqual(server.deliveries.qsize(), 1)
 
     def test_a_comment_on_an_untracked_issue_reaches_nobody_and_is_accepted(
         self,
@@ -278,7 +294,7 @@ class WebhookDeliveryTests(unittest.TestCase):
         with self.assertLogs(server.logger, "ERROR"):
             response = self.post(self.comment())
         self.assertEqual(response.status_code, 503)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_foregents_own_id_is_asked_for_once(self) -> None:
         self.track()

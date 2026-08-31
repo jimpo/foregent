@@ -7,8 +7,9 @@ Queued issues are dispatched to agents as capacity allows, through the
 harness.
 ``/webhooks/linear`` receives what Linear pushes about the issues foregent is
 tracking, so an agent sees activity on its own issue whether it is working or
-parked. Events reach an agent through a queue drained by a daemon thread, so
-whoever ingested one is never held behind an agent that is mid-turn.
+parked. Events reach an agent through its own queue, drained by a daemon
+thread, so whoever ingested one is never held behind an agent that is mid-turn
+and no agent is held behind another.
 ``/webhooks/github`` is the same door for what GitHub pushes about the pull
 requests those agents open; it authenticates a delivery and, for now, stops
 there.
@@ -68,7 +69,6 @@ async def lifespan(_app: FastAPI):
     await run_in_threadpool(check_agent_mcp)
     await run_in_threadpool(rebuild_store)
     watch_agents()
-    watch_deliveries()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -89,13 +89,25 @@ store = IssueStore()
 # wholesale to change harness.
 manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
 
-# Events waiting for the agent they are for, oldest first. One queue and one
-# drainer, so two events for one agent reach it one at a time and in the order
-# they were written, and whoever ingested them waited on neither. A long wait
-# on one agent therefore holds up deliveries to another; capacity is one agent,
-# so there is no other agent to hold up, and a queue per agent is the change
-# when capacity grows.
-deliveries: queue.Queue[tuple[str, str]] = queue.Queue()
+# Events waiting for the agent they are for, one queue per issue key, oldest
+# first. Each has a drainer of its own, so two events for one agent reach it
+# one at a time and in the order they were written, whoever ingested them
+# waited on neither, and an agent that cannot be reached delays only its own
+# messages. `None` is the sentinel that ends a drainer.
+deliveries: dict[str, queue.Queue[str | None]] = {}
+
+# Guards the dict above, not the queues in it: a queue is created on the first
+# delivery to an issue, and two deliveries arriving together must find the same
+# one rather than start two drainers for one agent.
+_deliveries_lock = threading.Lock()
+
+# Held for the whole of one dispatch. Dispatch reads the store for a free slot
+# and writes the launched agent back only after several harness calls, so two
+# callers arriving together would both read a store neither has written yet and
+# launch the same issue twice. Launches are therefore serial even when several
+# slots are free, which also keeps concurrent `jj workspace add` off one repo.
+# ponytail: one lock for the fleet; per-repo locks if launch latency matters.
+_dispatching = threading.Lock()
 
 # How long to pause before offering a refused message again. A prompt is
 # submitted without waiting for the agent to be free, so a refusal is the
@@ -179,35 +191,69 @@ def watch_agents() -> None:
                 # holding one. Deciding what happens next — re-dispatch, defer,
                 # escalate — is the scheduler's.
                 logger.warning("agent for %s exited; issue orphaned", key)
+            # Whether or not there was an issue to orphan, nothing can reach
+            # this agent again, so its drainer has no more work to wait for.
+            stop_deliveries(key)
 
     threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
 
 
-def watch_deliveries() -> None:
-    """Hand queued messages to their agents, on a daemon thread.
+def deliveries_for(key: str) -> queue.Queue[str | None]:
+    """Issue ``key``'s delivery queue, with a drainer running behind it.
 
-    In the shape of :func:`watch_agents`, and for the same reason: a send
-    talks to the harness and is retried until it lands, so it can take as
-    long as the harness is unreachable, and no ingesting caller can be held
-    that long — Linear retries any webhook delivery the bridge is slow to
-    answer.
-
-    One thread, so the queue's order is the delivery order. It survives a
-    failed delivery: a drainer that died on one message would silently
-    strand every message behind it.
+    Created on the first delivery to an issue rather than at dispatch, so an
+    agent nobody has written to costs no thread.
     """
+    with _deliveries_lock:
+        pending = deliveries.get(key)
+        if pending is None:
+            pending = deliveries[key] = queue.Queue()
+            threading.Thread(
+                target=drain,
+                args=(key, pending),
+                name=f"foregent-deliveries-{key}",
+                daemon=True,
+            ).start()
+        return pending
 
-    def consume() -> None:
-        while True:
-            key, message = deliveries.get()
-            try:
-                send_queued(key, message)
-            except Exception:
-                logger.exception("delivering to %s failed", key)
-            finally:
-                deliveries.task_done()
 
-    threading.Thread(target=consume, name="foregent-deliveries", daemon=True).start()
+def stop_deliveries(key: str) -> None:
+    """End issue ``key``'s drainer; its agent is finished or gone.
+
+    The sentinel goes to the back of the queue rather than clearing it, so
+    messages already waiting are handled (and, for an issue that is no longer
+    in flight, logged as dropped by :func:`send_queued`) before the thread
+    ends. Absence is not an error: an issue nobody delivered to has no queue.
+    """
+    with _deliveries_lock:
+        pending = deliveries.pop(key, None)
+    if pending is not None:
+        pending.put(None)
+
+
+def drain(key: str, pending: queue.Queue[str | None]) -> None:
+    """Hand ``key``'s queued messages to its agent, one at a time.
+
+    Runs on a daemon thread, for the reason :func:`watch_agents` does: a send
+    talks to the harness and is retried until it lands, so it can take as long
+    as the harness is unreachable, and no ingesting caller can be held that
+    long — Linear retries any webhook delivery the bridge is slow to answer.
+
+    One thread per issue, so this queue's order is that agent's delivery order
+    and no other agent waits on this one. It survives a failed delivery: a
+    drainer that died on one message would silently strand every message
+    behind it.
+    """
+    while True:
+        message = pending.get()
+        try:
+            if message is None:
+                return
+            send_queued(key, message)
+        except Exception:
+            logger.exception("delivering to %s failed", key)
+        finally:
+            pending.task_done()
 
 
 def send_queued(key: str, message: str) -> None:
@@ -334,6 +380,28 @@ def brief_for(key: str, mode: Mode) -> str:
     return f"/foregent-worker {key} {mode}"
 
 
+def mode_of(issue: Issue) -> Mode:
+    """How ``issue``'s project wants its work landed (§6.4).
+
+    Derived from the repo on every call rather than stored, so the brief an
+    agent is given and the completion it is held to cannot disagree
+    (:func:`foregent.workspaces.mode_for`).
+
+    **An issue with no repo is bootstrap**, and the guard is not a formality:
+    ``mode_for`` takes a path, ``Path("")`` is the current directory, and the
+    bridge's own working directory is a checkout of foregent — which has an
+    origin on GitHub and would answer Pull Request for an issue that names no
+    repo at all. A restart recovers a repo for every agent sitting in a
+    workspace and none for an agent running in a plain directory
+    (:func:`rebuild_store`), and bootstrap is the right answer for that agent
+    anyway: a project foregent cannot make a workspace in is one it cannot
+    open a pull request for either.
+    """
+    if not issue.repo:
+        return Mode.BOOTSTRAP
+    return workspaces.mode_for(Path(issue.repo))
+
+
 def agent_mcp_servers() -> dict[str, dict]:
     """The MCP servers a dispatched agent is given.
 
@@ -400,16 +468,27 @@ def ensure_skills() -> None:
 
 
 def dispatch() -> None:
-    """Launch an agent for the oldest Queued issue, capacity allowing.
+    """Launch agents for the queued issues, capacity allowing (JIM-151).
 
-    Capacity is hardcoded at one concurrently running agent, occupied by an
-    IN_PROGRESS or a parked-alive BLOCKED issue. Before
-    launch, the issue is claimed directly in Linear (assignee + In Progress
-    state) — no agent runs without a durable
-    ownership record. On a Linear or harness failure the issue stays Queued
-    and the caller's request fails with 502. Foregent's skills are installed
-    first (:func:`ensure_skills`), because the agent cannot pick up one that
-    appears after it starts.
+    Launches until the queue is empty or the next issue does not fit, so one
+    completion can start more than one agent where the queue has been waiting
+    on capacity.
+
+    **Strictly FIFO.** A head that does not fit stalls the queue rather than
+    being skipped: skipping it would make queue order a scheduling policy, with
+    a starvation question attached, and the only arrangement it helps is a box
+    hosting two projects — which the one-project-per-box boundary
+    (docs/ARCHITECTURE.md §1.1) says does not exist.
+
+    Serialised by :data:`_dispatching`, because the capacity check and the
+    write that satisfies it are several harness calls apart.
+
+    Before launch, each issue is claimed directly in Linear (assignee + In
+    Progress state) — no agent runs without a durable ownership record. On a
+    Linear or harness failure the issue stays Queued, the rest of the queue is
+    left alone, and the caller's request fails with 502. Foregent's skills are
+    installed first (:func:`ensure_skills`), because the agent cannot pick up
+    one that appears after it starts.
 
     Dispatch is not atomic, and the deterministic agent label is what makes
     that survivable. If the brief fails to send after the agent starts, a
@@ -419,12 +498,45 @@ def dispatch() -> None:
     that self-heals on retry, because claiming is idempotent — the durable
     fix for both is orphan reconciliation.
     """
-    occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
-    if any(issue.status in occupied for issue in store):
-        return
+    with _dispatching:
+        while _dispatch_one():
+            pass
+
+
+def admits(issue: Issue) -> bool:
+    """Whether there is room to launch ``issue`` now.
+
+    **Bootstrap mode is one agent at a time, and that is the repo's rule
+    rather than a policy.** A workspace is built at ``main`` and completion
+    fast-forwards ``main`` onto the agent's tip (§4.3), so two bootstrap agents
+    branch from the same commit and the second cannot land what it wrote.
+    Advancing before the next dispatch is what gives each agent a base that
+    holds the last one's work; running them together throws that away.
+
+    Pull Request mode has neither half — the agent pushes its own branch and
+    ``main`` is the reviewer's to move — so it is limited only by what the box
+    is told it can carry (:func:`foregent.config.max_agents`).
+
+    Every in-flight issue counts, parked ones included (§1.7): a blocked agent
+    is a live process holding a workspace and a pane, and freeing its slot
+    would launch a second agent onto the same machine's back.
+
+    A queued bootstrap issue therefore waits behind agents on *any* repo. That
+    is over-strict only where a box hosts two projects, which §1.1 rules out,
+    and the safe answer everywhere else.
+    """
+    limit = 1 if mode_of(issue) is Mode.BOOTSTRAP else config.max_agents()
+    return sum(1 for tracked in store if tracked.status in IN_FLIGHT) < limit
+
+
+def _dispatch_one() -> bool:
+    """Launch an agent for the oldest Queued issue; whether one started.
+
+    The caller holds :data:`_dispatching`.
+    """
     issue = store.next_queued()
-    if issue is None:
-        return
+    if issue is None or not admits(issue):
+        return False
     label = label_for(issue.key)
     repo = Path(issue.repo)
     ensure_skills()
@@ -449,7 +561,7 @@ def dispatch() -> None:
         # The mode is read off the repo rather than the workspace: a secondary
         # workspace shares the repo's remotes, and an adopted agent's dispatch
         # never built one to read.
-        manager.send(ref, brief_for(issue.key, workspaces.mode_for(repo)))
+        manager.send(ref, brief_for(issue.key, mode_of(issue)))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:
@@ -459,6 +571,7 @@ def dispatch() -> None:
     store.add(
         replace(issue, status=IssueStatus.IN_PROGRESS, directory=cwd, agent=ref)
     )
+    return True
 
 
 def _adopt(label: str) -> AgentRecord | None:
@@ -534,10 +647,10 @@ def deliver_issue(
     worker should see activity on its own issue as soon as it happens
    . The send itself waits for whatever the agent is
     doing to finish, so it happens on the drainer thread
-    (:func:`watch_deliveries`) and this route only enqueues. What the caller
-    is told is therefore that the message is *accepted*, not that it has been
-    read: the issue comes back as it stands, so a parked one still reads
-    BLOCKED until :func:`send_queued` has sent and unblocked it.
+    (:func:`drain`) and this route only enqueues. What the caller is told is
+    therefore that the message is *accepted*, not that it has been read: the
+    issue comes back as it stands, so a parked one still reads BLOCKED until
+    :func:`send_queued` has sent and unblocked it.
 
     409 for an issue with no agent to prompt, checked here rather than on the
     drainer so an event with nowhere to go is answered instead of queued.
@@ -555,7 +668,7 @@ def deliver_issue(
         raise HTTPException(
             status_code=409, detail=f"{key} has no agent to deliver to ({status})"
         )
-    deliveries.put((key, message))
+    deliveries_for(key).put(message)
     return _record(issue)
 
 
@@ -712,6 +825,10 @@ async def complete_task(issue_key: str) -> str:
         # failed, and retrying complete is safe (server.py's /complete route
         # docstring) — so report success rather than raising a tool error.
         result = f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
+    # The issue is Done, so nothing more is delivered to it and its drainer
+    # can end. Anything still queued drains first and is dropped by
+    # send_queued, which is what a message for a finished agent deserves.
+    stop_deliveries(issue_key)
     # Tear down the agent that called this. Best-effort: the issue is already
     # Done, so a failed teardown must not fail the tool.
     if issue is not None and issue.agent is not None:
@@ -766,9 +883,9 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
     """
     if issue is None or issue.status not in IN_FLIGHT or not issue.repo:
         return None
-    repo = Path(issue.repo)
-    if workspaces.mode_for(repo) is not Mode.BOOTSTRAP:
+    if mode_of(issue) is not Mode.BOOTSTRAP:
         return None
+    repo = Path(issue.repo)
     try:
         await run_in_threadpool(workspaces.advance, repo, issue_key)
     except workspaces.WorkspaceError as exc:

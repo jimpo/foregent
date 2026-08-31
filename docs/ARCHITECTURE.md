@@ -98,7 +98,7 @@ One machine per project. Three layers.
   ┌───────────────────────────────────┴─────────────┐
   │ foregent bridge (Python / FastAPI, stateless)   │
   │  • event ingest, authentication, matching       │
-  │  • delivery queue + drainer                     │
+  │  • delivery queues + drainers, one per issue    │
   │  • dispatch and capacity                        │
   │  • AgentManager (herdr + Claude Code)           │
   │  • foregent MCP server (mounted at /mcp)        │
@@ -122,7 +122,7 @@ the bridge through the foregent MCP server.
 
 | Module | Responsibility |
 |---|---|
-| `server.py` | The bridge: HTTP routes, the webhook endpoint, dispatch, the delivery queue and drainer, the harness-event watcher, the mounted MCP server. |
+| `server.py` | The bridge: HTTP routes, the webhook endpoint, dispatch, the per-issue delivery queues and their drainers, the harness-event watcher, the mounted MCP server. |
 | `store.py` | `IssueStore`, the in-memory issue map, and what counts as in-flight. |
 | `models.py` | `Issue` and `IssueStatus`. |
 | `events.py` | `Event`, `EventKind`, and the pure `wakes()` and `delivery_message()`. No transport, no server. |
@@ -143,8 +143,9 @@ the bridge through the foregent MCP server.
 
 `foregent queue JIM-42 --directory <path>` records the issue as Queued, then:
 
-1. **Capacity.** One concurrent agent. An In Progress or parked Blocked issue
-   holds the slot; anything else waits.
+1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
+   time in bootstrap mode, up to `FOREGENT_MAX_AGENTS` in pull request mode.
+   Every in-flight issue holds a slot; anything else waits.
 2. **Skills.** Any packaged skill the machine lacks is written first. Claude
    Code picks up live edits to a skill directory, but only one that existed
    when the session started, so this must finish before launch.
@@ -160,9 +161,19 @@ the bridge through the foregent MCP server.
    or `… pull-request`, so the lifecycle has one definition — the skill — and
    the mode is told to the agent rather than looked up by it (§6.4).
 
+One call launches until the queue is empty or the next issue does not fit, so
+a completion can start more than one agent where the queue has been waiting on
+capacity. The queue is strictly FIFO: an issue that does not fit stalls the
+ones behind it rather than being skipped, which keeps queue order from becoming
+a scheduling policy with a starvation question attached.
+
 Dispatch is not atomic. The deterministic agent label `fg-jim-42` is what
 makes that survivable: a retry after a failed brief adopts the running agent
-instead of starting a second one for the same issue.
+instead of starting a second one for the same issue. **A lock holds the whole
+of one dispatch**, because the capacity check and the write that satisfies it
+are several harness calls apart: two callers arriving together would both read
+a store neither has written yet and launch the same issue twice. Launches are
+therefore serial even when several slots are free.
 
 ### 4.2 Delivery
 
@@ -178,9 +189,13 @@ the whole of foregent's inbound path: nothing asks Linear what changed.
 3. **Enqueue and answer.** The route checks in memory that there is an agent,
    enqueues, and returns. It never waits on an agent: Linear retries any
    delivery the bridge is slow to answer.
-4. **Drain.** One daemon thread sends one message at a time, in the order
-   written. Nothing is coalesced — merging two people's comments into one
-   prompt loses who said what.
+4. **Drain.** Each issue has its own queue and its own daemon thread, started
+   on the first delivery to it, so one agent's messages reach it one at a time
+   in the order written and no agent waits behind another. A send is offered
+   again until it lands or the agent is gone, so a fleet-wide queue would let
+   one unreachable agent silence the rest. Nothing is coalesced — merging two
+   people's comments into one prompt loses who said what. A drainer ends when
+   its issue completes or its agent dies.
 5. **Send, then unblock.** The prompt is submitted straight away, whatever
    the agent is doing, and offered again until it lands or the harness
    reports the agent gone. Unblocking happens only after the send succeeds,
@@ -274,11 +289,30 @@ the rest mirror Linear states.
 
 ### 5.2 Capacity
 
-One concurrent agent, hardcoded. A parked agent holds the slot for the whole
-block. Three simplifications rest on this and become real work when it
-changes: one delivery queue for the fleet, no workspace pool — workspaces are
-built per dispatch rather than acquired from one (§6.5) — and no per-agent
-ordering.
+**How many agents run at once is the project's mode, not a number.**
+
+- **Bootstrap: one at a time**, and the repo rather than policy is what says
+  so. A workspace is built at `main` and completion fast-forwards `main` onto
+  the agent's tip (§4.3), so two bootstrap agents branch from the same commit
+  and the second cannot land what it wrote. Advancing before the next dispatch
+  is precisely what gives each agent a base holding the last one's work.
+- **Pull request: up to `FOREGENT_MAX_AGENTS`** (default 3). The agent pushes
+  its own branch and `main` is the reviewer's to move, so nothing in the repo
+  serialises it and the limit is only what one box and one reviewer can carry.
+
+The limit is set by the mode of the issue at the head of the queue, and every
+in-flight issue counts against it. A queued bootstrap issue therefore waits
+behind agents on any repo — over-strict only on a box hosting two projects,
+which §1.1 rules out, and the safe answer everywhere else. The mode is derived
+per call from the repo (§6.4), so it needs nothing persisted to survive a
+restart; an issue whose repo a restart could not recover reads bootstrap, the
+serial answer.
+
+**A parked agent holds its slot for the whole block** (§1.7). In pull request
+mode the steady state is therefore N agents all waiting on review, so
+`FOREGENT_MAX_AGENTS` is in practice the number of pull requests that may be
+open at once, and throughput is bounded by review latency rather than by the
+box.
 
 ### 5.3 The agent binding
 
@@ -463,9 +497,9 @@ consequences follow from that choice:
   agent quietly missing the credentials the operator asked to be there is the
   worse failure, and the only one nobody would notice.
 
-The pool is deliberately absent. Capacity is one concurrent agent (§5.2), so N
-slots with issue-keyed acquisition would be structure for a number that never
-changes; it arrives with capacity.
+The pool is deliberately absent, and concurrency did not bring one. Workspaces
+are keyed by issue and built per dispatch, so parallel agents want no shared
+resource to acquire; a pool would be structure with nothing to allocate.
 
 ## 7. The AgentManager seam
 
@@ -597,6 +631,7 @@ installed.
 | `FOREGENT_API_URL` | CLI, agents | Where the bridge is. Default `http://127.0.0.1:8577`. |
 | `FOREGENT_HERDR_SESSION` | bridge | Which herdr session agents run in. |
 | `FOREGENT_WORKSPACE_ROOT` | bridge | Where per-issue workspaces are built. Default `~/.foregent/workspaces`. |
+| `FOREGENT_MAX_AGENTS` | bridge | Agents at once in pull request mode. Default 3; bootstrap is always one. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
 | `GITHUB_TOKEN` | agents | GitHub MCP authentication. |
