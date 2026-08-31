@@ -7,8 +7,9 @@ Queued issues are dispatched to agents as capacity allows, through the
 harness.
 ``/webhooks/linear`` receives what Linear pushes about the issues foregent is
 tracking, so an agent sees activity on its own issue whether it is working or
-parked. Events reach an agent through a queue drained by a daemon thread, so
-whoever ingested one is never held behind an agent that is mid-turn.
+parked. Events reach an agent through its own queue, drained by a daemon
+thread, so whoever ingested one is never held behind an agent that is mid-turn
+and no agent is held behind another.
 ``/webhooks/github`` is the same door for what GitHub pushes about the pull
 requests those agents open; it authenticates a delivery and, for now, stops
 there.
@@ -68,7 +69,6 @@ async def lifespan(_app: FastAPI):
     await run_in_threadpool(check_agent_mcp)
     await run_in_threadpool(rebuild_store)
     watch_agents()
-    watch_deliveries()
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -89,13 +89,17 @@ store = IssueStore()
 # wholesale to change harness.
 manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
 
-# Events waiting for the agent they are for, oldest first. One queue and one
-# drainer, so two events for one agent reach it one at a time and in the order
-# they were written, and whoever ingested them waited on neither. A long wait
-# on one agent therefore holds up deliveries to another; capacity is one agent,
-# so there is no other agent to hold up, and a queue per agent is the change
-# when capacity grows.
-deliveries: queue.Queue[tuple[str, str]] = queue.Queue()
+# Events waiting for the agent they are for, one queue per issue key, oldest
+# first. Each has a drainer of its own, so two events for one agent reach it
+# one at a time and in the order they were written, whoever ingested them
+# waited on neither, and an agent that cannot be reached delays only its own
+# messages. `None` is the sentinel that ends a drainer.
+deliveries: dict[str, queue.Queue[str | None]] = {}
+
+# Guards the dict above, not the queues in it: a queue is created on the first
+# delivery to an issue, and two deliveries arriving together must find the same
+# one rather than start two drainers for one agent.
+_deliveries_lock = threading.Lock()
 
 # Held for the whole of one dispatch. Dispatch reads the store for a free slot
 # and writes the launched agent back only after several harness calls, so two
@@ -187,35 +191,69 @@ def watch_agents() -> None:
                 # holding one. Deciding what happens next — re-dispatch, defer,
                 # escalate — is the scheduler's.
                 logger.warning("agent for %s exited; issue orphaned", key)
+            # Whether or not there was an issue to orphan, nothing can reach
+            # this agent again, so its drainer has no more work to wait for.
+            stop_deliveries(key)
 
     threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
 
 
-def watch_deliveries() -> None:
-    """Hand queued messages to their agents, on a daemon thread.
+def deliveries_for(key: str) -> queue.Queue[str | None]:
+    """Issue ``key``'s delivery queue, with a drainer running behind it.
 
-    In the shape of :func:`watch_agents`, and for the same reason: a send
-    talks to the harness and is retried until it lands, so it can take as
-    long as the harness is unreachable, and no ingesting caller can be held
-    that long — Linear retries any webhook delivery the bridge is slow to
-    answer.
-
-    One thread, so the queue's order is the delivery order. It survives a
-    failed delivery: a drainer that died on one message would silently
-    strand every message behind it.
+    Created on the first delivery to an issue rather than at dispatch, so an
+    agent nobody has written to costs no thread.
     """
+    with _deliveries_lock:
+        pending = deliveries.get(key)
+        if pending is None:
+            pending = deliveries[key] = queue.Queue()
+            threading.Thread(
+                target=drain,
+                args=(key, pending),
+                name=f"foregent-deliveries-{key}",
+                daemon=True,
+            ).start()
+        return pending
 
-    def consume() -> None:
-        while True:
-            key, message = deliveries.get()
-            try:
-                send_queued(key, message)
-            except Exception:
-                logger.exception("delivering to %s failed", key)
-            finally:
-                deliveries.task_done()
 
-    threading.Thread(target=consume, name="foregent-deliveries", daemon=True).start()
+def stop_deliveries(key: str) -> None:
+    """End issue ``key``'s drainer; its agent is finished or gone.
+
+    The sentinel goes to the back of the queue rather than clearing it, so
+    messages already waiting are handled (and, for an issue that is no longer
+    in flight, logged as dropped by :func:`send_queued`) before the thread
+    ends. Absence is not an error: an issue nobody delivered to has no queue.
+    """
+    with _deliveries_lock:
+        pending = deliveries.pop(key, None)
+    if pending is not None:
+        pending.put(None)
+
+
+def drain(key: str, pending: queue.Queue[str | None]) -> None:
+    """Hand ``key``'s queued messages to its agent, one at a time.
+
+    Runs on a daemon thread, for the reason :func:`watch_agents` does: a send
+    talks to the harness and is retried until it lands, so it can take as long
+    as the harness is unreachable, and no ingesting caller can be held that
+    long — Linear retries any webhook delivery the bridge is slow to answer.
+
+    One thread per issue, so this queue's order is that agent's delivery order
+    and no other agent waits on this one. It survives a failed delivery: a
+    drainer that died on one message would silently strand every message
+    behind it.
+    """
+    while True:
+        message = pending.get()
+        try:
+            if message is None:
+                return
+            send_queued(key, message)
+        except Exception:
+            logger.exception("delivering to %s failed", key)
+        finally:
+            pending.task_done()
 
 
 def send_queued(key: str, message: str) -> None:
@@ -573,7 +611,7 @@ def deliver_issue(
     worker should see activity on its own issue as soon as it happens
    . The send itself waits for whatever the agent is
     doing to finish, so it happens on the drainer thread
-    (:func:`watch_deliveries`) and this route only enqueues. What the caller
+    (:func:`drain`) and this route only enqueues. What the caller
     is told is therefore that the message is *accepted*, not that it has been
     read: the issue comes back as it stands, so a parked one still reads
     BLOCKED until :func:`send_queued` has sent and unblocked it.
@@ -594,7 +632,7 @@ def deliver_issue(
         raise HTTPException(
             status_code=409, detail=f"{key} has no agent to deliver to ({status})"
         )
-    deliveries.put((key, message))
+    deliveries_for(key).put(message)
     return _record(issue)
 
 
@@ -751,6 +789,10 @@ async def complete_task(issue_key: str) -> str:
         # failed, and retrying complete is safe (server.py's /complete route
         # docstring) — so report success rather than raising a tool error.
         result = f"Marked {issue_key} complete; next dispatch failed: {exc.detail}"
+    # The issue is Done, so nothing more is delivered to it and its drainer
+    # can end. Anything still queued drains first and is dropped by
+    # send_queued, which is what a message for a finished agent deserves.
+    stop_deliveries(issue_key)
     # Tear down the agent that called this. Best-effort: the issue is already
     # Done, so a failed teardown must not fail the tool.
     if issue is not None and issue.agent is not None:

@@ -118,15 +118,16 @@ def drain_events(manager: FakeManager) -> None:
 
 
 def drain_deliveries() -> None:
-    """Run the delivery drainer until everything queued has been handled.
+    """Wait until every queued delivery has been handled.
 
-    Bounded, because the drainer is endless by design: a delivery that never
-    finishes fails the test instead of hanging it.
+    The drainers start themselves on the first delivery to an issue, so this
+    only waits. Bounded, because a drainer is endless by design: a delivery
+    that never finishes fails the test instead of hanging it.
     """
-    server.watch_deliveries()
-    waiter = threading.Thread(target=server.deliveries.join, daemon=True)
-    waiter.start()
-    waiter.join(timeout=5)
+    for pending in list(server.deliveries.values()):
+        waiter = threading.Thread(target=pending.join, daemon=True)
+        waiter.start()
+        waiter.join(timeout=5)
 
 
 class DispatchTests(unittest.TestCase):
@@ -354,9 +355,9 @@ class DeliverTests(unittest.TestCase):
         server.store = IssueStore()
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
-        # A queue per test, so a drainer left over from an earlier one cannot
-        # take this test's messages.
-        self.enterContext(mock.patch.object(server, "deliveries", queue.Queue()))
+        # A fresh set of queues per test, so a drainer left over from an
+        # earlier one cannot take this test's messages.
+        self.enterContext(mock.patch.object(server, "deliveries", {}))
         # The drainer paces its retries against a real agent's turn; nothing
         # here is really busy.
         self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
@@ -517,6 +518,54 @@ class DeliverTests(unittest.TestCase):
             drain_deliveries()
         self.assertEqual(self.manager.sent, [(self.ref, "second")])
 
+    def test_an_unreachable_agent_does_not_hold_up_another_agents_messages(
+        self,
+    ) -> None:
+        # One queue for the fleet meant the first stuck send silenced every
+        # agent behind it, because a refused message is offered again until
+        # its agent is gone (JIM-151).
+        stuck = AgentRef("fg-jim-88", "conversation-1")
+        free = AgentRef("fg-jim-89", "conversation-2")
+        server.store.add(
+            Issue(key="JIM-88", title="", status=IssueStatus.IN_PROGRESS, agent=stuck)
+        )
+        server.store.add(
+            Issue(key="JIM-89", title="", status=IssueStatus.IN_PROGRESS, agent=free)
+        )
+        held = threading.Event()
+        sent = self.manager.send
+
+        def hold(ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
+            if ref == stuck:
+                held.wait(5)
+            sent(ref, text, when_idle=when_idle)
+
+        self.enterContext(mock.patch.object(self.manager, "send", hold))
+        self.addCleanup(held.set)
+
+        server.deliver_issue("JIM-88", "wedged")
+        server.deliver_issue("JIM-89", "go on")
+
+        waiter = threading.Thread(
+            target=server.deliveries["JIM-89"].join, daemon=True
+        )
+        waiter.start()
+        waiter.join(timeout=5)
+        self.assertEqual(self.manager.sent, [(free, "go on")])
+
+    def test_a_completed_issue_stops_its_drainer(self) -> None:
+        self.work()
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+        drain_deliveries()
+
+        server.stop_deliveries("JIM-88")
+
+        self.assertEqual(server.deliveries, {})
+        for thread in threading.enumerate():
+            if thread.name == "foregent-deliveries-JIM-88":
+                thread.join(timeout=5)
+                self.assertFalse(thread.is_alive())
+
     def test_delivering_does_not_dispatch_anything_else(self) -> None:
         # The agent held its capacity slot the whole time, parked or not , so
         # prompting it frees nothing.
@@ -530,7 +579,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_a_queued_issue_is_a_conflict(self) -> None:
         # Nothing is running yet: the brief at dispatch is what it will read.
@@ -538,7 +587,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_an_orphaned_issue_is_a_conflict(self) -> None:
         self.work()
@@ -546,7 +595,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_a_completed_issue_is_a_conflict(self) -> None:
         # Done keeps the ref of the agent foregent has since stopped, so the
@@ -556,7 +605,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
     def test_delivering_to_a_blocked_issue_with_no_agent_is_a_conflict(self) -> None:
         # `block()` upserts an unknown key, so an issue can carry a blocker
@@ -565,7 +614,7 @@ class DeliverTests(unittest.TestCase):
         with self.assertRaises(server.HTTPException) as caught:
             server.deliver_issue("JIM-88", "go on")
         self.assertEqual(caught.exception.status_code, 409)
-        self.assertTrue(server.deliveries.empty())
+        self.assertEqual(server.deliveries, {})
 
 
 class CheckHerdrProtocolTests(unittest.TestCase):
