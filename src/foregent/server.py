@@ -829,30 +829,47 @@ async def complete_task(issue_key: str) -> str:
     # can end. Anything still queued drains first and is dropped by
     # send_queued, which is what a message for a finished agent deserves.
     stop_deliveries(issue_key)
-    # Tear down the agent that called this. Best-effort: the issue is already
-    # Done, so a failed teardown must not fail the tool.
-    if issue is not None and issue.agent is not None:
-        try:
-            await run_in_threadpool(manager.stop, issue.agent)
-        except AgentError as exc:
-            return f"{result} Agent teardown failed: {exc}"
-    # Then the workspace, and only after the agent is gone — removing a live
-    # agent's own cwd out from under it is worse than leaking a directory.
-    # The work is already in git by now, so a failure here costs a directory
-    # and not the issue's commits; it is still logged rather than passed over,
-    # because nobody owns the leftovers.
-    if issue is not None and issue.repo and issue.directory:
-        try:
-            await run_in_threadpool(
-                workspaces.destroy,
-                Path(issue.repo),
-                issue_key,
-                Path(issue.directory),
-            )
-        except workspaces.WorkspaceError as exc:
-            logger.error("could not remove the %s workspace: %s", issue_key, exc)
-            return f"{result} The workspace was left behind ({exc})."
+    if issue is not None:
+        result += await run_in_threadpool(teardown, issue)
     return result
+
+
+def teardown(issue: Issue) -> str:
+    """Stop ``issue``'s agent, remove its workspace, and say what went wrong.
+
+    **One call, on one thread, and that is the whole point.** Stopping the
+    agent severs the connection it called :func:`complete_task` over, and the
+    tool is served on a stateless streamable-HTTP session, whose request
+    handler is cancelled when its client disconnects — so an ``await`` after
+    the stop is never reached. A thread already running is not interrupted,
+    so a teardown that begins here finishes even though the coroutine that
+    started it does not (JIM-150).
+
+    Stopping the agent is best-effort, because the issue is already Done. A
+    failure ends the teardown there rather than going on to the directory:
+    removing a live agent's own cwd out from under it is worse than leaving
+    one behind.
+
+    The workspace goes second for that same reason. The work is in git by
+    now, so a failure costs a directory rather than the issue's commits, but
+    it is still reported rather than passed over, because nobody owns the
+    leftovers.
+
+    Returns what to append to the tool's answer: empty when both halves
+    worked.
+    """
+    if issue.agent is not None:
+        try:
+            manager.stop(issue.agent)
+        except AgentError as exc:
+            return f" Agent teardown failed: {exc}"
+    if issue.repo and issue.directory:
+        try:
+            workspaces.destroy(Path(issue.repo), issue.key, Path(issue.directory))
+        except workspaces.WorkspaceError as exc:
+            logger.error("could not remove the %s workspace: %s", issue.key, exc)
+            return f" The workspace was left behind ({exc})."
+    return ""
 
 
 async def land(issue_key: str, issue: Issue | None) -> str | None:

@@ -255,6 +255,13 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
   workspace that cannot be removed is logged and reported, because nobody owns
   the leftovers.
 
+  **Both halves run on one thread, in a single call, and that is what makes
+  the removal happen at all.** Stopping the agent severs the connection it
+  called the tool over, and the bridge serves MCP statelessly, so the request
+  handler is cancelled the moment its client disconnects; a thread already
+  running is not interrupted, and it is what carries the removal past the
+  cancellation (JIM-150).
+
   **A refusal to advance is the one thing that stops the completion**, before
   anything else has happened. jj declines to move `main` onto work that is not
   descended from it (§6.5), which means an agent that never rebased: its

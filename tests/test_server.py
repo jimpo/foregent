@@ -8,6 +8,7 @@ Code is. Linear is stubbed too — its own client is covered by
 
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
 import shutil
@@ -1034,6 +1035,42 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         await server.complete_task("JIM-88")
 
         self.assertEqual(alive, [True])
+
+    async def test_the_workspace_is_removed_after_the_caller_disconnects(
+        self,
+    ) -> None:
+        # Stopping the agent closes the connection it called complete_task
+        # over, and the tool's request handler is cancelled with it. The
+        # teardown has to be on a thread by then — a thread already running is
+        # not interrupted — or the workspace is left behind (JIM-150).
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        cwd = Path(self.manager.launched[0].cwd)
+        # The teardown outlives the coroutine that started it, so the test
+        # waits for the thread rather than for the await.
+        removed = threading.Event()
+        destroy = server.workspaces.destroy
+
+        def watched_destroy(repo: Path, key: str, path: Path) -> None:
+            destroy(repo, key, path)
+            removed.set()
+
+        self.enterContext(
+            mock.patch.object(server.workspaces, "destroy", watched_destroy)
+        )
+        loop = asyncio.get_running_loop()
+        completing = asyncio.ensure_future(server.complete_task("JIM-88"))
+
+        def disconnect() -> None:
+            loop.call_soon_threadsafe(completing.cancel)
+
+        self.manager.on_stop = disconnect
+
+        with self.assertRaises(asyncio.CancelledError):
+            await completing
+
+        self.assertTrue(removed.wait(10))
+        self.assertFalse(cwd.exists())
 
     async def test_a_failed_teardown_is_reported_not_swallowed(self) -> None:
         # Nobody owns the leftovers, so this does not get the silent
