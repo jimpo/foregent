@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -61,6 +62,12 @@ INCLUDE_FILE = ".worktreeinclude"
 # remote at all has nowhere to open one.
 ORIGIN = "origin"
 GITHUB = "github.com"
+
+# The `owner/name` a GitHub remote URL ends in, in both spellings jj prints:
+# `https://github.com/owner/name(.git)` and `git@github.com:owner/name.git`.
+# What GitHub itself calls the repository in a webhook payload
+# (`repository.full_name`), which is the point of reading it.
+_SLUG = re.compile(r"github\.com[:/](?P<slug>[^/\s]+/[^/\s]+?)(?:\.git)?$")
 
 # Per-call budget for a jj subprocess. Creating a workspace writes a whole
 # working copy, so this is generous; it exists to stop a wedged jj from
@@ -96,22 +103,53 @@ def mode_for(repo: Path) -> Mode:
     contract come from here — the mode the agent is briefed with at dispatch,
     and the one the bridge completes the issue in.
 
-    A jj command that fails answers bootstrap rather than raising. Refusing to
-    dispatch over an unreadable remote list would be a worse answer than
-    dispatching an agent that commits locally.
+    A repo whose remotes cannot be read answers bootstrap rather than raising
+    (:func:`_origin_url`). Refusing to dispatch over an unreadable remote list
+    would be a worse answer than dispatching an agent that commits locally.
+    """
+    return Mode.PULL_REQUEST if GITHUB in _origin_url(repo) else Mode.BOOTSTRAP
+
+
+def remote_slug(repo: Path) -> str:
+    """The ``owner/name`` ``repo``'s ``origin`` names on GitHub, or ``""``.
+
+    This is how a GitHub delivery about a repository is matched against the
+    issues foregent is working: the payload names the repository as
+    ``owner/name`` and an issue names a local path, and the ``origin`` remote
+    is the only thing that joins the two
+    (:func:`foregent.server.wake_on_push`).
+
+    ``""`` for a repo with no ``origin``, an ``origin`` hosted elsewhere, or a
+    URL this cannot parse. **The caller wakes that repo's agents anyway**
+    (docs/ARCHITECTURE.md §4.2): a spurious wake costs one agent turn, while a
+    missed one leaves an agent parked forever on a base that has moved. Being
+    strict here is affordable for the same reason :func:`mode_for` stays
+    lenient — that one decides how a whole project lands its work.
+    """
+    match = _SLUG.search(_origin_url(repo).rstrip("/"))
+    return match.group("slug") if match else ""
+
+
+def _origin_url(repo: Path) -> str:
+    """The URL ``repo``'s ``origin`` remote points at, or ``""``.
+
+    Every caller wants the URL of one remote, and the answer for a directory
+    that is not a repo, has no ``origin``, or whose remote list will not read
+    is the same empty string — so the failure is answered once here rather
+    than in each reader's own shape.
     """
     if not is_repo(repo):
-        return Mode.BOOTSTRAP
+        return ""
     try:
         listed = _jj(repo, "git", "remote", "list")
     except WorkspaceError as exc:
         logger.warning("could not read %s's git remotes: %s", repo, exc)
-        return Mode.BOOTSTRAP
+        return ""
     for line in listed.splitlines():
         name, _, url = line.partition(" ")
-        if name == ORIGIN and GITHUB in url:
-            return Mode.PULL_REQUEST
-    return Mode.BOOTSTRAP
+        if name == ORIGIN:
+            return url.strip()
+    return ""
 
 
 def path_for(key: str) -> Path:
