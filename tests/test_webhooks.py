@@ -23,6 +23,7 @@ import json
 import os
 import queue
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -80,6 +81,32 @@ class WebhookAuthenticTests(unittest.TestCase):
                 linear.webhook_authentic(b"{}", "")
 
 
+class WebhookFreshTests(unittest.TestCase):
+    """The replay window, which is what makes a signature mean *now* (JIM-135)."""
+
+    def stamped(self, ago: float) -> dict:
+        """A payload saying Linear sent it ``ago`` seconds before now."""
+        return {"webhookTimestamp": (time.time() - ago) * 1000}
+
+    def test_a_delivery_sent_just_now_is_fresh(self) -> None:
+        self.assertTrue(linear.webhook_fresh(self.stamped(0)))
+
+    def test_one_inside_the_window_is_fresh(self) -> None:
+        self.assertTrue(linear.webhook_fresh(self.stamped(linear.WINDOW - 1)))
+
+    def test_one_older_than_the_window_is_not(self) -> None:
+        self.assertFalse(linear.webhook_fresh(self.stamped(linear.WINDOW + 1)))
+
+    def test_one_dated_ahead_of_the_window_is_not(self) -> None:
+        # A clock the wrong way out is as much a reason to refuse.
+        self.assertFalse(linear.webhook_fresh(self.stamped(-linear.WINDOW - 1)))
+
+    def test_a_delivery_that_names_no_time_is_fresh(self) -> None:
+        # The signature covers the exact bytes, so a body without the field is
+        # one Linear sent that way, not one stripped of it on the way here.
+        self.assertTrue(linear.webhook_fresh({"type": "Comment"}))
+
+
 class WebhookRouteTests(unittest.TestCase):
     """Which deliveries ``POST /webhooks/linear`` accepts at all."""
 
@@ -122,6 +149,17 @@ class WebhookRouteTests(unittest.TestCase):
                 response = self.post(b"{}", sign(b"{}"))
         self.assertEqual(response.status_code, 503)
         self.assertIn("LINEAR_WEBHOOK_SECRET", response.json()["detail"])
+
+    def test_a_replayed_delivery_is_refused_though_it_is_signed(self) -> None:
+        # The signature still holds: Linear did send these bytes, an hour ago.
+        stale = dict(PAYLOAD, webhookTimestamp=(time.time() - 3600) * 1000)
+        body = json.dumps(stale).encode()
+        self.assertEqual(self.post(body, sign(body)).status_code, 400)
+
+    def test_the_same_delivery_sent_now_is_accepted(self) -> None:
+        fresh = dict(PAYLOAD, webhookTimestamp=time.time() * 1000)
+        body = json.dumps(fresh).encode()
+        self.assertEqual(self.post(body, sign(body)).status_code, 200)
 
 
 class WebhookDeliveryTests(unittest.TestCase):

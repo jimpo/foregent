@@ -181,6 +181,12 @@ Linear posts to `POST /webhooks/linear`. The body is authenticated by
 HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. Push is
 the whole of foregent's inbound path: nothing asks Linear what changed.
 
+A signature proves Linear sent these bytes, not that it sent them just now,
+so the delivery's own `webhookTimestamp` is checked against a one-minute
+window beside it and a delivery from outside that window is refused 400. Both
+halves are needed: without the second, a captured delivery replays at the
+bridge forever.
+
 1. **Match.** `wakes(event, viewer)` returns the issue key, or nothing. A
    lookup, not a scan — the event names its own issue.
 2. **Drop foregent's own writes.** Claiming an issue, and every comment an

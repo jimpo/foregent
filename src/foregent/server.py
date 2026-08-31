@@ -719,7 +719,10 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     delivery that does not prove it came from Linear, absent signature
     included; 503 when this bridge holds no secret to check one against, which
     is an operator's misconfiguration and not the caller's fault; 400 for a
-    signed body that is not JSON, which is not a delivery Linear makes.
+    signed body that is not JSON, which is not a delivery Linear makes, and
+    for one whose own timestamp puts it outside the replay window
+    (:func:`~foregent.linear.webhook_fresh`) — the signature holds, so
+    refusing it is the whole of not acting on a replay.
     """
     body = await request.body()
     try:
@@ -732,6 +735,8 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     if not authentic:
         raise HTTPException(status_code=401, detail="signature does not match")
     payload = _payload(body)
+    if not linear.webhook_fresh(payload):
+        raise HTTPException(status_code=400, detail="delivery is outside the window")
     event = linear.webhook_event(payload)
     if event is None:
         logger.debug("Linear webhook is about no issue foregent knows: %s", payload)
