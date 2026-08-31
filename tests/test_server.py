@@ -294,6 +294,25 @@ class DispatchTests(unittest.TestCase):
         server.dispatch()
         self.assertEqual(len(self.manager.launched), 1)
 
+    def test_dispatch_waits_for_a_dispatch_already_running(self) -> None:
+        # Dispatch reads the store for a free slot and writes the launched
+        # agent back several harness calls later, so a second caller that ran
+        # in that window would read a store nobody had written yet and launch
+        # the same issue again. Holding the lock here stands in for the first
+        # caller being mid-launch.
+        self.queue()
+        launched = threading.Event()
+
+        with server._dispatching:
+            threading.Thread(
+                target=lambda: (server.dispatch(), launched.set()), daemon=True
+            ).start()
+            self.assertFalse(launched.wait(0.2))
+            self.assertEqual(self.manager.launched, [])
+
+        self.assertTrue(launched.wait(5))
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
     def test_completing_an_issue_dispatches_the_next(self) -> None:
         self.queue()
         server.dispatch()

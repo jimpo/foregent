@@ -97,6 +97,14 @@ manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
 # when capacity grows.
 deliveries: queue.Queue[tuple[str, str]] = queue.Queue()
 
+# Held for the whole of one dispatch. Dispatch reads the store for a free slot
+# and writes the launched agent back only after several harness calls, so two
+# callers arriving together would both read a store neither has written yet and
+# launch the same issue twice. Launches are therefore serial even when several
+# slots are free, which also keeps concurrent `jj workspace add` off one repo.
+# ponytail: one lock for the fleet; per-repo locks if launch latency matters.
+_dispatching = threading.Lock()
+
 # How long to pause before offering a refused message again. A prompt is
 # submitted without waiting for the agent to be free, so a refusal is the
 # harness being unreachable rather than the agent being busy.
@@ -427,13 +435,15 @@ def dispatch() -> None:
     Capacity is hardcoded at one concurrently running agent, occupied by any
     in-flight issue: a working one, one parked alive on a blocker, and one in
     review alike each hold a live agent (:data:`~foregent.store.IN_FLIGHT`).
-    Before
-    launch, the issue is claimed directly in Linear (assignee + In Progress
-    state) — no agent runs without a durable
-    ownership record. On a Linear or harness failure the issue stays Queued
-    and the caller's request fails with 502. Foregent's skills are installed
-    first (:func:`ensure_skills`), because the agent cannot pick up one that
-    appears after it starts.
+    Before launch, the issue is claimed directly in Linear (assignee + In
+    Progress state) — no agent runs without a durable ownership record. On a
+    Linear or harness failure the issue stays Queued and the caller's request
+    fails with 502. Foregent's skills are installed first
+    (:func:`ensure_skills`), because the agent cannot pick up one that appears
+    after it starts.
+
+    Serialised by :data:`_dispatching`, because the capacity check and the
+    write that satisfies it are several harness calls apart.
 
     Dispatch is not atomic, and the deterministic agent label is what makes
     that survivable. If the brief fails to send after the agent starts, a
@@ -443,6 +453,12 @@ def dispatch() -> None:
     that self-heals on retry, because claiming is idempotent — the durable
     fix for both is orphan reconciliation.
     """
+    with _dispatching:
+        _dispatch_one()
+
+
+def _dispatch_one() -> None:
+    """Launch an agent for the oldest Queued issue. Caller holds the lock."""
     if any(issue.status in IN_FLIGHT for issue in store):
         return
     issue = store.next_queued()
