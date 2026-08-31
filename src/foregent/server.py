@@ -147,6 +147,27 @@ def check_herdr_protocol() -> None:
     herdr.HerdrClient(session=config.herdr_session()).check_protocol()
 
 
+# What a live agent's harness status says about its issue at boot, for the
+# statuses that say anything. An agent that is not mid-turn has finished one
+# and is waiting, which in this system means it parked (JIM-168) — these are
+# the two the manager itself already reads as an agent that is free.
+#
+# The rest are absent on purpose. UNKNOWN means the state could not be read,
+# not that the agent stopped, and herdr's own BLOCKED is an agent waiting on
+# input rather than on the world; claiming either had parked would be a guess
+# in the direction that wakes agents that never asked to be woken.
+_RECOVERED = {
+    AgentStatus.IDLE: IssueStatus.BLOCKED,
+    AgentStatus.DONE: IssueStatus.BLOCKED,
+}
+
+# The blocker a recovered issue carries. The words a worker chose are gone
+# with the process that held them, and the blocker is a note rather than a key
+# (docs/ARCHITECTURE.md §1.6) — nothing matches on it, so saying plainly that
+# it is unknown costs the operator nothing a re-report would have bought.
+RECOVERED_BLOCKER = "unknown — recovered at restart"
+
+
 def rebuild_store() -> None:
     """Reconstruct the issue<->agent map from live agents (JIM-52).
 
@@ -154,6 +175,14 @@ def rebuild_store() -> None:
     every dispatched agent is recovered by parsing the issue key out of its
     label. Best-effort: a harness hiccup logs and leaves the store empty
     rather than blocking startup.
+
+    **Whether an agent was parked is recovered too**, from the harness's own
+    status rather than from the label, which does not record it
+    (``_RECOVERED``). Getting it back matters beyond the operator's table: a
+    push to ``main`` wakes the issues that are Blocked
+    (:func:`wake_on_push`), and in Pull Request mode the steady state is a
+    fleet of agents all waiting on review, so a restart that returned them all
+    as working left that wake with nobody to find.
     """
     try:
         agents = manager.list_agents()
@@ -164,10 +193,10 @@ def rebuild_store() -> None:
         key = issue_key_from_label(record.ref.label)
         if key is None:
             continue
-        # Reconstructed as IN_PROGRESS: enough to hold the capacity-1 slot and
-        # prevent double-launch. A BLOCKED issue also holds a live agent, but
-        # distinguishing that (and full orphan reconciliation) is out of scope
-        # here.
+        # Either status holds the capacity slot and prevents a double launch;
+        # which one it is decides whether a push to `main` reaches the agent.
+        # Full orphan reconciliation stays out of scope here.
+        status = _RECOVERED.get(record.status, IssueStatus.IN_PROGRESS)
         # `repo` is read back out of the workspace the agent is sitting in,
         # not remembered: a restart between dispatch and completion is the
         # ordinary case — the operator merges an agent's pull request and
@@ -180,9 +209,10 @@ def rebuild_store() -> None:
             Issue(
                 key=key,
                 title="",
-                status=IssueStatus.IN_PROGRESS,
+                status=status,
                 repo=str(repo) if repo else "",
                 directory=record.cwd,
+                blocker=RECOVERED_BLOCKER if status is IssueStatus.BLOCKED else "",
                 agent=record.ref,
             )
         )

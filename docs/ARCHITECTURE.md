@@ -407,9 +407,24 @@ about a running agent needs persisting to find it again.
 One `agent.list` against herdr rebuilds the issue-to-agent map from the
 labels, finding every live agent including parked ones.
 
-It recovers no more than that. Every agent returns as In Progress, because
-the label does not record that it was blocked, and titles, blockers and
-conversation ids are lost.
+**Whether an agent was parked comes back with it**, from the status in that
+same listing rather than from the label, which does not record it: an agent
+that is not mid-turn has finished one and is waiting, which in this system
+means it parked. A status that says the agent could not be read, or that it is
+waiting on input rather than on the world, is not read that way — claiming
+either had parked would be a guess in the direction that wakes agents nobody
+was waiting for.
+
+Getting it back matters beyond the operator's table. A push to `main` wakes
+the issues that are Blocked (§4.2), and in Pull Request mode the steady state
+is a fleet of agents all waiting on review (§5.2), so a restart that returned
+them all as working left that wake with nobody to find.
+
+Titles and conversation ids are still lost, and so is the blocker's text: a
+recovered issue carries a placeholder saying it is unknown. That is affordable
+because the blocker is a note and never a key (§1.6) — nothing matches on it,
+so an honest placeholder tells the operator as much as prompting every idle
+worker to report itself again would have, and costs no agent turns to get.
 
 The repo each workspace was built from is not lost with them, because it is
 not recovered from the label at all: a secondary workspace's `.jj/repo` names
