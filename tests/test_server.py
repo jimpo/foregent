@@ -278,12 +278,96 @@ class DispatchTests(unittest.TestCase):
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
 
-    def test_capacity_is_one_agent(self) -> None:
+    def pull_request(self) -> None:
+        """Read every repo in this test as Pull Request mode."""
+        self.enterContext(
+            mock.patch.object(
+                server.workspaces, "mode_for", return_value=Mode.PULL_REQUEST
+            )
+        )
+
+    def test_bootstrap_mode_runs_one_agent_at_a_time(self) -> None:
+        # `main` is the bridge's to advance and every workspace is built on it,
+        # so a second bootstrap agent would branch from a commit the first is
+        # about to move past. The directories here are not jj repos, which is
+        # bootstrap (JIM-151).
         self.queue("JIM-88", "/ws/JIM-88")
         server.dispatch()
         self.queue("JIM-89", "/ws/JIM-89")
         server.dispatch()
         self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+    def test_pull_request_mode_runs_several_agents_at_once(self) -> None:
+        # Nothing in the repo serialises them: each pushes its own branch and
+        # `main` is the reviewer's to move. One dispatch drains the queue.
+        self.pull_request()
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+
+        server.dispatch()
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched],
+            ["fg-jim-88", "fg-jim-89", "fg-jim-90"],
+        )
+
+    def test_pull_request_mode_stops_at_the_limit(self) -> None:
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+
+        server.dispatch()
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
+        )
+
+    def test_a_parked_agent_still_holds_one_of_several_slots(self) -> None:
+        # A blocked agent is alive in its workspace holding a pane, so parking
+        # frees nothing here either (JIM-151).
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+        server.dispatch()
+
+        server.store.block("JIM-88", "a review of the PR")
+        server.dispatch()
+
+        self.assertEqual(len(self.manager.launched), 2)
+
+    def test_a_queued_bootstrap_issue_stalls_the_queue_behind_it(self) -> None:
+        # Strictly FIFO: the head is never skipped, so the pull-request issue
+        # behind it waits too rather than queue order becoming policy.
+        modes = {"/bs/repo": Mode.BOOTSTRAP, "/pr/repo": Mode.PULL_REQUEST}
+        self.enterContext(
+            mock.patch.object(
+                server.workspaces, "mode_for", lambda repo: modes[str(repo)]
+            )
+        )
+        self.queue("JIM-88", "/pr/repo")
+        server.dispatch()
+
+        self.queue("JIM-89", "/bs/repo")
+        self.queue("JIM-90", "/pr/repo")
+        server.dispatch()
+
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+    def test_one_completion_starts_everything_the_queue_was_waiting_on(self) -> None:
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90", "JIM-91"):
+            self.queue(key, "/ws/repo")
+        server.dispatch()
+
+        server.complete_issue("JIM-88")
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched],
+            ["fg-jim-88", "fg-jim-89", "fg-jim-90"],
+        )
 
     def test_a_parked_agent_still_holds_its_slot(self) -> None:
         # A blocked agent is alive in its workspace, so it must keep occupying

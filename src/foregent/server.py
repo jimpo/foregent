@@ -468,20 +468,27 @@ def ensure_skills() -> None:
 
 
 def dispatch() -> None:
-    """Launch an agent for the oldest Queued issue, capacity allowing.
+    """Launch agents for the queued issues, capacity allowing (JIM-151).
 
-    Capacity is hardcoded at one concurrently running agent, occupied by any
-    in-flight issue: a working one, one parked alive on a blocker, and one in
-    review alike each hold a live agent (:data:`~foregent.store.IN_FLIGHT`).
-    Before launch, the issue is claimed directly in Linear (assignee + In
-    Progress state) — no agent runs without a durable ownership record. On a
-    Linear or harness failure the issue stays Queued and the caller's request
-    fails with 502. Foregent's skills are installed first
-    (:func:`ensure_skills`), because the agent cannot pick up one that appears
-    after it starts.
+    Launches until the queue is empty or the next issue does not fit, so one
+    completion can start more than one agent where the queue has been waiting
+    on capacity.
+
+    **Strictly FIFO.** A head that does not fit stalls the queue rather than
+    being skipped: skipping it would make queue order a scheduling policy, with
+    a starvation question attached, and the only arrangement it helps is a box
+    hosting two projects — which the one-project-per-box boundary
+    (docs/ARCHITECTURE.md §1.1) says does not exist.
 
     Serialised by :data:`_dispatching`, because the capacity check and the
     write that satisfies it are several harness calls apart.
+
+    Before launch, each issue is claimed directly in Linear (assignee + In
+    Progress state) — no agent runs without a durable ownership record. On a
+    Linear or harness failure the issue stays Queued, the rest of the queue is
+    left alone, and the caller's request fails with 502. Foregent's skills are
+    installed first (:func:`ensure_skills`), because the agent cannot pick up
+    one that appears after it starts.
 
     Dispatch is not atomic, and the deterministic agent label is what makes
     that survivable. If the brief fails to send after the agent starts, a
@@ -492,16 +499,44 @@ def dispatch() -> None:
     fix for both is orphan reconciliation.
     """
     with _dispatching:
-        _dispatch_one()
+        while _dispatch_one():
+            pass
 
 
-def _dispatch_one() -> None:
-    """Launch an agent for the oldest Queued issue. Caller holds the lock."""
-    if any(issue.status in IN_FLIGHT for issue in store):
-        return
+def admits(issue: Issue) -> bool:
+    """Whether there is room to launch ``issue`` now.
+
+    **Bootstrap mode is one agent at a time, and that is the repo's rule
+    rather than a policy.** A workspace is built at ``main`` and completion
+    fast-forwards ``main`` onto the agent's tip (§4.3), so two bootstrap agents
+    branch from the same commit and the second cannot land what it wrote.
+    Advancing before the next dispatch is what gives each agent a base that
+    holds the last one's work; running them together throws that away.
+
+    Pull Request mode has neither half — the agent pushes its own branch and
+    ``main`` is the reviewer's to move — so it is limited only by what the box
+    is told it can carry (:func:`foregent.config.max_agents`).
+
+    Every in-flight issue counts, parked ones included (§1.7): a blocked agent
+    is a live process holding a workspace and a pane, and freeing its slot
+    would launch a second agent onto the same machine's back.
+
+    A queued bootstrap issue therefore waits behind agents on *any* repo. That
+    is over-strict only where a box hosts two projects, which §1.1 rules out,
+    and the safe answer everywhere else.
+    """
+    limit = 1 if mode_of(issue) is Mode.BOOTSTRAP else config.max_agents()
+    return sum(1 for tracked in store if tracked.status in IN_FLIGHT) < limit
+
+
+def _dispatch_one() -> bool:
+    """Launch an agent for the oldest Queued issue; whether one started.
+
+    The caller holds :data:`_dispatching`.
+    """
     issue = store.next_queued()
-    if issue is None:
-        return
+    if issue is None or not admits(issue):
+        return False
     label = label_for(issue.key)
     repo = Path(issue.repo)
     ensure_skills()
@@ -536,6 +571,7 @@ def _dispatch_one() -> None:
     store.add(
         replace(issue, status=IssueStatus.IN_PROGRESS, directory=cwd, agent=ref)
     )
+    return True
 
 
 def _adopt(label: str) -> AgentRecord | None:
@@ -611,10 +647,10 @@ def deliver_issue(
     worker should see activity on its own issue as soon as it happens
    . The send itself waits for whatever the agent is
     doing to finish, so it happens on the drainer thread
-    (:func:`drain`) and this route only enqueues. What the caller
-    is told is therefore that the message is *accepted*, not that it has been
-    read: the issue comes back as it stands, so a parked one still reads
-    BLOCKED until :func:`send_queued` has sent and unblocked it.
+    (:func:`drain`) and this route only enqueues. What the caller is told is
+    therefore that the message is *accepted*, not that it has been read: the
+    issue comes back as it stands, so a parked one still reads BLOCKED until
+    :func:`send_queued` has sent and unblocked it.
 
     409 for an issue with no agent to prompt, checked here rather than on the
     drainer so an event with nowhere to go is answered instead of queued.

@@ -226,10 +226,14 @@ foregent queue JIM-42 -d ~/src/myrepo   # queue an issue against a repo
 foregent status                         # what is tracked, and its state
 ```
 
-`queue` records the issue and dispatches it if there is capacity — **one running
-agent at a time**. Dispatch assigns the issue to the foregent account in Linear
-and moves it to `In Progress`, so the team must have a state with exactly that
-name. A queued issue waits until the running agent finishes.
+`queue` records the issue and dispatches it if there is capacity. **How many
+agents run at once is the project's mode**: bootstrap mode is one at a time,
+because the bridge advances `main` onto each agent's work and the next
+workspace is built from it; Pull Request mode runs up to `FOREGENT_MAX_AGENTS`
+(default 3), each in its own workspace with its own branch. Dispatch assigns
+the issue to the foregent account in Linear and moves it to `In Progress`, so
+the team must have a state with exactly that name. A queued issue waits its
+turn, in the order it was queued.
 
 `-d` is the **repository**, not the agent's working directory. Dispatch builds
 the agent a jj workspace of its own from it — `~/.foregent/workspaces/JIM-42`
@@ -265,8 +269,9 @@ Completion tears the agent down and dispatches the next queued issue.
 
 An agent that hits an external dependency calls `report_blocked` and **stays
 alive** in its workspace with its context intact. It keeps holding the capacity
-slot. Comment on the issue in Linear; the comment reaches the agent as a
-prompt, and delivering it unblocks the issue.
+slot, so `FOREGENT_MAX_AGENTS` is in practice how many pull requests may be
+open and waiting for review at once. Comment on the issue in Linear; the
+comment reaches the agent as a prompt, and delivering it unblocks the issue.
 
 Observe by attaching, from the box or from a laptop:
 
@@ -300,12 +305,13 @@ state.
 | `FOREGENT_HERDR_SESSION` | The herdr session to run agents in. Falls back to the session the bridge process runs in, then herdr's default. |
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
+| `FOREGENT_MAX_AGENTS` | How many agents run at once in Pull Request mode (default 3). Bootstrap mode is always one. |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
 
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 312 unit tests, ~6s
+uv run python -m unittest discover -s tests -t .   # 326 unit tests, ~6s
 uv run ty check                                    # type check
 ```
 

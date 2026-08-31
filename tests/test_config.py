@@ -42,5 +42,30 @@ class ApiUrlTests(unittest.TestCase):
             self.assertEqual(config.api_url(), config.DEFAULT_API_URL)
 
 
+class MaxAgentsTests(unittest.TestCase):
+    """How many agents a box will run at once (JIM-151)."""
+
+    def test_the_environment_overrides_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "5"}):
+            self.assertEqual(config.max_agents(), 5)
+
+    def test_the_default_is_used_when_unset(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(config.max_agents(), config.DEFAULT_MAX_AGENTS)
+
+    def test_a_value_that_is_not_a_number_falls_back_and_says_so(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "three"}):
+            with self.assertLogs(config.logger, "WARNING"):
+                self.assertEqual(config.max_agents(), config.DEFAULT_MAX_AGENTS)
+
+    def test_no_setting_can_stop_dispatch_altogether(self) -> None:
+        # A zero would leave the box refusing to dispatch with nothing to say
+        # why, which is worse than ignoring the operator.
+        for setting in ("0", "-1"):
+            with self.subTest(setting=setting):
+                with mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": setting}):
+                    self.assertEqual(config.max_agents(), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
