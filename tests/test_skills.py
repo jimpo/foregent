@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 import foregent
-from foregent import cli, skills
+from foregent import cli, server, skills
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -151,18 +151,6 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(outcomes["foregent-worker"], skills.Outcome.UPDATED)
         self.assertNotEqual(self.worker().read_text(), "stale\n")
 
-    def test_ensure_writes_a_missing_skill(self) -> None:
-        self.assertEqual(skills.ensure(self.root), ["foregent-worker"])
-        self.assertTrue(self.worker().is_file())
-
-    def test_ensure_leaves_an_existing_skill_alone(self) -> None:
-        # This runs on every dispatch; clobbering a deliberately edited skill
-        # mid-flight is worse than serving a stale one.
-        skills.install(self.root)
-        self.worker().write_text("hand edited\n")
-        self.assertEqual(skills.ensure(self.root), [])
-        self.assertEqual(self.worker().read_text(), "hand edited\n")
-
     def test_installing_leaves_no_staging_files_behind(self) -> None:
         # The copy is staged in the destination directory to make the rename
         # atomic; a stray temp file there is one Claude Code would try to load.
@@ -173,10 +161,47 @@ class InstallTests(unittest.TestCase):
         )
 
     def test_an_empty_directory_does_not_count_as_installed(self) -> None:
-        # A half-finished copy must not make the safety net skip the skill.
+        # A half-finished copy is a fresh install, not an update.
         (self.root / "foregent-worker").mkdir(parents=True)
-        self.assertEqual(skills.ensure(self.root), ["foregent-worker"])
+        outcomes = dict(skills.install(self.root))
+        self.assertEqual(outcomes["foregent-worker"], skills.Outcome.INSTALLED)
         self.assertTrue(self.worker().is_file())
+
+
+class DispatchRefreshesSkillsTests(unittest.TestCase):
+    """JIM-143: an agent is briefed from the copy on disk, so dispatch writes it.
+
+    The bug this guards was silent in both directions: the stale skill named a
+    file that no longer existed, and neither the server log nor the agent had
+    any way to say so.
+    """
+
+    def setUp(self) -> None:
+        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}))
+        self.worker = config / "skills" / "foregent-worker" / "SKILL.md"
+
+    def test_a_stale_skill_is_refreshed_before_a_launch(self) -> None:
+        skills.install()
+        self.worker.write_text("read docs/PLAN.md\n")
+        with self.assertLogs("foregent.server", level="INFO") as logs:
+            server.ensure_skills()
+        packaged = (skills.PACKAGED / "foregent-worker" / "SKILL.md").read_text()
+        self.assertEqual(self.worker.read_text(), packaged)
+        self.assertIn("updated the foregent-worker skill", "\n".join(logs.output))
+
+    def test_an_up_to_date_skill_is_not_announced(self) -> None:
+        # Every dispatch runs this; a line per skill per launch is noise.
+        skills.install()
+        with mock.patch.object(server.logger, "info") as info:
+            server.ensure_skills()
+        info.assert_not_called()
+
+    def test_a_machine_that_cannot_be_written_to_still_dispatches(self) -> None:
+        with mock.patch.object(skills, "install", side_effect=OSError("read-only")):
+            with self.assertLogs("foregent.server", level="WARNING") as logs:
+                server.ensure_skills()
+        self.assertIn("could not install", "\n".join(logs.output))
 
 
 class SetupCommandTests(unittest.TestCase):

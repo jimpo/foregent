@@ -221,14 +221,15 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(present_at_launch, [True])
         self.assertIn("foregent-worker", self.skill.read_text())
 
-    def test_dispatch_leaves_an_existing_skill_alone(self) -> None:
-        # The safety net only fills gaps: `foregent setup` is the one
-        # deliberate updater, so an operator's edit survives every dispatch.
+    def test_dispatch_refreshes_a_stale_skill(self) -> None:
+        # The agent is briefed from the copy on disk, so a box that has not
+        # run `foregent setup` since an upgrade must not brief it from a skill
+        # foregent no longer ships (JIM-143).
         self.skill.parent.mkdir(parents=True)
-        self.skill.write_text("hand edited\n")
+        self.skill.write_text("stale\n")
         self.queue()
         server.dispatch()
-        self.assertEqual(self.skill.read_text(), "hand edited\n")
+        self.assertIn("foregent-worker", self.skill.read_text())
 
     def test_dispatch_survives_a_skill_directory_it_cannot_write(self) -> None:
         # An agent working the issue without foregent's instructions beats no

@@ -6,14 +6,13 @@ place a session loads for every project. The skill files themselves sit
 alongside this module inside the installed package, so they travel with a
 ``uv tool install foregent`` rather than only existing in a repo checkout.
 
-Two callers install them, and they must not drift apart, which is why both
-live here:
+Two callers install them through the one function :func:`install`, so what
+an agent is briefed from cannot drift from what foregent ships:
 
-- ``foregent setup`` (:func:`install`), run once per machine and again after
-  upgrading foregent. It updates skills that have changed.
-- The server, before launching an agent (:func:`ensure`). A gap-filler only:
-  it writes what is missing and never overwrites, leaving ``setup`` as the one
-  deliberate updater so an operator's edit survives every dispatch.
+- ``foregent setup``, run once per machine and again after upgrading foregent.
+- The server, before launching an agent. An agent is briefed from the skill on
+  disk, so dispatch refreshes it: a copy left over from an older foregent
+  would otherwise brief every agent silently, and nothing downstream can tell.
 """
 
 from __future__ import annotations
@@ -35,8 +34,6 @@ class Outcome(StrEnum):
     INSTALLED = "installed"
     UPDATED = "updated"
     UNCHANGED = "unchanged"
-    KEPT = "kept"
-    """Already present and left alone (:func:`ensure` only)."""
 
 
 def skills_root() -> Path:
@@ -67,27 +64,10 @@ def install(root: Path | None = None) -> list[tuple[str, Outcome]]:
     edits were replaced should be told rather than left to discover it.
     """
     root = root if root is not None else skills_root()
-    return [(skill.name, _install(skill, root, overwrite=True)) for skill in packaged()]
+    return [(skill.name, _install(skill, root)) for skill in packaged()]
 
 
-def ensure(root: Path | None = None) -> list[str]:
-    """Install only the packaged skills absent from ``root``.
-
-    The names of the skills actually written. Never touches one that is
-    already there: this runs on every dispatch, and clobbering a deliberately
-    edited skill mid-flight is worse than serving a stale one. The cost is
-    that a skill left over from an older foregent persists silently — the fix
-    for that is running ``foregent setup`` after an upgrade.
-    """
-    root = root if root is not None else skills_root()
-    return [
-        skill.name
-        for skill in packaged()
-        if _install(skill, root, overwrite=False) is Outcome.INSTALLED
-    ]
-
-
-def _install(skill: Path, root: Path, *, overwrite: bool) -> Outcome:
+def _install(skill: Path, root: Path) -> Outcome:
     """Copy one packaged skill directory into ``root``."""
     target = root / skill.name
     files = [(source, target / source.relative_to(skill)) for source in _files(skill)]
@@ -95,8 +75,6 @@ def _install(skill: Path, root: Path, *, overwrite: bool) -> Outcome:
     # the loader reads, and an empty directory left by a half-finished copy
     # must not read as installed.
     if (target / "SKILL.md").is_file():
-        if not overwrite:
-            return Outcome.KEPT
         if all(
             destination.is_file() and destination.read_bytes() == source.read_bytes()
             for source, destination in files

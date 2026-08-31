@@ -489,11 +489,14 @@ def check_agent_mcp() -> None:
 
 
 def ensure_skills() -> None:
-    """Install any packaged skill this machine is missing, before a launch.
+    """Install every packaged skill onto this machine, before a launch.
 
-    `foregent setup` is the deliberate installer; this is the safety net that
-    keeps a box where it was never run from briefing an agent to use a skill
-    that is not there. It only fills gaps — updating is setup's job.
+    The agent is briefed from the copy on disk, so dispatch writes the
+    packaged text over whatever is there (JIM-143). A box where `foregent
+    setup` was never run, or not re-run since an upgrade, would otherwise
+    brief every agent from a skill foregent no longer ships, and nothing
+    downstream can tell that it did. The cost is that a hand-edited skill does
+    not survive a dispatch; edit the packaged one.
 
     **Must complete before `manager.launch`, never alongside it.** Claude Code
     watches skill directories live, but only ones that existed when the
@@ -510,12 +513,13 @@ def ensure_skills() -> None:
     while there is one harness; a second one makes this a manager method.
     """
     try:
-        installed = skills.ensure()
+        outcomes = skills.install()
     except OSError as exc:
         logger.warning("could not install foregent's skills: %s", exc)
         return
-    for name in installed:
-        logger.info("installed the %s skill into %s", name, skills.skills_root())
+    for name, outcome in outcomes:
+        if outcome is not skills.Outcome.UNCHANGED:
+            logger.info("%s the %s skill in %s", outcome, name, skills.skills_root())
 
 
 def dispatch() -> None:
@@ -538,8 +542,8 @@ def dispatch() -> None:
     Progress state) — no agent runs without a durable ownership record. On a
     Linear or harness failure the issue stays Queued, the rest of the queue is
     left alone, and the caller's request fails with 502. Foregent's skills are
-    installed first (:func:`ensure_skills`), because the agent cannot pick up
-    one that appears after it starts.
+    refreshed first (:func:`ensure_skills`), because the agent cannot pick up
+    a skill that appears or changes after it starts.
 
     Dispatch is not atomic, and the deterministic agent label is what makes
     that survivable. If the brief fails to send after the agent starts, a
