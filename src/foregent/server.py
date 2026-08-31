@@ -12,7 +12,8 @@ thread, so whoever ingested one is never held behind an agent that is mid-turn
 and no agent is held behind another.
 ``/webhooks/github`` is the same door for what GitHub pushes about the pull
 requests those agents open; it authenticates a delivery and, for now, stops
-there.
+there. ``/health`` reports when Linear last delivered, because push is the
+only thing that wakes an agent and a hook that has stopped looks like quiet.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -26,8 +27,10 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
 
@@ -108,6 +111,22 @@ _deliveries_lock = threading.Lock()
 # slots are free, which also keeps concurrent `jj workspace add` off one repo.
 # ponytail: one lock for the fleet; per-repo locks if launch latency matters.
 _dispatching = threading.Lock()
+
+# How many recent Linear deliveries are remembered, newest last, to answer a
+# repeat of one already acted on. Linear retries a delivery it believes
+# failed, and a retried comment must not prompt a worker twice. The signature
+# is the key: there is no per-delivery id in the payload, but Linear signs the
+# exact bytes it sent, so a retry carries the signature already seen and two
+# distinct deliveries — each with its own `webhookTimestamp` — never collide.
+# ponytail: a linear scan of a short deque; a set beside it if this grows.
+RECENT_DELIVERIES = 256
+_recent: deque[str] = deque(maxlen=RECENT_DELIVERIES)
+
+# When an authentic Linear delivery last arrived, as an ISO-8601 instant, or
+# empty until one has. Push is the only thing that tells a worker its issue
+# moved, so a webhook that has stopped delivering otherwise looks like a quiet
+# day; this is what :func:`health` reports so it does not.
+_last_delivery = ""
 
 # How long to pause before offering a refused message again. A prompt is
 # submitted without waiting for the agent to be free, so a refusal is the
@@ -587,6 +606,18 @@ def _adopt(label: str) -> AgentRecord | None:
     return None
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    """Report when an authentic Linear delivery last arrived, or never.
+
+    The one thing about this bridge an operator cannot see from the issues:
+    every agent is woken by push and nothing else, so a webhook that has
+    stopped delivering leaves a fleet that looks merely idle. A timestamp
+    hours old says which it is.
+    """
+    return {"last_linear_delivery": _last_delivery}
+
+
 @app.get("/issues")
 def list_issues() -> list[dict[str, str]]:
     """Return the tracked issues as ``{key, title, status, blocker}`` records."""
@@ -705,8 +736,10 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     Linear sends is about issues no agent here is working, and a 200 is the
     honest answer: nothing failed, and telling Linear otherwise buys three
     pointless retries of an event that would be dropped again. That covers a
-    payload naming no issue, an issue nobody is working, and foregent's own
-    writes coming back at it.
+    payload naming no issue, an issue nobody is working, foregent's own
+    writes coming back at it, and a repeat of a delivery already acted on —
+    which is the same answer the first copy got, and the answer that stops
+    Linear sending a third.
 
     The one delivery that is *not* accepted is one that arrives while
     foregent's own account id is unknown (:func:`own_viewer`): matching
@@ -719,19 +752,31 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     delivery that does not prove it came from Linear, absent signature
     included; 503 when this bridge holds no secret to check one against, which
     is an operator's misconfiguration and not the caller's fault; 400 for a
-    signed body that is not JSON, which is not a delivery Linear makes.
+    signed body that is not JSON, which is not a delivery Linear makes, and
+    for one whose own timestamp puts it outside the replay window
+    (:func:`~foregent.linear.webhook_fresh`) — the signature holds, so
+    refusing it is the whole of not acting on a replay.
     """
     body = await request.body()
+    signature = request.headers.get(linear.SIGNATURE_HEADER, "")
     try:
-        authentic = linear.webhook_authentic(
-            body, request.headers.get(linear.SIGNATURE_HEADER, "")
-        )
+        authentic = linear.webhook_authentic(body, signature)
     except linear.LinearError as exc:
         logger.error("cannot authenticate Linear webhooks: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not authentic:
         raise HTTPException(status_code=401, detail="signature does not match")
     payload = _payload(body)
+    if not linear.webhook_fresh(payload):
+        raise HTTPException(status_code=400, detail="delivery is outside the window")
+    global _last_delivery
+    _last_delivery = datetime.now(UTC).isoformat(timespec="seconds")
+    # Nothing is awaited between the read and the write, so two copies of one
+    # delivery arriving together cannot both find it unseen.
+    if signature in _recent:
+        logger.info("dropping a repeat of a delivery already acted on")
+        return {"status": "ok"}
+    _recent.append(signature)
     event = linear.webhook_event(payload)
     if event is None:
         logger.debug("Linear webhook is about no issue foregent knows: %s", payload)

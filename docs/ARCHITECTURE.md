@@ -181,22 +181,39 @@ Linear posts to `POST /webhooks/linear`. The body is authenticated by
 HMAC-SHA256 against `LINEAR_WEBHOOK_SECRET` and mapped to an `Event`. Push is
 the whole of foregent's inbound path: nothing asks Linear what changed.
 
-1. **Match.** `wakes(event, viewer)` returns the issue key, or nothing. A
+When an authentic delivery last arrived is recorded and served from
+`GET /health`, which `foregent status` prints above its table. Push is the
+only thing that wakes an agent, so a hook that has stopped delivering leaves a
+fleet that looks merely idle; the timestamp is what tells the two apart.
+
+A signature proves Linear sent these bytes, not that it sent them just now,
+so the delivery's own `webhookTimestamp` is checked against a one-minute
+window beside it and a delivery from outside that window is refused 400. Both
+halves are needed: without the second, a captured delivery replays at the
+bridge forever.
+
+1. **Drop a repeat.** Linear retries a delivery it believes failed, and a
+   retried comment must not prompt a worker twice. The signatures of the last
+   few hundred deliveries are held, newest last; one already there is answered
+   200 and goes no further. The signature is the key because the payload
+   carries no per-delivery id — `webhookId` names the webhook — while the
+   signature is a digest of the exact bytes sent.
+2. **Match.** `wakes(event, viewer)` returns the issue key, or nothing. A
    lookup, not a scan — the event names its own issue.
-2. **Drop foregent's own writes.** Claiming an issue, and every comment an
+3. **Drop foregent's own writes.** Claiming an issue, and every comment an
    agent posts through the Linear MCP, come back under foregent's account.
    They are dropped by actor identity. A wake that causes a write is a loop.
-3. **Enqueue and answer.** The route checks in memory that there is an agent,
+4. **Enqueue and answer.** The route checks in memory that there is an agent,
    enqueues, and returns. It never waits on an agent: Linear retries any
    delivery the bridge is slow to answer.
-4. **Drain.** Each issue has its own queue and its own daemon thread, started
+5. **Drain.** Each issue has its own queue and its own daemon thread, started
    on the first delivery to it, so one agent's messages reach it one at a time
    in the order written and no agent waits behind another. A send is offered
    again until it lands or the agent is gone, so a fleet-wide queue would let
    one unreachable agent silence the rest. Nothing is coalesced — merging two
    people's comments into one prompt loses who said what. A drainer ends when
    its issue completes or its agent dies.
-5. **Send, then unblock.** The prompt is submitted straight away, whatever
+6. **Send, then unblock.** The prompt is submitted straight away, whatever
    the agent is doing, and offered again until it lands or the harness
    reports the agent gone. Unblocking happens only after the send succeeds,
    so a failure leaves the issue Blocked with nothing to roll back.

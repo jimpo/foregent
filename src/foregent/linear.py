@@ -7,9 +7,10 @@ is tracking. This is the bridge's own direct Linear access, separate from the
 agent-facing Linear MCP.
 
 Traffic in the other direction — deliveries Linear makes to the bridge — is
-here too: :func:`webhook_authentic` proves a payload came from Linear, and
+here too: :func:`webhook_authentic` proves a payload came from Linear,
+:func:`webhook_fresh` proves it came from Linear just now, and
 :func:`webhook_event` turns it into an event in foregent's own shape. Those
-two are the whole of understanding a Linear payload; nothing above this
+three are the whole of understanding a Linear payload; nothing above this
 module reads one.
 """
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import time
 
 from gql import Client, gql
 from gql.transport.exceptions import TransportError
@@ -31,6 +33,10 @@ TIMEOUT = 30
 
 # The header Linear signs every webhook delivery with (:func:`webhook_authentic`).
 SIGNATURE_HEADER = "Linear-Signature"
+
+# How far from now a delivery may say it was sent and still be acted on
+# (:func:`webhook_fresh`), in seconds. Linear's own replay guidance.
+WINDOW = 60
 
 # Comments read per call. A window with more than this is served oldest-first
 # across consecutive calls rather than truncated; see :func:`poll_comments`.
@@ -176,6 +182,24 @@ def webhook_authentic(body: bytes, signature: str) -> bool:
         raise LinearError("LINEAR_WEBHOOK_SECRET is not set")
     digest = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(digest, signature)
+
+
+def webhook_fresh(payload: dict) -> bool:
+    """Whether the delivery ``payload`` holds was sent within :data:`WINDOW`.
+
+    Linear stamps every delivery with the millisecond it sent it, and asks
+    that one further from now than a minute be refused. That is what makes a
+    signature mean *now*: on its own it proves only that Linear sent these
+    bytes at some point, so a captured delivery replays forever.
+
+    A payload carrying no ``webhookTimestamp`` is fresh. The signature covers
+    the exact bytes, so a body without the field is one Linear sent that way,
+    not one stripped of it on the way here.
+    """
+    sent = payload.get("webhookTimestamp")
+    if not isinstance(sent, (int, float)):
+        return True
+    return abs(time.time() - sent / 1000) <= WINDOW
 
 
 def poll_comments(

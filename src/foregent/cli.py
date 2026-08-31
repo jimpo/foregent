@@ -105,10 +105,22 @@ def fetch_issues() -> list[Issue]:
     ]
 
 
+def fetch_last_delivery() -> str:
+    """When Linear last delivered to the server, or "" if it never has."""
+    with urllib.request.urlopen(f"{api_url()}/health") as response:
+        return json.load(response)["last_linear_delivery"]
+
+
 def cmd_status(args: argparse.Namespace) -> int:
-    """Fetch tracked issues from the server and print them as a table."""
+    """Fetch tracked issues from the server and print them as a table.
+
+    Headed by when Linear last delivered, because that is what an idle fleet
+    cannot tell an operator on its own: every agent is woken by push, so a
+    hook that has stopped and a quiet morning look the same in the table.
+    """
     try:
         issues = fetch_issues()
+        last = fetch_last_delivery()
     except urllib.error.URLError as exc:
         print(
             f"Cannot reach foregent server at {api_url()}: {exc.reason}",
@@ -116,6 +128,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         )
         return 1
 
+    print(f"Linear last delivered: {last or 'never'}")
     if not issues:
         print("No issues are being tracked.")
         return 0

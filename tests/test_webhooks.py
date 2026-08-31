@@ -23,7 +23,10 @@ import json
 import os
 import queue
 import threading
+import time
 import unittest
+from collections import deque
+from datetime import datetime
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -80,6 +83,32 @@ class WebhookAuthenticTests(unittest.TestCase):
                 linear.webhook_authentic(b"{}", "")
 
 
+class WebhookFreshTests(unittest.TestCase):
+    """The replay window, which is what makes a signature mean *now* (JIM-135)."""
+
+    def stamped(self, ago: float) -> dict:
+        """A payload saying Linear sent it ``ago`` seconds before now."""
+        return {"webhookTimestamp": (time.time() - ago) * 1000}
+
+    def test_a_delivery_sent_just_now_is_fresh(self) -> None:
+        self.assertTrue(linear.webhook_fresh(self.stamped(0)))
+
+    def test_one_inside_the_window_is_fresh(self) -> None:
+        self.assertTrue(linear.webhook_fresh(self.stamped(linear.WINDOW - 1)))
+
+    def test_one_older_than_the_window_is_not(self) -> None:
+        self.assertFalse(linear.webhook_fresh(self.stamped(linear.WINDOW + 1)))
+
+    def test_one_dated_ahead_of_the_window_is_not(self) -> None:
+        # A clock the wrong way out is as much a reason to refuse.
+        self.assertFalse(linear.webhook_fresh(self.stamped(-linear.WINDOW - 1)))
+
+    def test_a_delivery_that_names_no_time_is_fresh(self) -> None:
+        # The signature covers the exact bytes, so a body without the field is
+        # one Linear sent that way, not one stripped of it on the way here.
+        self.assertTrue(linear.webhook_fresh({"type": "Comment"}))
+
+
 class WebhookRouteTests(unittest.TestCase):
     """Which deliveries ``POST /webhooks/linear`` accepts at all."""
 
@@ -92,6 +121,13 @@ class WebhookRouteTests(unittest.TestCase):
         # so hand one over rather than have a test of the signature ask
         # Linear for it. The store is empty, so nothing is delivered anyway.
         self.enterContext(mock.patch.object(server, "_viewer", "own-id"))
+        # The recent-delivery memory is process-wide, and these tests replay
+        # one body across several of them; each starts with an empty one.
+        self.enterContext(
+            mock.patch.object(server, "_recent", deque(maxlen=server.RECENT_DELIVERIES))
+        )
+        # As is the last-delivery mark, which starts each test unset.
+        self.enterContext(mock.patch.object(server, "_last_delivery", ""))
 
     def post(self, body: bytes, signature: str | None):
         headers = {"Content-Type": "application/json"}
@@ -123,6 +159,17 @@ class WebhookRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertIn("LINEAR_WEBHOOK_SECRET", response.json()["detail"])
 
+    def test_a_replayed_delivery_is_refused_though_it_is_signed(self) -> None:
+        # The signature still holds: Linear did send these bytes, an hour ago.
+        stale = dict(PAYLOAD, webhookTimestamp=(time.time() - 3600) * 1000)
+        body = json.dumps(stale).encode()
+        self.assertEqual(self.post(body, sign(body)).status_code, 400)
+
+    def test_the_same_delivery_sent_now_is_accepted(self) -> None:
+        fresh = dict(PAYLOAD, webhookTimestamp=time.time() * 1000)
+        body = json.dumps(fresh).encode()
+        self.assertEqual(self.post(body, sign(body)).status_code, 200)
+
 
 class WebhookDeliveryTests(unittest.TestCase):
     """Who a delivery reaches, and what Linear is told about it (JIM-133)."""
@@ -148,6 +195,13 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.viewer = self.enterContext(
             mock.patch.object(server.linear, "viewer_id", return_value=self.VIEWER)
         )
+        # The recent-delivery memory is process-wide, and these tests replay
+        # one body across several of them; each starts with an empty one.
+        self.enterContext(
+            mock.patch.object(server, "_recent", deque(maxlen=server.RECENT_DELIVERIES))
+        )
+        # As is the last-delivery mark, which starts each test unset.
+        self.enterContext(mock.patch.object(server, "_last_delivery", ""))
 
     def track(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
         """Put ``KEY`` in the store with an agent behind it."""
@@ -168,6 +222,10 @@ class WebhookDeliveryTests(unittest.TestCase):
             "actor": {"id": actor, "name": "AJ"},
             "data": {"body": "ship it", "issue": {"identifier": key}},
         }
+
+    def last_delivery(self) -> str:
+        """When the server says Linear last delivered to it."""
+        return self.client.get("/health").json()["last_linear_delivery"]
 
     def deliver(self, payload: dict):
         """Post ``payload`` signed, then hand what it queued to the agents."""
@@ -273,6 +331,56 @@ class WebhookDeliveryTests(unittest.TestCase):
         response = self.deliver(self.comment(actor=self.VIEWER))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.manager.sent, [])
+
+    def test_a_retried_delivery_prompts_the_agent_once(self) -> None:
+        # Linear retries a delivery it believes failed; the worker must not
+        # read the same comment twice.
+        self.track()
+        payload = self.comment()
+        first = self.deliver(payload)
+        second = self.deliver(payload)
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+        self.assertEqual(len(self.manager.sent), 1)
+
+    def test_a_second_comment_is_not_mistaken_for_a_retry(self) -> None:
+        # Two deliveries differ in their bodies, so neither hides the other.
+        self.track()
+        self.deliver(self.comment())
+        self.deliver(dict(self.comment(), webhookTimestamp=time.time() * 1000))
+        self.assertEqual(len(self.manager.sent), 2)
+
+    def test_only_the_most_recent_deliveries_are_remembered(self) -> None:
+        # The memory is bounded, so a repeat is only dropped while it is
+        # recent. Nothing else keeps this process from growing on traffic.
+        self.enterContext(mock.patch.object(server, "_recent", deque(maxlen=1)))
+        self.track()
+        payload = self.comment()
+        self.deliver(payload)
+        self.deliver(dict(payload, webhookTimestamp=time.time() * 1000))
+        self.deliver(payload)
+        self.assertEqual(len(self.manager.sent), 3)
+
+    def test_when_linear_last_delivered_is_readable(self) -> None:
+        # Nothing else on the surface separates a hook that has stopped from a
+        # quiet morning, so an authentic delivery has to leave a mark.
+        self.assertEqual(self.last_delivery(), "")
+        self.deliver(self.comment())
+        self.assertAlmostEqual(
+            datetime.fromisoformat(self.last_delivery()).timestamp(),
+            time.time(),
+            delta=60,
+        )
+
+    def test_a_delivery_that_reaches_nobody_still_counts_as_one(self) -> None:
+        # Liveness is the webhook's, not any agent's: most of what Linear
+        # sends is about issues nobody here is working, and that is a
+        # delivering hook all the same.
+        self.deliver(self.comment(key="JIM-999"))
+        self.assertNotEqual(self.last_delivery(), "")
+
+    def test_a_delivery_that_proves_nothing_does_not_count(self) -> None:
+        self.client.post("/webhooks/linear", content=b"{}")
+        self.assertEqual(self.last_delivery(), "")
 
     def test_a_delivery_about_no_issue_is_accepted_and_dropped(self) -> None:
         self.track()
