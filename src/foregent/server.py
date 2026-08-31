@@ -12,7 +12,9 @@ thread, so whoever ingested one is never held behind an agent that is mid-turn
 and no agent is held behind another.
 ``/webhooks/github`` is the same door for what GitHub pushes about the pull
 requests those agents open, matched to an agent by the issue the pull request's
-branch names. ``/health`` reports when Linear last delivered, because push is
+branch names. Both routes account for every delivery at debug level: one line
+as it arrives, and one where it is delivered, filtered out, or not understood.
+``/health`` reports when Linear last delivered, because push is
 the only thing that wakes an agent and a hook that has stopped looks like quiet.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
@@ -777,15 +779,22 @@ def queue_event(event: Event, viewer: str = "") -> None:
         return
     key = wakes(event, viewer)
     if not key:
+        logger.debug(
+            "dropping a %s event: %s",
+            event.kind,
+            "foregent's own write" if event.issue_key else "it names no issue",
+        )
         return
     issue = store.get(key)
     parked = issue is not None and issue.status is IssueStatus.BLOCKED
+    message = delivery_message(event, parked=parked)
     try:
-        deliver_issue(key, delivery_message(event, parked=parked))
+        deliver_issue(key, message)
     except HTTPException as exc:
         logger.debug("event on %s reached nobody: %s", key, exc.detail)
         return
     logger.info("queued for %s on activity by %s", key, event.author or "someone")
+    logger.debug("delivered to %s: %s", key, message)
 
 
 def wake_on_push(event: Event) -> None:
@@ -816,6 +825,7 @@ def wake_on_push(event: Event) -> None:
     change (§5.4). A worker parked on something else is woken too, reads one
     line and parks again; that is the whole price of not keeping it.
     """
+    woken = 0
     for issue in store.in_flight():
         if issue.status is not IssueStatus.BLOCKED:
             continue
@@ -830,6 +840,9 @@ def wake_on_push(event: Event) -> None:
             logger.debug("%s was not woken by the push: %s", issue.key, exc.detail)
             continue
         logger.info("woke %s: main advanced in %s", issue.key, event.repo)
+        woken += 1
+    if not woken:
+        logger.debug("main advanced in %s: no parked agent to wake", event.repo)
 
 
 @app.post("/webhooks/linear")
@@ -875,6 +888,11 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     if not authentic:
         raise HTTPException(status_code=401, detail="signature does not match")
     payload = _payload(body)
+    logger.debug(
+        "Linear delivered a %s %s",
+        payload.get("action") or "nameless",
+        payload.get("type") or "entity",
+    )
     if not linear.webhook_fresh(payload):
         raise HTTPException(status_code=400, detail="delivery is outside the window")
     global _last_delivery
@@ -943,6 +961,7 @@ async def github_webhook(request: Request) -> dict[str, str]:
     # The body names the repository and the pull request; only the header says
     # what happened to them.
     kind = request.headers.get(github.EVENT_HEADER) or "nameless"
+    logger.debug("GitHub delivered a %s %s", payload.get("action") or "nameless", kind)
     # Threadpooled because a conversation comment names no branch, so mapping
     # one asks GitHub for the pull request over a blocking socket.
     event = await run_in_threadpool(github.webhook_event, payload, kind)

@@ -238,6 +238,14 @@ before foregent knows its own account id is answered 503, the one delivery
 not accepted, because matching without that id wakes an agent with its own
 comment.
 
+**Every delivery is accounted for at debug level.** One line as it arrives,
+naming what the platform called it, and one where it ends: the message an agent
+was handed and which agent, or the reason it went nowhere — foregent's own
+write coming back, an event naming no issue, a payload the bridge does not
+recognize, a push no agent is parked on. `FOREGENT_LOG_LEVEL=debug` is
+therefore the whole of accounting for a webhook that reached the bridge and no
+worker, and a fleet at `info` prints no more than it did.
+
 GitHub posts to `POST /webhooks/github`, the second inbound path, for what
 happens to the pull requests agents open in Pull Request mode. Authentication
 is the same shape — HMAC-SHA256 over the exact bytes received, against

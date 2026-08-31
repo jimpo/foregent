@@ -251,6 +251,12 @@ class WebhookDeliveryTests(unittest.TestCase):
             },
         )
 
+    def logs_from(self, payload: dict) -> str:
+        """Everything the server logged at debug while delivering ``payload``."""
+        with self.assertLogs("foregent.server", "DEBUG") as logs:
+            self.deliver(payload)
+        return "\n".join(logs.output)
+
     def test_a_comment_on_a_working_issue_reaches_its_agent(self) -> None:
         self.track()
         response = self.deliver(self.comment())
@@ -333,6 +339,25 @@ class WebhookDeliveryTests(unittest.TestCase):
         response = self.deliver(self.comment(actor=self.VIEWER))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.manager.sent, [])
+
+    def test_a_delivered_event_logs_what_reached_which_agent(self) -> None:
+        # An operator running at debug can account for any delivery: this one
+        # arrived, and this is the prompt the agent was handed for it.
+        self.track()
+        logs = self.logs_from(self.comment())
+        self.assertIn("Linear delivered a create Comment", logs)
+        self.assertIn("delivered to JIM-133: AJ commented on JIM-133.", logs)
+
+    def test_a_filtered_delivery_says_it_was_filtered(self) -> None:
+        self.track()
+        self.assertIn(
+            "foregent's own write", self.logs_from(self.comment(actor=self.VIEWER))
+        )
+
+    def test_a_delivery_that_is_not_understood_is_summarized(self) -> None:
+        logs = self.logs_from({"action": "create", "type": "Comment", "data": {}})
+        self.assertIn("Linear delivered a create Comment", logs)
+        self.assertIn("about no issue foregent knows", logs)
 
     def test_a_retried_delivery_prompts_the_agent_once(self) -> None:
         # Linear retries a delivery it believes failed; the worker must not
@@ -974,6 +999,15 @@ class PushWakeTests(GitHubDeliveryTest):
             sorted(ref.label for ref, _ in self.manager.sent),
             ["fg-jim-141", "fg-jim-142"],
         )
+
+    def test_a_push_that_wakes_nobody_says_so(self) -> None:
+        # An operator running at debug can tell a push nobody was parked on
+        # apart from one the bridge never received.
+        with self.assertLogs("foregent.server", "DEBUG") as logs:
+            self.push_to_main()
+        text = "\n".join(logs.output)
+        self.assertIn("GitHub delivered a nameless push", text)
+        self.assertIn("no parked agent to wake", text)
 
     def test_a_working_worker_is_left_alone(self) -> None:
         # It is told to check main before it pushes, so it does not need
