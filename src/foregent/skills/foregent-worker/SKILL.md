@@ -73,6 +73,14 @@ report yourself blocked on the review rather than waiting. Push the branch
 Linear names on the issue, so the PR is linked to it and foregent can find you
 when the review lands.
 
+**Rebase before every push.** Your workspace was built from the `main` your box
+had at dispatch, and you then wait on a review for as long as a review takes —
+`main` moves at both ends of that. So before you open the pull request, and
+again before every update to it, run `jj git fetch`; if `main` advanced, rebase
+your work onto it and resolve any conflicts. A pull request that conflicts with
+`main` is one nobody can merge, and clearing that conflict is what foregent
+wakes you for.
+
 ### History is linear, always
 
 Rebase; never merge. Every project foregent manages requires linear history —
