@@ -34,7 +34,7 @@ from fastapi.testclient import TestClient
 from foregent import github, linear, server
 from foregent.agents import AgentRef
 from foregent.events import EventKind
-from foregent.models import Issue, IssueStatus
+from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IssueStore
 from tests.test_server import FakeManager, drain_deliveries
 
@@ -547,6 +547,20 @@ def review(
     }
 
 
+def push(*, ref: str = "refs/heads/main", **overrides) -> dict:
+    payload = {
+        "ref": ref,
+        "commits": [
+            {"message": "Rebase onto main before PR (JIM-167) (#12)\n\nBody."},
+            {"message": "Add --log-level to foregent serve (JIM-149) (#9)"},
+        ],
+        "repository": {"full_name": "jimpo/foregent"},
+        "sender": {"login": "jimpo"},
+    }
+    payload.update(overrides)
+    return payload
+
+
 def review_comment(**overrides) -> dict:
     payload = {
         "action": "created",
@@ -602,10 +616,56 @@ class GitHubWebhookEventTests(unittest.TestCase):
         )
         self.assertIsNone(event)
 
+    def test_a_push_to_main_carries_the_repository_and_what_landed(self) -> None:
+        # The base moved under everyone with a pull request open against it,
+        # and the subjects are how an agent recognizes its own landing.
+        event = github.webhook_event(push(), "push")
+        assert event is not None
+        self.assertEqual(event.kind, EventKind.MAIN_ADVANCED)
+        self.assertEqual(event.repo, "jimpo/foregent")
+        self.assertEqual(event.author, "jimpo")
+        self.assertIn("(JIM-167) (#12)", event.body)
+        self.assertIn("(JIM-149) (#9)", event.body)
+
+    def test_a_push_names_no_issue(self) -> None:
+        # It is about a repository. Fanning it out is the bridge's job.
+        event = github.webhook_event(push(), "push")
+        assert event is not None
+        self.assertEqual(event.issue_key, "")
+
+    def test_only_the_subject_of_each_commit_is_carried(self) -> None:
+        event = github.webhook_event(push(), "push")
+        assert event is not None
+        self.assertNotIn("Body.", event.body)
+
+    def test_a_push_is_not_dropped_as_foregents_own(self) -> None:
+        # An agent pushes its branch and never main, so a push is not a
+        # delivery foregent can cause; there is nothing to compare it to.
+        event = github.webhook_event(push(sender={"login": AGENT_LOGIN}), "push")
+        self.assertIsNotNone(event)
+
+    def test_a_push_to_another_branch_maps_to_nothing(self) -> None:
+        # Agents push their own branches constantly, and none of that moves
+        # anybody's base.
+        pushed = push(ref=f"refs/heads/{BRANCH}")
+        self.assertIsNone(github.webhook_event(pushed, "push"))
+
+    def test_a_tag_being_pushed_maps_to_nothing(self) -> None:
+        self.assertIsNone(github.webhook_event(push(ref="refs/tags/v1.0"), "push"))
+
+    def test_main_being_deleted_maps_to_nothing(self) -> None:
+        # A deletion names the ref too, and leaves nothing to have advanced.
+        self.assertIsNone(github.webhook_event(push(deleted=True), "push"))
+
+    def test_a_push_that_carries_no_commits_still_says_main_moved(self) -> None:
+        # The subjects are a convenience; the base having moved is the event.
+        event = github.webhook_event(push(commits=[]), "push")
+        assert event is not None
+        self.assertEqual(event.body, "")
+
     def test_deliveries_foregent_has_no_use_for_map_to_nothing(self) -> None:
         for kind, payload in (
             # An organization webhook carries every repository's every event.
-            ("push", {"ref": "refs/heads/main"}),
             ("ping", {"zen": "Design for failure."}),
             # A reviewer amending themselves is not new feedback to act on.
             ("pull_request_review", review() | {"action": "edited"}),
@@ -615,11 +675,8 @@ class GitHubWebhookEventTests(unittest.TestCase):
         ):
             with self.subTest(kind=kind):
                 self.assertIsNone(github.webhook_event(payload, kind))
-class GitHubWebhookDeliveryTests(unittest.TestCase):
-    """Who a GitHub delivery reaches (JIM-141)."""
-
-    KEY = "JIM-141"
-    AGENT = AgentRef("fg-jim-141", "conversation-1")
+class GitHubDeliveryTest(unittest.TestCase):
+    """A bridge with a fake harness, reached over the GitHub webhook route."""
 
     def setUp(self) -> None:
         self.client = TestClient(server.app)
@@ -632,17 +689,6 @@ class GitHubWebhookDeliveryTests(unittest.TestCase):
         self.enterContext(mock.patch.object(server, "deliveries", {}))
         self.viewer = self.enterContext(
             mock.patch.object(server.linear, "viewer_id", return_value="viewer-id")
-        )
-
-    def track(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
-        server.store.add(
-            Issue(
-                key=self.KEY,
-                title="",
-                status=status,
-                blocker="a review" if status is IssueStatus.BLOCKED else "",
-                agent=self.AGENT,
-            )
         )
 
     def deliver(self, payload: dict, event: str = "pull_request_review"):
@@ -658,6 +704,24 @@ class GitHubWebhookDeliveryTests(unittest.TestCase):
         )
         drain_deliveries()
         return response
+
+
+class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
+    """Who a GitHub delivery reaches (JIM-141)."""
+
+    KEY = "JIM-141"
+    AGENT = AgentRef("fg-jim-141", "conversation-1")
+
+    def track(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
+        server.store.add(
+            Issue(
+                key=self.KEY,
+                title="",
+                status=status,
+                blocker="a review" if status is IssueStatus.BLOCKED else "",
+                agent=self.AGENT,
+            )
+        )
 
     def test_a_review_reaches_the_agent_whose_branch_it_is_on(self) -> None:
         self.track()
@@ -697,4 +761,123 @@ class GitHubWebhookDeliveryTests(unittest.TestCase):
         self.track()
         self.deliver(review())
         self.assertEqual(self.manager.sent[0][0], self.AGENT)
+        self.viewer.assert_not_called()
+
+
+class PushWakeTests(GitHubDeliveryTest):
+    """Who a push to ``main`` wakes (JIM-168).
+
+    The two jj readers are stubbed and everything else is real: what is under
+    test is which issues the bridge picks out, not what jj prints for them —
+    that is :mod:`tests.test_workspaces`' subject.
+    """
+
+    REPO = "/srv/foregent"
+    SLUG = "jimpo/foregent"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.mode = self.enterContext(
+            mock.patch.object(
+                server.workspaces, "mode_for", return_value=Mode.PULL_REQUEST
+            )
+        )
+        self.slug = self.enterContext(
+            mock.patch.object(server.workspaces, "remote_slug", return_value=self.SLUG)
+        )
+
+    def park(
+        self,
+        key: str,
+        *,
+        status: IssueStatus = IssueStatus.BLOCKED,
+        repo: str | None = None,
+    ) -> None:
+        server.store.add(
+            Issue(
+                key=key,
+                title="",
+                status=status,
+                repo=self.REPO if repo is None else repo,
+                blocker="a review of the PR" if status is IssueStatus.BLOCKED else "",
+                agent=AgentRef(f"fg-{key.lower()}", "conversation-1"),
+            )
+        )
+
+    def push_to_main(self, **overrides):
+        return self.deliver(push(**overrides), event="push")
+
+    def test_a_parked_worker_is_woken_and_told_what_landed(self) -> None:
+        self.park("JIM-141")
+        response = self.push_to_main()
+        self.assertEqual(response.status_code, 200)
+        ref, text = self.manager.sent[0]
+        self.assertEqual(ref, AgentRef("fg-jim-141", "conversation-1"))
+        self.assertIn("Waking", text)
+        self.assertIn("main advanced in jimpo/foregent", text)
+        self.assertIn("(JIM-167) (#12)", text)
+
+    def test_being_woken_returns_the_worker_to_working(self) -> None:
+        # Which is why the skill tells a worker still waiting to report itself
+        # blocked again: nothing else would reach it on the next push.
+        self.park("JIM-141")
+        self.push_to_main()
+        issue = server.store.get("JIM-141")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+
+    def test_every_parked_worker_on_the_repo_is_woken(self) -> None:
+        # The event is about the repository, so it has no one owner.
+        self.park("JIM-141")
+        self.park("JIM-142")
+        self.push_to_main()
+        self.assertEqual(
+            sorted(ref.label for ref, _ in self.manager.sent),
+            ["fg-jim-141", "fg-jim-142"],
+        )
+
+    def test_a_working_worker_is_left_alone(self) -> None:
+        # It is told to check main before it pushes, so it does not need
+        # telling twice (JIM-167).
+        self.park("JIM-141", status=IssueStatus.IN_PROGRESS)
+        self.push_to_main()
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_bootstrap_worker_is_left_alone(self) -> None:
+        # No pull request to go stale, and no remote that could have moved.
+        self.mode.return_value = Mode.BOOTSTRAP
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_worker_on_another_repository_is_left_alone(self) -> None:
+        # An organization webhook carries every repository's pushes.
+        self.slug.return_value = "jimpo/binius64"
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_repo_whose_remote_cannot_be_read_is_woken_anyway(self) -> None:
+        # Fail open: a spurious wake costs one agent turn, a missed one leaves
+        # an agent parked forever on a base that has moved.
+        self.slug.return_value = ""
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(len(self.manager.sent), 1)
+
+    def test_a_worker_with_no_workspace_is_left_alone(self) -> None:
+        # An agent that is not sitting in a workspace names no repo, and
+        # bootstrap is the answer foregent gives for it (§6.4).
+        self.park("JIM-141", repo="")
+        self.push_to_main()
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_push_wakes_nobody_when_nothing_is_parked(self) -> None:
+        response = self.push_to_main()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_push_is_matched_without_asking_linear_anything(self) -> None:
+        self.park("JIM-141")
+        self.push_to_main()
         self.viewer.assert_not_called()

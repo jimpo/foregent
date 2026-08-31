@@ -247,8 +247,9 @@ a body that is not a JSON object, 200 for everything else. Only the header
 and the pull request.
 
 A review being submitted and an inline review comment being written map to a
-`PR_REVIEW` event; every other event and every other action of those two maps
-to nothing, an organization webhook carrying far more than foregent has a use
+`PR_REVIEW` event, and a push that leaves commits on `main` to a
+`MAIN_ADVANCED` one; every other event and every other action of those maps to
+nothing, an organization webhook carrying far more than foregent has a use
 for. From there the path is the Linear one, joined at `queue_event`: match,
 enqueue, drain, send. The two guards ahead of that join stay Linear's own —
 both key on what Linear signs and stamps — so a GitHub delivery is checked
@@ -270,11 +271,40 @@ matched without an account id and without a Linear call. The cost is that a
 person who opens a pull request by hand does not wake the agent by commenting
 on it themselves; anyone else reviewing it does.
 
-Two things a worker could be told about are not delivered. A comment in the
+**A push to `main` is the one delivery that is about a repository rather than
+an issue.** It names no branch of foregent's, so it resolves to no issue and
+matches to nobody; who it reaches is decided from the issues instead, below.
+It is also the only signal there is for a pull request going stale — GitHub
+sends nothing when one stops merging cleanly — so it says only that the base
+moved, and leaves the agent to find out what that did to its branch. The
+pushed commit subjects ride along, which is what lets an agent recognize its
+own pull request landing without going to read the repository.
+
+**Who a push reaches is decided from the issues, not from the payload.** Three
+things make an issue one of them, and none of it is remembered anywhere:
+Blocked, because a working agent is told to check `main` before it pushes and
+does not need telling twice; Pull Request mode, because a bootstrap agent has
+no pull request to go stale; and the repo that was pushed to, which an issue
+names as a local path and the payload as `owner/name`, joined through the
+`origin` remote. A repo whose remote will not read is woken anyway — the
+failure is unreadable remotes rather than a wrong answer, and a spurious wake
+costs one agent turn while a missed one leaves an agent parked forever on a
+base that has moved.
+
+**Nothing records which workers have a pull request open, deliberately.** The
+bridge holds no GitHub client to rebuild such a record with, so it would be
+empty after every restart — which is the ordinary case here (§5.4) — and the
+fallback for an empty one is the rule above. A worker parked on something
+else is therefore woken too; it reads one line and parks again.
+
+**A wake un-blocks**, so a worker that handles one and is still waiting has to
+report itself blocked again or no later push will reach it. The worker skill
+says so, and that sentence is what the Blocked filter rests on.
+
+One thing a worker could be told about is not delivered: a comment in the
 pull request's conversation tab arrives as `issue_comment`, whose payload
 carries no head branch, so resolving it would need the GitHub API client the
-bridge does not have. And GitHub sends nothing when a pull request stops
-merging cleanly, so `PR_CONFLICT` has no source and stays unused.
+bridge does not have.
 
 ### 4.3 Completion and blocking
 

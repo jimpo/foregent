@@ -51,7 +51,7 @@ from foregent.agents import (
     label_for,
 )
 from foregent.agents.herdr_claude import HerdrClaudeManager
-from foregent.events import Event, delivery_message, wakes
+from foregent.events import Event, EventKind, delivery_message, wakes
 from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
 
@@ -736,7 +736,15 @@ def queue_event(event: Event, viewer: str = "") -> None:
     GitHub deliveries foregent caused are already dropped in the mapping
     (:func:`~foregent.github.webhook_event`), which is what keeps a GitHub
     delivery from needing a Linear call to be matched.
+
+    ``MAIN_ADVANCED`` is the one kind that names no issue, and is handed to
+    :func:`wake_on_push` instead of matched. It is branched on here rather
+    than in the route because this is where both routes join, and a second
+    join would be a second place for the drop and the enqueue to disagree.
     """
+    if event.kind is EventKind.MAIN_ADVANCED:
+        wake_on_push(event)
+        return
     key = wakes(event, viewer)
     if not key:
         return
@@ -748,6 +756,50 @@ def queue_event(event: Event, viewer: str = "") -> None:
         logger.debug("event on %s reached nobody: %s", key, exc.detail)
         return
     logger.info("queued for %s on activity by %s", key, event.author or "someone")
+
+
+def wake_on_push(event: Event) -> None:
+    """Wake the agents parked on a pull request into the repo that moved.
+
+    A push to ``main`` is about a repository, so who it reaches is decided
+    here, from the issues, rather than by matching the payload
+    (:func:`~foregent.events.wakes`). Three things make an issue one of them,
+    and none of it is remembered from anywhere:
+
+    - **Blocked**, because a working agent is told to check ``main`` before it
+      pushes and does not need telling twice (JIM-167).
+    - **Pull Request mode**, because a bootstrap agent has no pull request to
+      go stale and no remote that could have moved under it.
+    - **The repo that was pushed to**, which an issue names as a local path
+      and the payload as ``owner/name``; ``origin`` joins the two
+      (:func:`~foregent.workspaces.remote_slug`).
+
+    **A repo whose slug cannot be read is woken anyway.** The failure is
+    unreadable remotes, not a wrong answer, and a spurious wake costs one
+    agent turn while a missed one leaves an agent parked forever on a base
+    that has moved.
+
+    Nothing is remembered about which workers pushed a pull request, and that
+    is deliberate: the bridge holds no GitHub client to rebuild such a record
+    with, so it would be empty after every restart — which is the ordinary
+    case here, the operator merging a pull request and restarting on the
+    change (§5.4). A worker parked on something else is woken too, reads one
+    line and parks again; that is the whole price of not keeping it.
+    """
+    for issue in store.in_flight():
+        if issue.status is not IssueStatus.BLOCKED:
+            continue
+        if mode_of(issue) is not Mode.PULL_REQUEST:
+            continue
+        slug = workspaces.remote_slug(Path(issue.repo))
+        if slug and slug != event.repo:
+            continue
+        try:
+            deliver_issue(issue.key, delivery_message(event, parked=True))
+        except HTTPException as exc:
+            logger.debug("%s was not woken by the push: %s", issue.key, exc.detail)
+            continue
+        logger.info("woke %s: main advanced in %s", issue.key, event.repo)
 
 
 @app.post("/webhooks/linear")
@@ -863,7 +915,11 @@ async def github_webhook(request: Request) -> dict[str, str]:
     if event is None:
         logger.debug("GitHub delivered a %s event foregent has no use for", kind)
         return {"status": "ok"}
-    queue_event(event)
+    # Threadpooled because a push reads each parked issue's remotes to find
+    # out whose repo moved (:func:`wake_on_push`), and jj is a subprocess.
+    # Enqueuing is the only thing that happens after that, so answering is
+    # still not waiting on any agent.
+    await run_in_threadpool(queue_event, event)
     return {"status": "ok"}
 
 

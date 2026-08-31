@@ -65,6 +65,18 @@ _BRANCH_KEY = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 _REVIEW = "pull_request_review"
 _REVIEW_COMMENT = "pull_request_review_comment"
 
+# The delivery that is the base moving under everyone with a pull request
+# open, and the ref it has to name to be that. GitHub sends nothing when a
+# pull request stops merging cleanly, so a push to the trunk is the only
+# signal there is for it — and the same one that says a pull request landed.
+_PUSH = "push"
+_TRUNK_REF = "refs/heads/main"
+
+# How many pushed commit subjects to carry. Enough to recognize your own pull
+# request landing in a batch of merges; short enough not to bury the prompt
+# under a force-push of somebody's whole branch history.
+_SUBJECTS = 10
+
 
 def webhook_event(payload: dict, kind: str) -> Event | None:
     """The foregent event a GitHub webhook delivery is, or ``None`` for none.
@@ -73,10 +85,13 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     it works in foregent's own shape, as on the Linear side.
 
     ``kind`` is the ``X-GitHub-Event`` header, because only the header says
-    what a delivery is about. A review being submitted and a review comment
-    being written are the two that map; every other event and every other
-    action returns ``None``, an organization webhook carrying far more than
-    foregent has any use for.
+    what a delivery is about. A review being submitted, a review comment being
+    written, and a push to ``main`` are the three that map; every other event
+    and every other action returns ``None``, an organization webhook carrying
+    far more than foregent has any use for.
+
+    A push is the odd one and is handled first, because it is the one
+    delivery here that carries no pull request at all (:func:`_pushed`).
 
     The issue is resolved from the pull request's head branch
     (:func:`issue_key`), and the body carries what the agent needs to act on
@@ -93,6 +108,8 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     is that a person who opens a pull request by hand does not wake the agent
     by commenting on it themselves; anyone else reviewing it does.
     """
+    if kind == _PUSH:
+        return _pushed(payload)
     pull_request = payload.get("pull_request")
     if not isinstance(pull_request, dict):
         return None
@@ -120,6 +137,42 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         number=pull_request.get("number") or 0,
         author=sender.get("login") or "",
         body=body,
+    )
+
+
+def _pushed(payload: dict) -> Event | None:
+    """The ``MAIN_ADVANCED`` event a ``push`` delivery is, or ``None``.
+
+    **Only a push that leaves commits on ``main`` counts.** Agents push their
+    own branches constantly and none of that moves anybody's base, so the ref
+    is checked; a branch being deleted names a ref too, and leaves nothing to
+    have advanced.
+
+    The event names a repository and no issue: a push says the base moved, and
+    which agents that matters to is a question about the issues foregent is
+    working rather than about the payload
+    (:func:`~foregent.events.wakes`). It carries the pushed commit subjects,
+    which is what lets an agent recognize its own pull request landing without
+    going to read the repository.
+
+    **No ``actor``**, so nothing about this is dropped as foregent's own. An
+    agent pushes its own branch and never ``main``, so this is not a delivery
+    foregent can cause; the pusher is carried as the ``author`` the bridge
+    logs the wake against, and compared to nothing.
+    """
+    if payload.get("ref") != _TRUNK_REF or payload.get("deleted"):
+        return None
+    commits = payload.get("commits")
+    subjects = [
+        f"- {(commit.get('message') or '').splitlines()[0]}"
+        for commit in (commits if isinstance(commits, list) else [])
+        if isinstance(commit, dict) and (commit.get("message") or "").strip()
+    ]
+    return Event(
+        kind=EventKind.MAIN_ADVANCED,
+        repo=(payload.get("repository") or {}).get("full_name") or "",
+        author=(payload.get("sender") or {}).get("login") or "",
+        body="\n".join(subjects[:_SUBJECTS]),
     )
 
 

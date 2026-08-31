@@ -11,6 +11,10 @@ its own issue as soon as it happens. The blocker a parked agent reported is
 never read: it says what the agent was waiting for, in whatever words it
 chose, and is for the operator reading ``foregent status``.
 
+One kind is about a repository rather than an issue — ``main`` moving under
+everyone working against it — and so names no issue and matches to nobody
+here. Who it reaches is decided where the issues are held, not here.
+
 Ingestion — the periodic tick that asks Linear and GitHub what changed, and
 resolving a pull request back to the Linear issue it is linked to — lands
 separately. Keeping this pure is what lets it be tested without a
@@ -40,8 +44,9 @@ class EventKind(StrEnum):
     ISSUE_UPDATE = "issue_update"
     # A review or a comment on the linked pull request, inline or PR-level.
     PR_REVIEW = "pr_review"
-    # The linked pull request stopped merging cleanly as main advanced.
-    PR_CONFLICT = "pr_conflict"
+    # `main` moved in a repository. The one kind that is about a repository
+    # rather than an issue, and so the one that carries no issue key.
+    MAIN_ADVANCED = "main_advanced"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +58,10 @@ class Event:
     request's link to the issue — which Linear makes for itself off the branch
     name — so a worker never has to report its own PR number to be findable.
     An event ingestion could not attribute to an issue carries no key and
-    reaches nobody.
+    reaches nobody, with one deliberate exception: ``MAIN_ADVANCED`` is about
+    a repository, names no issue, and is fanned out over the agents parked on
+    that repo by whoever holds the issues
+    (:func:`foregent.server.wake_on_push`).
 
     Deliberately flat: a per-platform payload hierarchy would put the work of
     understanding two payload formats into every consumer instead of into
@@ -84,6 +92,10 @@ def wakes(event: Event, viewer: str = "") -> str:
     there is nothing to search agents for. The caller checks that the issue
     has a live agent to deliver to — an event on an issue nobody is working
     is not an error, just a message with nowhere to go.
+
+    ``MAIN_ADVANCED`` therefore answers ``""`` here, as any keyless event
+    does. Which agents care that ``main`` moved is a different question, asked
+    of the issues rather than of the event, and answered where they live.
 
     ``viewer`` is foregent's own account id on the event's platform. Foregent
     writes to Linear as that account on every dispatch (assignee + In
@@ -120,7 +132,11 @@ def delivery_message(event: Event, *, parked: bool) -> str:
             what = f"{who} updated {event.issue_key}."
         case EventKind.PR_REVIEW:
             what = f"{who} reviewed {pull_request}."
-        case EventKind.PR_CONFLICT:
-            what = f"{pull_request} no longer merges cleanly into main."
+        case EventKind.MAIN_ADVANCED:
+            # What moved, and nothing about what it did to the agent's branch:
+            # a push proves the base changed and no more than that. What to do
+            # about it is the worker skill's to say, and saying it twice is
+            # how the two come to disagree.
+            what = f"main advanced in {event.repo}."
     header = f"Waking you: {what}" if parked else what
     return f"{header}\n\n{event.body}" if event.body else header
