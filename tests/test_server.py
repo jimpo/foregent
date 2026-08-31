@@ -29,7 +29,7 @@ from foregent.agents import (
     AgentStatus,
     LaunchSpec,
 )
-from foregent.models import Issue, IssueStatus
+from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
 from foregent.workspaces import WorkspaceError
 
@@ -302,6 +302,30 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(
             [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
         )
+
+
+class ModeTests(unittest.TestCase):
+    """The mode an issue is briefed in and completed in (JIM-151)."""
+
+    def test_an_issue_with_no_repo_is_bootstrap_without_reading_a_repo(self) -> None:
+        # `Path("")` is the current directory, so an unguarded lookup reads the
+        # bridge's *own* checkout — foregent's, which has an origin on GitHub.
+        def never(repo: Path) -> Mode:
+            raise AssertionError(f"read the mode of {repo}")
+
+        with mock.patch.object(server.workspaces, "mode_for", never):
+            mode = server.mode_of(Issue(key="JIM-88", title=""))
+
+        self.assertIs(mode, Mode.BOOTSTRAP)
+
+    def test_an_issue_with_a_repo_is_the_mode_its_remotes_name(self) -> None:
+        with mock.patch.object(
+            server.workspaces, "mode_for", return_value=Mode.PULL_REQUEST
+        ) as mode_for:
+            mode = server.mode_of(Issue(key="JIM-88", title="", repo="/ws/repo"))
+
+        self.assertIs(mode, Mode.PULL_REQUEST)
+        mode_for.assert_called_once_with(Path("/ws/repo"))
 
 
 class DeliverTests(unittest.TestCase):

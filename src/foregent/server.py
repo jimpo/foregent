@@ -334,6 +334,28 @@ def brief_for(key: str, mode: Mode) -> str:
     return f"/foregent-worker {key} {mode}"
 
 
+def mode_of(issue: Issue) -> Mode:
+    """How ``issue``'s project wants its work landed (§6.4).
+
+    Derived from the repo on every call rather than stored, so the brief an
+    agent is given and the completion it is held to cannot disagree
+    (:func:`foregent.workspaces.mode_for`).
+
+    **An issue with no repo is bootstrap**, and the guard is not a formality:
+    ``mode_for`` takes a path, ``Path("")`` is the current directory, and the
+    bridge's own working directory is a checkout of foregent — which has an
+    origin on GitHub and would answer Pull Request for an issue that names no
+    repo at all. A restart recovers a repo for every agent sitting in a
+    workspace and none for an agent running in a plain directory
+    (:func:`rebuild_store`), and bootstrap is the right answer for that agent
+    anyway: a project foregent cannot make a workspace in is one it cannot
+    open a pull request for either.
+    """
+    if not issue.repo:
+        return Mode.BOOTSTRAP
+    return workspaces.mode_for(Path(issue.repo))
+
+
 def agent_mcp_servers() -> dict[str, dict]:
     """The MCP servers a dispatched agent is given.
 
@@ -450,7 +472,7 @@ def dispatch() -> None:
         # The mode is read off the repo rather than the workspace: a secondary
         # workspace shares the repo's remotes, and an adopted agent's dispatch
         # never built one to read.
-        manager.send(ref, brief_for(issue.key, workspaces.mode_for(repo)))
+        manager.send(ref, brief_for(issue.key, mode_of(issue)))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:
@@ -767,9 +789,9 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
     """
     if issue is None or issue.status not in IN_FLIGHT or not issue.repo:
         return None
-    repo = Path(issue.repo)
-    if workspaces.mode_for(repo) is not Mode.BOOTSTRAP:
+    if mode_of(issue) is not Mode.BOOTSTRAP:
         return None
+    repo = Path(issue.repo)
     try:
         await run_in_threadpool(workspaces.advance, repo, issue_key)
     except workspaces.WorkspaceError as exc:
