@@ -67,5 +67,28 @@ class MaxAgentsTests(unittest.TestCase):
                     self.assertEqual(config.max_agents(), 1)
 
 
+class LogLevelTests(unittest.TestCase):
+    """What level the server logs at (JIM-149)."""
+
+    def test_the_environment_overrides_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_LOG_LEVEL": "debug"}):
+            self.assertEqual(config.log_level(), "debug")
+
+    def test_the_default_is_used_when_unset(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(config.log_level(), config.DEFAULT_LOG_LEVEL)
+
+    def test_a_level_is_read_however_it_is_spelled(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_LOG_LEVEL": " DEBUG "}):
+            self.assertEqual(config.log_level(), "debug")
+
+    def test_a_value_that_is_not_a_level_falls_back_and_says_so(self) -> None:
+        # A typo in a systemd unit should not be what stops the bridge from
+        # starting, so it warns rather than raising.
+        with mock.patch.dict(os.environ, {"FOREGENT_LOG_LEVEL": "verbose"}):
+            with self.assertLogs(config.logger, "WARNING"):
+                self.assertEqual(config.log_level(), config.DEFAULT_LOG_LEVEL)
+
+
 if __name__ == "__main__":
     unittest.main()

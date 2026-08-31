@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from urllib.parse import quote, urlparse
 
 from foregent import __version__, mcp_servers, skills
-from foregent.config import api_url
+from foregent.config import LOG_LEVELS, api_url, log_level
 from foregent.models import Issue, IssueStatus
 
 
@@ -84,6 +84,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--dev",
         action="store_true",
         help="Enable autoreload: restart the server when source files change.",
+    )
+    serve.add_argument(
+        "--log-level",
+        default=log_level(),
+        choices=LOG_LEVELS,
+        help=(
+            "Level for uvicorn's loggers and foregent's own "
+            "(default: %(default)s, or FOREGENT_LOG_LEVEL)."
+        ),
     )
     serve.set_defaults(func=cmd_serve)
 
@@ -209,20 +218,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
     return 0
 
 
-def serve_log_config() -> dict:
-    """uvicorn's logging config, extended to carry foregent's own records.
+def serve_log_config(level: str) -> dict:
+    """uvicorn's logging config at `level`, carrying foregent's own records.
 
     uvicorn configures only its own loggers, so without this everything the
     bridge logs below WARNING — which session it resolved, which skills it
     installed, which agent it adopted — reaches no handler and is dropped.
     Passed to `uvicorn.run` rather than set up here, because `--dev` runs the
     server in a reloader subprocess that configures logging from this config
-    alone.
+    alone: a level applied to the live logging state would not survive a
+    reload, so this stays a pure function of `level`.
     """
     from uvicorn.config import LOGGING_CONFIG
 
     config = copy.deepcopy(LOGGING_CONFIG)
-    config["root"] = {"handlers": ["default"], "level": "INFO"}
+    # `dictConfig` knows level names in upper case only; uvicorn's own
+    # `log_level` wants them lower, which is the spelling the flag takes.
+    config["root"] = {"handlers": ["default"], "level": level.upper()}
     return config
 
 
@@ -236,7 +248,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         host=url.hostname or "127.0.0.1",
         port=url.port or 8577,
         reload=args.dev,
-        log_config=serve_log_config(),
+        log_config=serve_log_config(args.log_level),
+        log_level=args.log_level,
     )
     return 0
 
