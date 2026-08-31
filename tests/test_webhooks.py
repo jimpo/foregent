@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import io
 import json
 import os
 import queue
@@ -577,8 +578,38 @@ def review_comment(**overrides) -> dict:
     return payload
 
 
+def conversation_comment(**overrides) -> dict:
+    """A comment in the pull request's conversation tab (``issue_comment``).
+
+    GitHub calls the thing commented on an ``issue`` whether it is one or a
+    pull request, and names no branch either way.
+    """
+    payload = {
+        "action": "created",
+        "comment": {"body": "does this handle a force-push?"},
+        "issue": {
+            "number": 9,
+            "pull_request": {"url": "https://api.github.com/repos/x/y/pulls/9"},
+            "user": {"login": AGENT_LOGIN},
+        },
+        "repository": {"full_name": "jimpo/foregent"},
+        "sender": {"login": "jimpo"},
+    }
+    payload.update(overrides)
+    return payload
+
+
 class GitHubWebhookEventTests(unittest.TestCase):
     """What a GitHub delivery maps to, before anyone is looked up (JIM-141)."""
+
+    def setUp(self) -> None:
+        # A conversation comment names no branch, so mapping one asks GitHub
+        # for the pull request. What that call does with a socket is
+        # `HeadRefTests`' subject; what the mapping does with its answer is
+        # this one's.
+        self.head_ref = self.enterContext(
+            mock.patch.object(github, "_head_ref", return_value=BRANCH)
+        )
 
     def test_a_submitted_review_carries_its_state_and_what_was_written(self) -> None:
         event = github.webhook_event(review(), "pull_request_review")
@@ -615,6 +646,51 @@ class GitHubWebhookEventTests(unittest.TestCase):
             review_comment(sender={"login": AGENT_LOGIN}), "pull_request_review_comment"
         )
         self.assertIsNone(event)
+
+    def test_a_conversation_comment_is_resolved_by_asking_for_the_branch(
+        self,
+    ) -> None:
+        # The payload names no branch, so the one thing that resolves this
+        # delivery to an issue is fetched (JIM-177).
+        event = github.webhook_event(conversation_comment(), "issue_comment")
+        assert event is not None
+        self.assertEqual(event.kind, EventKind.PR_REVIEW)
+        self.assertEqual(event.issue_key, "JIM-141")
+        self.assertEqual(event.repo, "jimpo/foregent")
+        self.assertEqual(event.number, 9)
+        self.assertEqual(event.author, "jimpo")
+        self.assertIn("force-push", event.body)
+        self.head_ref.assert_called_once_with("jimpo/foregent", 9)
+
+    def test_a_conversation_comment_on_an_unresolvable_branch_names_no_issue(
+        self,
+    ) -> None:
+        # A pull request GitHub would not answer for reaches nobody, which is
+        # what the delivery did before it was handled at all.
+        self.head_ref.return_value = ""
+        event = github.webhook_event(conversation_comment(), "issue_comment")
+        assert event is not None
+        self.assertEqual(event.issue_key, "")
+
+    def test_the_pull_request_authors_own_conversation_comment_maps_to_nothing(
+        self,
+    ) -> None:
+        # Same loop as an agent's own review comment, and dropped before the
+        # GitHub call rather than after it.
+        event = github.webhook_event(
+            conversation_comment(sender={"login": AGENT_LOGIN}), "issue_comment"
+        )
+        self.assertIsNone(event)
+        self.head_ref.assert_not_called()
+
+    def test_a_comment_on_a_plain_issue_maps_to_nothing(self) -> None:
+        # GitHub delivers comments on issues and on pull requests under one
+        # event; the `pull_request` link is what separates them, and foregent
+        # opens no issues.
+        plain = conversation_comment()
+        del plain["issue"]["pull_request"]
+        self.assertIsNone(github.webhook_event(plain, "issue_comment"))
+        self.head_ref.assert_not_called()
 
     def test_a_push_to_main_carries_the_repository_and_what_landed(self) -> None:
         # The base moved under everyone with a pull request open against it,
@@ -670,11 +746,60 @@ class GitHubWebhookEventTests(unittest.TestCase):
             # A reviewer amending themselves is not new feedback to act on.
             ("pull_request_review", review() | {"action": "edited"}),
             ("pull_request_review_comment", review_comment(action="deleted")),
+            ("issue_comment", conversation_comment(action="edited")),
             # The pull request opening and closing is foregent's own doing.
             ("pull_request", review() | {"action": "opened"}),
         ):
             with self.subTest(kind=kind):
                 self.assertIsNone(github.webhook_event(payload, kind))
+
+
+class HeadRefTests(unittest.TestCase):
+    """The bridge's one outbound GitHub call (JIM-177).
+
+    The socket is stubbed: what is under test is that a token is required, the
+    answer is read, and no failure escapes — not what GitHub replies.
+    """
+
+    def setUp(self) -> None:
+        self.enterContext(mock.patch.dict(os.environ, {"GITHUB_TOKEN": "t0ken"}))
+        self.urlopen = self.enterContext(
+            mock.patch.object(github.urllib.request, "urlopen")
+        )
+        self.answer({"head": {"ref": BRANCH}})
+
+    def answer(self, payload: object) -> None:
+        self.urlopen.return_value = io.BytesIO(json.dumps(payload).encode())
+
+    def test_the_head_branch_is_read_off_the_pull_request(self) -> None:
+        self.assertEqual(github._head_ref("jimpo/foregent", 9), BRANCH)
+
+    def test_the_pull_request_is_asked_for_by_repository_and_number(self) -> None:
+        github._head_ref("jimpo/foregent", 9)
+        request = self.urlopen.call_args.args[0]
+        self.assertEqual(
+            request.full_url, "https://api.github.com/repos/jimpo/foregent/pulls/9"
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer t0ken")
+
+    def test_without_a_token_nothing_is_asked_and_no_branch_comes_back(self) -> None:
+        # An operator's misconfiguration, not a caller's fault, and not worth
+        # failing a webhook GitHub would retry into the same wall.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(github._head_ref("jimpo/foregent", 9), "")
+        self.urlopen.assert_not_called()
+
+    def test_an_unreachable_api_answers_no_branch(self) -> None:
+        self.urlopen.side_effect = OSError("connection refused")
+        self.assertEqual(github._head_ref("jimpo/foregent", 9), "")
+
+    def test_an_answer_that_is_not_a_pull_request_answers_no_branch(self) -> None:
+        for payload in ({"message": "Not Found"}, [], None):
+            with self.subTest(payload=payload):
+                self.answer(payload)
+                self.assertEqual(github._head_ref("jimpo/foregent", 9), "")
+
+
 class GitHubDeliveryTest(unittest.TestCase):
     """A bridge with a fake harness, reached over the GitHub webhook route."""
 
@@ -754,6 +879,20 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         response = self.deliver(review(branch="jimpo/jim-9999-something-else"))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.manager.sent, [])
+
+    def test_a_conversation_comment_reaches_the_agent_whose_branch_it_is_on(
+        self,
+    ) -> None:
+        # The comment tab is the ordinary way a reviewer says something that
+        # hangs off no line, and the bridge used to drop it (JIM-177).
+        self.track(IssueStatus.BLOCKED)
+        with mock.patch.object(github, "_head_ref", return_value=BRANCH):
+            response = self.deliver(conversation_comment(), event="issue_comment")
+        self.assertEqual(response.status_code, 200)
+        ref, text = self.manager.sent[0]
+        self.assertEqual(ref, self.AGENT)
+        self.assertIn("Waking", text)
+        self.assertIn("does this handle a force-push?", text)
 
     def test_a_delivery_is_matched_without_asking_linear_anything(self) -> None:
         # The branch is the link, so a GitHub delivery costs no Linear call

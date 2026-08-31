@@ -910,7 +910,9 @@ async def github_webhook(request: Request) -> dict[str, str]:
 
     Foregent's own account id is not needed here, and no Linear call is made:
     a delivery caused by the agent that opened the pull request is dropped in
-    the mapping, where the payload names both sides of that comparison.
+    the mapping, where the payload names both sides of that comparison. A
+    comment in the conversation tab is the one delivery whose payload names no
+    branch, and mapping one asks GitHub for it.
 
     **A delivery foregent does nothing with is still a success**, as on the
     Linear side: an organization webhook carries every repository and every
@@ -941,7 +943,9 @@ async def github_webhook(request: Request) -> dict[str, str]:
     # The body names the repository and the pull request; only the header says
     # what happened to them.
     kind = request.headers.get(github.EVENT_HEADER) or "nameless"
-    event = github.webhook_event(payload, kind)
+    # Threadpooled because a conversation comment names no branch, so mapping
+    # one asks GitHub for the pull request over a blocking socket.
+    event = await run_in_threadpool(github.webhook_event, payload, kind)
     if event is None:
         logger.debug("GitHub delivered a %s event foregent has no use for", kind)
         return {"status": "ok"}
