@@ -127,7 +127,7 @@ the bridge through the foregent MCP server.
 | `models.py` | `Issue` and `IssueStatus`. |
 | `events.py` | `Event`, `EventKind`, and the pure `wakes()` and `delivery_message()`. No transport, no server. |
 | `linear.py` | Linear GraphQL client: claim an issue, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
-| `github.py` | The inbound half of GitHub: authenticate a webhook delivery. Agents reach GitHub through the MCP server, so the bridge needs no API client. |
+| `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server, so the bridge needs no API client. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
 | `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
@@ -244,10 +244,37 @@ sends in `X-Hub-Signature-256` — and so are the answers: 401 for a signature
 that does not prove the delivery, 503 when the bridge holds no secret, 400 for
 a body that is not a JSON object, 200 for everything else. Only the header
 `X-GitHub-Event` says what a delivery is about; the body names the repository
-and the pull request. Mapping a delivery to an `Event`, resolving the pull
-request back to the Linear issue it is linked to, and the delivery that
-follows are JIM-141; until then an authenticated delivery is logged and
-dropped.
+and the pull request.
+
+A review being submitted and an inline review comment being written map to a
+`PR_REVIEW` event; every other event and every other action of those two maps
+to nothing, an organization webhook carrying far more than foregent has a use
+for. From there the path is the Linear one, joined at `queue_event`: match,
+enqueue, drain, send. The two guards ahead of that join stay Linear's own —
+both key on what Linear signs and stamps — so a GitHub delivery is checked
+against no freshness window, and a retry of one GitHub believes failed reaches
+the agent a second time.
+
+**The pull request is resolved back to its issue through its head branch.**
+Linear names an agent's branch after the issue and links a pull request opened
+from it to that issue, so the key is in the branch and reading it there is the
+whole of following the link — no GitHub call, and no pull request number a
+worker has to report to be findable.
+
+**Foregent's own writes are dropped by comparing the delivery's sender to the
+pull request's author.** The agent opened the pull request, so a review comment
+it writes there comes back as an event about its own issue, and a wake that
+causes a write is a loop. That is what `viewer` does on the Linear side, except
+that the payload names both sides of this comparison, so a GitHub delivery is
+matched without an account id and without a Linear call. The cost is that a
+person who opens a pull request by hand does not wake the agent by commenting
+on it themselves; anyone else reviewing it does.
+
+Two things a worker could be told about are not delivered. A comment in the
+pull request's conversation tab arrives as `issue_comment`, whose payload
+carries no head branch, so resolving it would need the GitHub API client the
+bridge does not have. And GitHub sends nothing when a pull request stops
+merging cleanly, so `PR_CONFLICT` has no source and stays unused.
 
 ### 4.3 Completion and blocking
 
