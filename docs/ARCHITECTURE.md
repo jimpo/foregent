@@ -443,9 +443,16 @@ server's environment.
 
 - **bootstrap** — no GitHub surface. The agent rebases onto `main` and commits
   there; the bridge moves the bookmark when the issue completes (§4.3).
-- **pull request** — the agent pushes a branch and opens a pull request
-  through the GitHub MCP, then reports blocked on the review. This is how
-  foregent develops itself.
+- **pull request** — the agent fetches, rebases onto `main`, pushes a branch
+  and opens a pull request through the GitHub MCP, then reports blocked on the
+  review. This is how foregent develops itself.
+
+  The fetch and the rebase are the agent's, on every push rather than only the
+  first. A workspace is built from the box's local `main` (§6.5) and the agent
+  then parks on a review, so `main` moves both before the pull request is
+  opened and while it waits; the review that wakes it is often the conflict
+  itself. Foregent cannot do it for the agent — resolving a conflict is a
+  judgement about the change, and the working copy belongs to the agent.
 
 **A project's mode is derived, not declared.** `jj git remote list` decides it
 at dispatch: an `origin` remote on GitHub is where a pull request can be
