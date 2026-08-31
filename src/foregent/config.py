@@ -25,6 +25,13 @@ DEFAULT_WORKSPACE_ROOT = "~/.foregent/workspaces"
 # serialises it rather than a policy anyone can raise.
 DEFAULT_MAX_AGENTS = 3
 
+# The levels `foregent serve` accepts (JIM-149). uvicorn also knows `trace`,
+# which is left out because Python's `logging` has no such level and
+# `dictConfig` rejects it.
+LOG_LEVELS = ("debug", "info", "warning", "error", "critical")
+
+DEFAULT_LOG_LEVEL = "info"
+
 
 def api_url() -> str:
     """Base URL of the foregent server (``FOREGENT_API_URL`` or the default)."""
@@ -84,3 +91,28 @@ def herdr_session() -> str | None:
     # Empty means unset: an exported-but-blank variable is not a session name,
     # and treating it as one asks herdr for a socket nobody chose.
     return os.environ.get("FOREGENT_HERDR_SESSION") or None
+
+
+def log_level() -> str:
+    """Level the server logs at (``FOREGENT_LOG_LEVEL``).
+
+    The default of ``serve``'s ``--log-level``, so the flag wins over the
+    variable. The variable exists because deployment is a systemd unit, where
+    every other knob is already set this way and there is no command line to
+    edit.
+
+    An unrecognised value warns and falls back rather than raising: a typo in
+    a unit file should not be what stops the bridge from starting.
+    """
+    setting = os.environ.get("FOREGENT_LOG_LEVEL", "").strip().lower()
+    if not setting:
+        return DEFAULT_LOG_LEVEL
+    if setting not in LOG_LEVELS:
+        logger.warning(
+            "FOREGENT_LOG_LEVEL is %r, which is not one of %s; logging at %s",
+            setting,
+            ", ".join(LOG_LEVELS),
+            DEFAULT_LOG_LEVEL,
+        )
+        return DEFAULT_LOG_LEVEL
+    return setting

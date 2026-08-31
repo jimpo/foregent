@@ -313,13 +313,14 @@ state.
 | `FOREGENT_HERDR_SESSION` | The herdr session to run agents in. Falls back to the session the bridge process runs in, then herdr's default. |
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
+| `FOREGENT_LOG_LEVEL` | What level `serve` logs at (default `info`), for uvicorn's loggers and foregent's own. `--log-level` overrides it. |
 | `FOREGENT_MAX_AGENTS` | How many agents run at once in Pull Request mode (default 3). Bootstrap mode is always one. |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
 
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 340 unit tests, ~6s
+uv run python -m unittest discover -s tests -t .   # 358 unit tests, ~7s
 uv run ty check                                    # type check
 ```
 
