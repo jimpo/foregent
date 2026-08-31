@@ -11,8 +11,8 @@ The delivery half borrows the fake harness and the drainer from
 ``tests.test_server``: what a message does once it is queued is that module's
 subject, and what is queued for whom is this one's.
 
-The GitHub half is the same, over a payload of its own: which deliveries the
-endpoint accepts, and what one maps to once it is in (JIM-141).
+The GitHub half (JIM-141) is the same subjects over a payload of its own:
+which deliveries the endpoint accepts, what one maps to, and who it reaches.
 """
 
 from __future__ import annotations
@@ -615,3 +615,86 @@ class GitHubWebhookEventTests(unittest.TestCase):
         ):
             with self.subTest(kind=kind):
                 self.assertIsNone(github.webhook_event(payload, kind))
+class GitHubWebhookDeliveryTests(unittest.TestCase):
+    """Who a GitHub delivery reaches (JIM-141)."""
+
+    KEY = "JIM-141"
+    AGENT = AgentRef("fg-jim-141", "conversation-1")
+
+    def setUp(self) -> None:
+        self.client = TestClient(server.app)
+        self.enterContext(
+            mock.patch.dict(os.environ, {"GITHUB_WEBHOOK_SECRET": SECRET})
+        )
+        server.store = IssueStore()
+        self.manager = FakeManager()
+        self.enterContext(mock.patch.object(server, "manager", self.manager))
+        self.enterContext(mock.patch.object(server, "deliveries", {}))
+        self.viewer = self.enterContext(
+            mock.patch.object(server.linear, "viewer_id", return_value="viewer-id")
+        )
+
+    def track(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
+        server.store.add(
+            Issue(
+                key=self.KEY,
+                title="",
+                status=status,
+                blocker="a review" if status is IssueStatus.BLOCKED else "",
+                agent=self.AGENT,
+            )
+        )
+
+    def deliver(self, payload: dict, event: str = "pull_request_review"):
+        body = json.dumps(payload).encode()
+        response = self.client.post(
+            "/webhooks/github",
+            content=body,
+            headers={
+                "Content-Type": "application/json",
+                github.EVENT_HEADER: event,
+                github.SIGNATURE_HEADER: sign_github(body),
+            },
+        )
+        drain_deliveries()
+        return response
+
+    def test_a_review_reaches_the_agent_whose_branch_it_is_on(self) -> None:
+        self.track()
+        response = self.deliver(review())
+        self.assertEqual(response.status_code, 200)
+        ref, text = self.manager.sent[0]
+        self.assertEqual(ref, self.AGENT)
+        self.assertIn("jimpo reviewed jimpo/foregent#9.", text)
+        self.assertIn("rename this", text)
+
+    def test_a_review_of_a_parked_agents_pull_request_wakes_and_unblocks_it(
+        self,
+    ) -> None:
+        # The whole point: an agent parked on `a review of the PR` is waiting
+        # for exactly this.
+        self.track(IssueStatus.BLOCKED)
+        self.deliver(review())
+        _, text = self.manager.sent[0]
+        self.assertIn("Waking", text)
+        issue = server.store.get(self.KEY)
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+
+    def test_a_review_on_a_branch_nobody_is_working_is_accepted_and_dropped(
+        self,
+    ) -> None:
+        # An organization webhook carries every pull request in every
+        # repository; almost none of them are foregent's business.
+        self.track()
+        response = self.deliver(review(branch="jimpo/jim-9999-something-else"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_delivery_is_matched_without_asking_linear_anything(self) -> None:
+        # The branch is the link, so a GitHub delivery costs no Linear call
+        # and is not held up by one that fails.
+        self.track()
+        self.deliver(review())
+        self.assertEqual(self.manager.sent[0][0], self.AGENT)
+        self.viewer.assert_not_called()

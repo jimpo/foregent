@@ -24,9 +24,11 @@ Linear pushes what happens next. A comment or a field change on an agent's own
 issue arrives at `POST /webhooks/linear`, is authenticated against the
 workspace's signing secret, and is delivered to that agent as a prompt —
 whether it is working or parked on a blocker. Deliveries are queued, so the
-route answers Linear at once instead of waiting on a busy agent. The agent
-reports back through two MCP tools the bridge serves: `report_blocked` and
-`complete_task`.
+route answers Linear at once instead of waiting on a busy agent. GitHub pushes
+the other half: a review or a review comment on an agent's pull request arrives
+at `POST /webhooks/github` and reaches the same agent, matched by the issue its
+branch names. The agent reports back through two MCP tools the bridge serves:
+`report_blocked` and `complete_task`.
 
 The bridge keeps no database. Its issue → agent map is in memory and is rebuilt
 from the live herdr agents at startup.
@@ -274,8 +276,10 @@ Completion tears the agent down and dispatches the next queued issue.
 An agent that hits an external dependency calls `report_blocked` and **stays
 alive** in its workspace with its context intact. It keeps holding the capacity
 slot, so `FOREGENT_MAX_AGENTS` is in practice how many pull requests may be
-open and waiting for review at once. Comment on the issue in Linear; the
-comment reaches the agent as a prompt, and delivering it unblocks the issue.
+open and waiting for review at once. Comment on the issue in Linear, or review
+the agent's pull request on GitHub; either reaches the agent as a prompt, and
+delivering it unblocks the issue. A review is matched to the agent by the
+branch it is on, so nothing has to be told which pull request is whose.
 
 Observe by attaching, from the box or from a laptop:
 

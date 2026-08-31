@@ -11,9 +11,9 @@ parked. Events reach an agent through its own queue, drained by a daemon
 thread, so whoever ingested one is never held behind an agent that is mid-turn
 and no agent is held behind another.
 ``/webhooks/github`` is the same door for what GitHub pushes about the pull
-requests those agents open; it authenticates a delivery and, for now, stops
-there. ``/health`` reports when Linear last delivered, because push is the
-only thing that wakes an agent and a hook that has stopped looks like quiet.
+requests those agents open, matched to an agent by the issue the pull request's
+branch names. ``/health`` reports when Linear last delivered, because push is
+the only thing that wakes an agent and a hook that has stopped looks like quiet.
 Also mounts the foregent MCP server (``complete_task``,
 ``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
@@ -51,7 +51,7 @@ from foregent.agents import (
     label_for,
 )
 from foregent.agents.herdr_claude import HerdrClaudeManager
-from foregent.events import delivery_message, wakes
+from foregent.events import Event, delivery_message, wakes
 from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
 
@@ -720,17 +720,43 @@ def _payload(body: bytes) -> dict:
     return payload
 
 
+def queue_event(event: Event, viewer: str = "") -> None:
+    """Queue ``event`` for the agent working the issue it is about, if any.
+
+    The match and the drop, shared by both webhook routes: an event about no
+    tracked issue, or one with nobody behind it, is logged and dropped rather
+    than raised, because both routes answer 200 for it. The enqueue goes
+    through :func:`deliver_issue` rather than the queue directly, so the
+    live-agent guard stays decided in one place. The issue's status is read
+    here only to word the prompt: a parked agent is being woken and a working
+    one is not.
+
+    ``viewer`` is foregent's own account id on the event's platform, and is
+    how its own writes coming back are dropped. Only Linear has one to give:
+    GitHub deliveries foregent caused are already dropped in the mapping
+    (:func:`~foregent.github.webhook_event`), which is what keeps a GitHub
+    delivery from needing a Linear call to be matched.
+    """
+    key = wakes(event, viewer)
+    if not key:
+        return
+    issue = store.get(key)
+    parked = issue is not None and issue.status is IssueStatus.BLOCKED
+    try:
+        deliver_issue(key, delivery_message(event, parked=parked))
+    except HTTPException as exc:
+        logger.debug("event on %s reached nobody: %s", key, exc.detail)
+        return
+    logger.info("queued for %s on activity by %s", key, event.author or "someone")
+
+
 @app.post("/webhooks/linear")
 async def linear_webhook(request: Request) -> dict[str, str]:
     """Deliver what Linear pushes to the agent it is for.
 
     Push is the whole of foregent's inbound path: authenticate, map the
-    payload to an :class:`~foregent.events.Event`, match it to an issue, and
-    queue it for that issue's agent. The enqueue goes through
-    :func:`deliver_issue` rather than the queue directly, so the live-agent
-    guard and the 409 for an issue with nobody behind it stay decided in one
-    place. The issue's status is read here only to word the prompt: a parked
-    agent is being woken and a working one is not.
+    payload to an :class:`~foregent.events.Event`, and hand it to
+    :func:`queue_event` for the agent working the issue it names.
 
     **A delivery foregent does nothing with is still a success.** Most of what
     Linear sends is about issues no agent here is working, and a 200 is the
@@ -786,28 +812,23 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     except linear.LinearError as exc:
         logger.error("cannot tell foregent's own writes apart: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    key = wakes(event, viewer)
-    if not key:
-        return {"status": "ok"}
-    issue = store.get(key)
-    parked = issue is not None and issue.status is IssueStatus.BLOCKED
-    try:
-        deliver_issue(key, delivery_message(event, parked=parked))
-    except HTTPException as exc:
-        logger.debug("event on %s reached nobody: %s", key, exc.detail)
-        return {"status": "ok"}
-    logger.info("queued for %s on activity by %s", key, event.author or "someone")
+    queue_event(event, viewer)
     return {"status": "ok"}
 
 
 @app.post("/webhooks/github")
 async def github_webhook(request: Request) -> dict[str, str]:
-    """Accept what GitHub pushes about the pull requests foregent's agents open.
+    """Deliver what GitHub pushes to the agent whose pull request it is about.
 
-    Receipt and authentication. Mapping a delivery to an
-    :class:`~foregent.events.Event`, resolving the pull request back to the
-    Linear issue it is linked to, and prompting that issue's agent land in
-    JIM-141; until they do, an authenticated delivery is logged and dropped.
+    The same three steps as the Linear route — authenticate, map, queue — over
+    a payload only :mod:`foregent.github` understands. **The pull request is
+    resolved back to its issue through its head branch**, which Linear names
+    after the issue and links the pull request by, so a worker never has to
+    report its own pull request number to be findable.
+
+    Foregent's own account id is not needed here, and no Linear call is made:
+    a delivery caused by the agent that opened the pull request is dropped in
+    the mapping, where the payload names both sides of that comparison.
 
     **A delivery foregent does nothing with is still a success**, as on the
     Linear side: an organization webhook carries every repository and every
@@ -838,7 +859,11 @@ async def github_webhook(request: Request) -> dict[str, str]:
     # The body names the repository and the pull request; only the header says
     # what happened to them.
     kind = request.headers.get(github.EVENT_HEADER) or "nameless"
-    logger.debug("GitHub delivered a %s event: %s", kind, payload)
+    event = github.webhook_event(payload, kind)
+    if event is None:
+        logger.debug("GitHub delivered a %s event foregent has no use for", kind)
+        return {"status": "ok"}
+    queue_event(event)
     return {"status": "ok"}
 
 
