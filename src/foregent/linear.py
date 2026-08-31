@@ -2,8 +2,8 @@
 
 Linear ships no first-party client library either, so this is a thin
 wrapper, built on the ``gql`` library, over the little foregent needs of
-Linear directly: claiming an issue, and asking what changed on the issues it
-is tracking. This is the bridge's own direct Linear access, separate from the
+Linear directly: claiming an issue, closing it out, and asking what changed
+on the issues it is tracking. This is the bridge's own direct Linear access, separate from the
 agent-facing Linear MCP.
 
 Traffic in the other direction — deliveries Linear makes to the bridge — is
@@ -63,6 +63,32 @@ mutation Claim($id: String!, $assigneeId: String!, $stateId: String!) {
   }
 }
 """
+
+
+_CLOSE_QUERY = """
+query Close($key: String!) {
+  issue(id: $key) {
+    id
+    state { type }
+    team {
+      states(filter: { name: { eq: "Done" } }) {
+        nodes { id }
+      }
+    }
+  }
+}
+"""
+
+_CLOSE_MUTATION = """
+mutation Close($id: String!, $stateId: String!) {
+  issueUpdate(id: $id, input: { stateId: $stateId }) {
+    success
+  }
+}
+"""
+
+# The Linear state types that mean the work is over, either way it ended.
+CLOSED = frozenset({"completed", "canceled"})
 
 
 _VIEWER_QUERY = """
@@ -150,6 +176,37 @@ def claim_issue(key: str) -> None:
             "assigneeId": data["viewer"]["id"],
             "stateId": state_nodes[0]["id"],
         },
+    )
+    if not result["issueUpdate"]["success"]:
+        raise LinearError(f"Linear issueUpdate for {key!r} did not succeed")
+
+
+def close_issue(key: str) -> None:
+    """Move issue ``key`` to Done, unless it is already closed.
+
+    The mirror of :func:`claim_issue`, and it exists for the same reason: the
+    transition is the record of what foregent did with the issue, and it has
+    to happen whether or not anything else moved the status.
+
+    **An issue already in a completed or canceled state is left alone.** The
+    agent owns the outcome — a bug it could not reproduce is canceled, not
+    done — and Linear's own GitHub integration closes a merged pull request's
+    issue. This fills in the transition nobody made; it does not overrule one.
+    """
+    data = _request(_CLOSE_QUERY, {"key": key})
+    issue = data["issue"]
+    if issue is None:
+        raise LinearError(f"Linear issue {key!r} not found")
+    if issue["state"]["type"] in CLOSED:
+        return
+    state_nodes = issue["team"]["states"]["nodes"]
+    if not state_nodes:
+        raise LinearError(
+            f"Linear team for {key!r} has no 'Done' state "
+            "(provisioning precondition)"
+        )
+    result = _request(
+        _CLOSE_MUTATION, {"id": issue["id"], "stateId": state_nodes[0]["id"]}
     )
     if not result["issueUpdate"]["success"]:
         raise LinearError(f"Linear issueUpdate for {key!r} did not succeed")

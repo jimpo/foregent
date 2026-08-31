@@ -54,9 +54,9 @@ rebase onto `main` and call the tool again.
 3. **Keep Linear current** as you go. Comment on meaningful findings and
    decisions; the issue is the only record an operator reads.
 4. **Land the change** per the project's mode (below).
-5. **Set the issue's final status in Linear yourself**, then call
-   `complete_task`. Foregent's own record and Linear's are updated separately —
-   `complete_task` does not touch Linear.
+5. **Set the issue's final status in Linear yourself where it is not Done** —
+   a ticket you cancel, say — then call `complete_task`. Completing moves a
+   still-open issue to Done and leaves an outcome you set alone.
 
 If you get blocked at any point, see *Being blocked* below instead of
 finishing.

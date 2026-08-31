@@ -128,7 +128,7 @@ the bridge through the foregent MCP server.
 | `store.py` | `IssueStore`, the in-memory issue map, and what counts as in-flight. |
 | `models.py` | `Issue` and `IssueStatus`. |
 | `events.py` | `Event`, `EventKind`, and the pure `wakes()` and `delivery_message()`. No transport, no server. |
-| `linear.py` | Linear GraphQL client: claim an issue, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
+| `linear.py` | Linear GraphQL client: claim an issue, close it, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
 | `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server; the bridge's own reach is one GET, for the one delivery that names no branch. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
@@ -343,8 +343,9 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
 - **`report_blocked(issue_key, blocker)`** records the note and marks the
   issue Blocked. Nothing is terminated and capacity does not change.
 - **`complete_task(issue_key)`** advances `main` onto the issue's work in
-  bootstrap mode, marks the issue Done, dispatches the next queued issue,
-  stops the calling agent, and removes its jj workspace — in that order.
+  bootstrap mode, marks the issue Done here and in Linear, dispatches the next
+  queued issue, stops the calling agent, and removes its jj workspace — in
+  that order.
 
   **Advancing comes first because the next dispatch builds its workspace on
   `main`**: move the bookmark after that, and the next agent starts from a
@@ -376,9 +377,16 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
 The tools are mounted in the bridge's own process, so they mutate the store
 directly instead of looping back over HTTP.
 
-**The bridge writes to Linear once per issue: the claim.** Status, comments
-and the close-out are the agent's own, through the Linear MCP. The bridge
-reads Linear and reacts to it; it does not narrate the work.
+**The bridge writes to Linear twice per issue: the claim and the close.** They
+are the two ends of the same record — the issue foregent moved to In Progress
+is the issue foregent moves out of it — and the close is the bridge's because
+nothing else makes it in every mode: a merged pull request closes its own
+issue through Linear's GitHub integration, and bootstrap mode has no pull
+request (JIM-200). An issue already in a completed or canceled state is left
+as it is, so an outcome the agent decided — a bug it could not reproduce is
+canceled, not done — stands. Everything else Linear shows is the agent's own,
+through the Linear MCP: the bridge reads Linear and reacts to it; it does not
+narrate the work.
 
 ### 4.4 Boot
 
