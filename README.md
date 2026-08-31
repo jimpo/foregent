@@ -97,9 +97,10 @@ Linear and GitHub MCP servers to the machine's user-level Claude Code config,
 where agents and your own sessions both read them. The config stores
 `${LINEAR_API_KEY}`, never the token itself.
 
-Run it once per machine, and **again after every foregent upgrade** — it is the
-only thing that updates a stale skill. The bridge writes missing skills before a
-launch, but never overwrites.
+Run it once per machine, and again after every foregent upgrade. The bridge
+also rewrites the packaged skills before every launch, so an agent is always
+briefed from the version foregent ships — a hand-edited skill in
+`~/.claude/skills/` does not survive a dispatch.
 
 `setup` warns when a credential is unset. Fix that before dispatching: an
 unauthenticated agent discovers the problem only once it is working an issue.

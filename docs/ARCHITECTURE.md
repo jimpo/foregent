@@ -148,9 +148,9 @@ the bridge through the foregent MCP server.
 1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
    time in bootstrap mode, up to `FOREGENT_MAX_AGENTS` in pull request mode.
    Every in-flight issue holds a slot; anything else waits.
-2. **Skills.** Any packaged skill the machine lacks is written first. Claude
-   Code picks up live edits to a skill directory, but only one that existed
-   when the session started, so this must finish before launch.
+2. **Skills.** Every packaged skill is written first, over whatever is there.
+   Claude Code picks up live edits to a skill directory, but only one that
+   existed when the session started, so this must finish before launch.
 3. **Claim.** Assignee and In Progress are set in Linear in one step. Nothing
    is dispatched without a durable ownership record.
 4. **Workspace.** A fresh jj workspace is built from the queued repo, named
@@ -497,11 +497,15 @@ definition. Its second word is the mode (§6.4), which is the one thing about
 the lifecycle the skill cannot work out for itself.
 
 Skills ship inside the installed package, so they travel with a
-`uv tool install`. Two paths put them on disk, both through
-`skills/__init__.py`: `foregent setup` installs and updates every packaged
-skill, and the server fills any gap before a launch. Each file is staged in
-its destination directory and renamed into place, so a concurrent dispatch
-never loads a half-written `SKILL.md`.
+`uv tool install`. Two paths put them on disk, `foregent setup` and the server
+before a launch, and both call the one installer in `skills/__init__.py`: what
+an agent is briefed from is what foregent ships. Dispatch overwrites because
+the drift is otherwise silent in both directions — a skill left over from an
+older foregent can name a file that no longer exists, and neither the agent
+nor the log has any way to say so (JIM-143). The cost is a hand-edited skill
+lost at the next dispatch; edit the packaged one. Each file is staged in its
+destination directory and renamed into place, so a concurrent dispatch never
+loads a half-written `SKILL.md`.
 
 ### 6.3 MCP servers are split by lifetime
 
