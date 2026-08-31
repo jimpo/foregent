@@ -66,7 +66,9 @@ running but not enough to resume them (§5.4).
 There is no supervisor and no worker hierarchy. One agent reads the issue,
 drives its Linear status, writes the code, and closes it out. How it
 decomposes the work, including whether it spawns its own subagents, is its
-business.
+business. An issue that arrives already split into sub-issues is no different:
+the same agent does every child itself, as one pull request with at least one
+commit per sub-issue. Nothing dispatches a sub-issue on its own.
 
 ### 1.6 The blocker is a note, not a key
 
