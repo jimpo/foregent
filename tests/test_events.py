@@ -50,17 +50,12 @@ class WakesTests(unittest.TestCase):
             "JIM-42",
         )
 
-    def test_a_conflict_with_main_wakes_the_issue_too(self) -> None:
+    def test_main_advancing_wakes_nobody_by_key(self) -> None:
+        # It is about a repository, not an issue, so there is no key to match
+        # (JIM-168). Which agents care is asked of the issues, not of the
+        # event, and answered where they are held.
         self.assertEqual(
-            wakes(
-                Event(
-                    kind=EventKind.PR_CONFLICT,
-                    issue_key="JIM-42",
-                    repo="jimpo/binius64",
-                    number=123,
-                )
-            ),
-            "JIM-42",
+            wakes(Event(kind=EventKind.MAIN_ADVANCED, repo="jimpo/binius64")), ""
         )
 
     def test_an_event_attributed_to_no_issue_wakes_nobody(self) -> None:
@@ -132,19 +127,30 @@ class DeliveryMessageTests(unittest.TestCase):
         self.assertIn("jimpo/binius64#123", message)
         self.assertIn("rename this", message)
 
-    def test_a_conflict_says_what_broke(self) -> None:
-        # Nobody said anything here, so the message has to stand on its own.
+    def test_main_advancing_says_where_and_what_landed(self) -> None:
+        # Nobody said anything here, so the message has to stand on its own,
+        # and the commit subjects are what let an agent recognize its own
+        # pull request landing without going to read the repository.
         message = delivery_message(
             Event(
-                kind=EventKind.PR_CONFLICT,
-                issue_key="JIM-42",
+                kind=EventKind.MAIN_ADVANCED,
                 repo="jimpo/binius64",
-                number=123,
+                body="- Rebase onto main before PR (JIM-167) (#12)",
             ),
             parked=True,
         )
-        self.assertIn("jimpo/binius64#123", message)
-        self.assertIn("main", message)
+        self.assertIn("jimpo/binius64", message)
+        self.assertIn("main advanced", message)
+        self.assertIn("(#12)", message)
+
+    def test_main_advancing_claims_no_conflict(self) -> None:
+        # A push proves the base moved and nothing about whether the pull
+        # request still merges. A claim the agent has to disprove would be
+        # worse than no claim.
+        message = delivery_message(
+            Event(kind=EventKind.MAIN_ADVANCED, repo="jimpo/binius64"), parked=True
+        )
+        self.assertNotIn("conflict", message.lower())
 
     def test_a_parked_agent_is_told_it_is_being_woken(self) -> None:
         self.assertIn("Waking", delivery_message(comment("JIM-42"), parked=True))

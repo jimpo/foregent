@@ -263,11 +263,11 @@ class WorkspaceTest(unittest.TestCase):
 
 
 @unittest.skipUnless(JJ, "jj is not installed")
-class ModeTest(unittest.TestCase):
-    """Reading a project's mode off its git remotes (JIM-152).
+class RemotesTest(unittest.TestCase):
+    """A throwaway repo whose ``origin`` each subclass sets for itself.
 
-    The mode is a claim about what ``jj git remote list`` prints, so these
-    drive a real jj against throwaway repos rather than a stubbed one.
+    What the remote list prints is a claim about jj, so everything reading it
+    drives a real jj rather than a stub.
     """
 
     def setUp(self) -> None:
@@ -279,6 +279,10 @@ class ModeTest(unittest.TestCase):
 
     def remote(self, name: str, url: str) -> None:
         jj(self.repo, "git", "remote", "add", name, url)
+
+
+class ModeTest(RemotesTest):
+    """Reading a project's mode off its git remotes (JIM-152)."""
 
     def test_a_github_origin_is_pull_request_mode(self) -> None:
         self.remote("origin", "https://github.com/jimpo/foregent")
@@ -319,6 +323,56 @@ class ModeTest(unittest.TestCase):
             workspaces, "_jj", side_effect=workspaces.WorkspaceError("boom")
         ):
             self.assertIs(workspaces.mode_for(self.repo), Mode.BOOTSTRAP)
+
+
+class RemoteSlugTest(RemotesTest):
+    """Reading the repository a push webhook is about off ``origin`` (JIM-168).
+
+    The same remote list :class:`ModeTest` reads; what differs is only how
+    strictly the URL is parsed.
+    """
+
+    def test_an_https_origin_names_the_repository(self) -> None:
+        self.remote("origin", "https://github.com/jimpo/foregent")
+
+        self.assertEqual(workspaces.remote_slug(self.repo), "jimpo/foregent")
+
+    def test_the_git_suffix_is_not_part_of_the_name(self) -> None:
+        """GitHub calls the repository ``owner/name``; the clone URL adds ``.git``."""
+        self.remote("origin", "https://github.com/jimpo/foregent.git")
+
+        self.assertEqual(workspaces.remote_slug(self.repo), "jimpo/foregent")
+
+    def test_an_ssh_origin_names_the_same_repository(self) -> None:
+        self.remote("origin", "git@github.com:jimpo/foregent.git")
+
+        self.assertEqual(workspaces.remote_slug(self.repo), "jimpo/foregent")
+
+    def test_a_trailing_slash_is_not_part_of_the_name(self) -> None:
+        self.remote("origin", "https://github.com/jimpo/foregent/")
+
+        self.assertEqual(workspaces.remote_slug(self.repo), "jimpo/foregent")
+
+    def test_a_repo_with_no_remotes_names_nothing(self) -> None:
+        self.assertEqual(workspaces.remote_slug(self.repo), "")
+
+    def test_an_origin_off_github_names_nothing(self) -> None:
+        """Only a GitHub repository can be the subject of a GitHub delivery."""
+        self.remote("origin", "https://gitlab.com/jimpo/foregent.git")
+
+        self.assertEqual(workspaces.remote_slug(self.repo), "")
+
+    def test_a_github_remote_that_is_not_origin_names_nothing(self) -> None:
+        self.remote("upstream", "https://github.com/someone/foregent.git")
+
+        self.assertEqual(workspaces.remote_slug(self.repo), "")
+
+    def test_a_failing_jj_names_nothing(self) -> None:
+        """Which wakes the repo's agents rather than silencing them (§4.2)."""
+        with mock.patch.object(
+            workspaces, "_jj", side_effect=workspaces.WorkspaceError("boom")
+        ):
+            self.assertEqual(workspaces.remote_slug(self.repo), "")
 
 
 def _names(repo: Path) -> list[str]:

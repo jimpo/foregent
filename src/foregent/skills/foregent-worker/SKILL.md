@@ -113,9 +113,20 @@ you when something happens. Waiting costs nothing; starting over costs
 everything you have worked out so far.
 
 What wakes you is activity on **your own issue**: a comment or reply on it, or
-a review, comment, or new conflict with `main` on the pull request linked to
-it. Foregent finds that pull request itself — Linear links it off your branch
-name — so you never have to report which PR is yours.
+a review or comment on the pull request linked to it. Foregent finds that pull
+request itself — Linear links it off your branch name — so you never have to
+report which PR is yours.
+
+In `pull-request` mode you are woken by one more thing: **`main` advancing**.
+That is the base of your branch moving, and it is all foregent can tell you —
+GitHub says nothing about whether your pull request still merges. So fetch,
+rebase if it moved, push the update, and say so on the pull request if you had
+to resolve anything.
+
+**A wake un-blocks you.** Foregent marks you working again as soon as it
+prompts you, so if you handle a wake and are still waiting on the same thing,
+call `report_blocked` again. A worker that does not is one no later push to
+`main` reaches.
 
 The corollary: nothing that happens on a *different* issue will ever wake you.
 If you are waiting on another ticket to land, say so in a comment on your own

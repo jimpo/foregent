@@ -766,17 +766,43 @@ class RebuildStoreTests(unittest.TestCase):
         with mock.patch.object(server, "manager", manager):
             server.rebuild_store()
 
-    def test_live_agents_are_recovered_by_label(self) -> None:
+    def recover(self, status: AgentStatus) -> Issue:
         self.rebuild(
-            FakeManager(
-                [AgentRecord(AgentRef("fg-jim-88", "abc"), AgentStatus.IDLE, "/ws")]
-            )
+            FakeManager([AgentRecord(AgentRef("fg-jim-88", "abc"), status, "/ws")])
         )
         issue = server.store.get("JIM-88")
         assert issue is not None
+        return issue
+
+    def test_live_agents_are_recovered_by_label(self) -> None:
+        issue = self.recover(AgentStatus.WORKING)
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
         self.assertEqual(issue.agent, AgentRef("fg-jim-88", "abc"))
         self.assertEqual(issue.directory, "/ws")
+
+    def test_an_agent_that_is_not_mid_turn_is_recovered_as_parked(self) -> None:
+        # It finished a turn and is waiting, which in this system means it
+        # parked (JIM-168). Without this a restart leaves the push-to-main
+        # wake with nobody to find.
+        for status in (AgentStatus.IDLE, AgentStatus.DONE):
+            with self.subTest(status=status):
+                self.assertEqual(self.recover(status).status, IssueStatus.BLOCKED)
+
+    def test_a_recovered_blocker_says_it_is_unknown(self) -> None:
+        # The words the worker chose died with the process. The blocker is a
+        # note and never a key, so saying so plainly is the honest answer.
+        self.assertEqual(
+            self.recover(AgentStatus.IDLE).blocker, server.RECOVERED_BLOCKER
+        )
+        self.assertIn("unknown", server.RECOVERED_BLOCKER)
+
+    def test_an_unreadable_status_is_not_read_as_parked(self) -> None:
+        # UNKNOWN means the state could not be read, not that the agent
+        # stopped; herdr's own BLOCKED is one waiting on input, not on the
+        # world. Neither is a claim to make on a guess.
+        for status in (AgentStatus.UNKNOWN, AgentStatus.BLOCKED):
+            with self.subTest(status=status):
+                self.assertEqual(self.recover(status).status, IssueStatus.IN_PROGRESS)
 
     def test_agents_foregent_did_not_launch_are_ignored(self) -> None:
         self.rebuild(
