@@ -30,7 +30,7 @@ from foregent.agents import (
     LaunchSpec,
 )
 from foregent.models import Issue, IssueStatus
-from foregent.store import IssueStore
+from foregent.store import IN_FLIGHT, IssueStore
 from foregent.workspaces import WorkspaceError
 
 
@@ -712,8 +712,7 @@ class WatchAgentsTests(unittest.TestCase):
             AgentEvent(AgentEventKind.EXITED, AgentRef("fg-jim-88"), AgentStatus.GONE)
         ]
         self.watch(manager)
-        occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
-        self.assertFalse(any(i.status in occupied for i in server.store))
+        self.assertFalse(any(i.status in IN_FLIGHT for i in server.store))
 
 
 @unittest.skipUnless(shutil.which("jj"), "jj is not installed")

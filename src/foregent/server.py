@@ -402,8 +402,10 @@ def ensure_skills() -> None:
 def dispatch() -> None:
     """Launch an agent for the oldest Queued issue, capacity allowing.
 
-    Capacity is hardcoded at one concurrently running agent, occupied by an
-    IN_PROGRESS or a parked-alive BLOCKED issue. Before
+    Capacity is hardcoded at one concurrently running agent, occupied by any
+    in-flight issue: a working one, one parked alive on a blocker, and one in
+    review alike each hold a live agent (:data:`~foregent.store.IN_FLIGHT`).
+    Before
     launch, the issue is claimed directly in Linear (assignee + In Progress
     state) — no agent runs without a durable
     ownership record. On a Linear or harness failure the issue stays Queued
@@ -419,8 +421,7 @@ def dispatch() -> None:
     that self-heals on retry, because claiming is idempotent — the durable
     fix for both is orphan reconciliation.
     """
-    occupied = (IssueStatus.IN_PROGRESS, IssueStatus.BLOCKED)
-    if any(issue.status in occupied for issue in store):
+    if any(issue.status in IN_FLIGHT for issue in store):
         return
     issue = store.next_queued()
     if issue is None:
