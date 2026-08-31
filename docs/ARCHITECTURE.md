@@ -127,7 +127,7 @@ the bridge through the foregent MCP server.
 | `models.py` | `Issue` and `IssueStatus`. |
 | `events.py` | `Event`, `EventKind`, and the pure `wakes()` and `delivery_message()`. No transport, no server. |
 | `linear.py` | Linear GraphQL client: claim an issue, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
-| `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server, so the bridge needs no API client. |
+| `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server; the bridge's own reach is one GET, for the one delivery that names no branch. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
 | `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
@@ -246,21 +246,45 @@ a body that is not a JSON object, 200 for everything else. Only the header
 `X-GitHub-Event` says what a delivery is about; the body names the repository
 and the pull request.
 
-A review being submitted and an inline review comment being written map to a
-`PR_REVIEW` event, and a push that leaves commits on `main` to a
-`MAIN_ADVANCED` one; every other event and every other action of those maps to
-nothing, an organization webhook carrying far more than foregent has a use
-for. From there the path is the Linear one, joined at `queue_event`: match,
-enqueue, drain, send. The two guards ahead of that join stay Linear's own —
-both key on what Linear signs and stamps — so a GitHub delivery is checked
-against no freshness window, and a retry of one GitHub believes failed reaches
-the agent a second time.
+A review being submitted and a comment being written — inline, or in the pull
+request's conversation tab — map to a `PR_REVIEW` event, and a push that leaves
+commits on `main` to a `MAIN_ADVANCED` one; every other event and every other
+action of those maps to nothing, an organization webhook carrying far more than
+foregent has a use for. From there the path is the Linear one, joined at
+`queue_event`: match, enqueue, drain, send. The two guards ahead of that join
+stay Linear's own — both key on what Linear signs and stamps — so a GitHub
+delivery is checked against no freshness window, and a retry of one GitHub
+believes failed reaches the agent a second time.
 
 **The pull request is resolved back to its issue through its head branch.**
 Linear names an agent's branch after the issue and links a pull request opened
 from it to that issue, so the key is in the branch and reading it there is the
-whole of following the link — no GitHub call, and no pull request number a
-worker has to report to be findable.
+whole of following the link — and no pull request number a worker has to report
+to be findable.
+
+**One delivery names no branch, and is the only thing the bridge asks GitHub
+for.** A comment in the pull request's conversation tab — the ordinary way a
+reviewer says something that hangs off no line — arrives as `issue_comment`,
+GitHub's one event for a comment on an issue and on a pull request alike, and
+its payload carries the branch nowhere. The bridge fetches it: one
+authenticated `GET /repos/{owner}/{name}/pulls/{number}`, read for `head.ref`,
+with the `GITHUB_TOKEN` the box already holds for the agents' MCP server.
+Nothing else of GitHub's API is reached and there is no client — a payload
+short of one field is not a reason to own one.
+
+The two cheap drops run ahead of the call, so it is made only for a comment
+that would otherwise be delivered. The `pull_request` link inside the `issue`
+is what says the comment is on a pull request rather than on a plain issue,
+which foregent never opens; and that `issue`'s author is the pull request's, so
+foregent's own writes are dropped by the same sender comparison as below. A
+missing token or an unreachable API is logged and resolves to no issue — the
+comment then reaches nobody, which is what it did before it was handled at all,
+and failing the delivery would buy retries into the same wall.
+
+Mapping a delivery can therefore block on a socket, so the route maps on a
+worker thread rather than on the event loop. Resolving the branch a level up
+instead would put the reading of a GitHub payload into the route, which is the
+boundary `github.py` exists to hold.
 
 **Foregent's own writes are dropped by comparing the delivery's sender to the
 pull request's author.** The agent opened the pull request, so a review comment
@@ -292,7 +316,7 @@ costs one agent turn while a missed one leaves an agent parked forever on a
 base that has moved.
 
 **Nothing records which workers have a pull request open, deliberately.** The
-bridge holds no GitHub client to rebuild such a record with, so it would be
+bridge has nothing to rebuild such a record from, so it would be
 empty after every restart — which is the ordinary case here (§5.4) — and the
 fallback for an empty one is the rule above. A worker parked on something
 else is therefore woken too; it reads one line and parks again.
@@ -301,10 +325,6 @@ else is therefore woken too; it reads one line and parks again.
 report itself blocked again or no later push will reach it. The worker skill
 says so, and that sentence is what the Blocked filter rests on.
 
-One thing a worker could be told about is not delivered: a comment in the
-pull request's conversation tab arrives as `issue_comment`, whose payload
-carries no head branch, so resolving it would need the GitHub API client the
-bridge does not have.
 
 ### 4.3 Completion and blocking
 
@@ -738,5 +758,5 @@ installed.
 | `FOREGENT_LOG_LEVEL` | CLI | Default of `serve --log-level`. Default `info`. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
-| `GITHUB_TOKEN` | agents | GitHub MCP authentication. |
+| `GITHUB_TOKEN` | bridge, agents | GitHub MCP authentication, and the bridge's lookup of a pull request's head branch (§4.2). |
 | `GITHUB_WEBHOOK_SECRET` | bridge | GitHub webhook signature verification. |
