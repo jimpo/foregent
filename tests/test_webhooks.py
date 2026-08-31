@@ -25,6 +25,7 @@ import queue
 import threading
 import time
 import unittest
+from collections import deque
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -119,6 +120,11 @@ class WebhookRouteTests(unittest.TestCase):
         # so hand one over rather than have a test of the signature ask
         # Linear for it. The store is empty, so nothing is delivered anyway.
         self.enterContext(mock.patch.object(server, "_viewer", "own-id"))
+        # The recent-delivery memory is process-wide, and these tests replay
+        # one body across several of them; each starts with an empty one.
+        self.enterContext(
+            mock.patch.object(server, "_recent", deque(maxlen=server.RECENT_DELIVERIES))
+        )
 
     def post(self, body: bytes, signature: str | None):
         headers = {"Content-Type": "application/json"}
@@ -185,6 +191,11 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.enterContext(mock.patch.object(server, "_viewer", ""))
         self.viewer = self.enterContext(
             mock.patch.object(server.linear, "viewer_id", return_value=self.VIEWER)
+        )
+        # The recent-delivery memory is process-wide, and these tests replay
+        # one body across several of them; each starts with an empty one.
+        self.enterContext(
+            mock.patch.object(server, "_recent", deque(maxlen=server.RECENT_DELIVERIES))
         )
 
     def track(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
@@ -311,6 +322,34 @@ class WebhookDeliveryTests(unittest.TestCase):
         response = self.deliver(self.comment(actor=self.VIEWER))
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.manager.sent, [])
+
+    def test_a_retried_delivery_prompts_the_agent_once(self) -> None:
+        # Linear retries a delivery it believes failed; the worker must not
+        # read the same comment twice.
+        self.track()
+        payload = self.comment()
+        first = self.deliver(payload)
+        second = self.deliver(payload)
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+        self.assertEqual(len(self.manager.sent), 1)
+
+    def test_a_second_comment_is_not_mistaken_for_a_retry(self) -> None:
+        # Two deliveries differ in their bodies, so neither hides the other.
+        self.track()
+        self.deliver(self.comment())
+        self.deliver(dict(self.comment(), webhookTimestamp=time.time() * 1000))
+        self.assertEqual(len(self.manager.sent), 2)
+
+    def test_only_the_most_recent_deliveries_are_remembered(self) -> None:
+        # The memory is bounded, so a repeat is only dropped while it is
+        # recent. Nothing else keeps this process from growing on traffic.
+        self.enterContext(mock.patch.object(server, "_recent", deque(maxlen=1)))
+        self.track()
+        payload = self.comment()
+        self.deliver(payload)
+        self.deliver(dict(payload, webhookTimestamp=time.time() * 1000))
+        self.deliver(payload)
+        self.assertEqual(len(self.manager.sent), 3)
 
     def test_a_delivery_about_no_issue_is_accepted_and_dropped(self) -> None:
         self.track()

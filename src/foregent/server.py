@@ -26,6 +26,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -108,6 +109,16 @@ _deliveries_lock = threading.Lock()
 # slots are free, which also keeps concurrent `jj workspace add` off one repo.
 # ponytail: one lock for the fleet; per-repo locks if launch latency matters.
 _dispatching = threading.Lock()
+
+# How many recent Linear deliveries are remembered, newest last, to answer a
+# repeat of one already acted on. Linear retries a delivery it believes
+# failed, and a retried comment must not prompt a worker twice. The signature
+# is the key: there is no per-delivery id in the payload, but Linear signs the
+# exact bytes it sent, so a retry carries the signature already seen and two
+# distinct deliveries — each with its own `webhookTimestamp` — never collide.
+# ponytail: a linear scan of a short deque; a set beside it if this grows.
+RECENT_DELIVERIES = 256
+_recent: deque[str] = deque(maxlen=RECENT_DELIVERIES)
 
 # How long to pause before offering a refused message again. A prompt is
 # submitted without waiting for the agent to be free, so a refusal is the
@@ -705,8 +716,10 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     Linear sends is about issues no agent here is working, and a 200 is the
     honest answer: nothing failed, and telling Linear otherwise buys three
     pointless retries of an event that would be dropped again. That covers a
-    payload naming no issue, an issue nobody is working, and foregent's own
-    writes coming back at it.
+    payload naming no issue, an issue nobody is working, foregent's own
+    writes coming back at it, and a repeat of a delivery already acted on —
+    which is the same answer the first copy got, and the answer that stops
+    Linear sending a third.
 
     The one delivery that is *not* accepted is one that arrives while
     foregent's own account id is unknown (:func:`own_viewer`): matching
@@ -725,10 +738,9 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     refusing it is the whole of not acting on a replay.
     """
     body = await request.body()
+    signature = request.headers.get(linear.SIGNATURE_HEADER, "")
     try:
-        authentic = linear.webhook_authentic(
-            body, request.headers.get(linear.SIGNATURE_HEADER, "")
-        )
+        authentic = linear.webhook_authentic(body, signature)
     except linear.LinearError as exc:
         logger.error("cannot authenticate Linear webhooks: %s", exc)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -737,6 +749,12 @@ async def linear_webhook(request: Request) -> dict[str, str]:
     payload = _payload(body)
     if not linear.webhook_fresh(payload):
         raise HTTPException(status_code=400, detail="delivery is outside the window")
+    # Nothing is awaited between the read and the write, so two copies of one
+    # delivery arriving together cannot both find it unseen.
+    if signature in _recent:
+        logger.info("dropping a repeat of a delivery already acted on")
+        return {"status": "ok"}
+    _recent.append(signature)
     event = linear.webhook_event(payload)
     if event is None:
         logger.debug("Linear webhook is about no issue foregent knows: %s", payload)
