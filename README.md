@@ -237,9 +237,10 @@ agents run at once is the project's mode**: bootstrap mode is one at a time,
 because the bridge advances `main` onto each agent's work and the next
 workspace is built from it; Pull Request mode runs up to `FOREGENT_MAX_AGENTS`
 (default 3), each in its own workspace with its own branch. Dispatch assigns
-the issue to the foregent account in Linear and moves it to `In Progress`, so
-the team must have a state with exactly that name. A queued issue waits its
-turn, in the order it was queued.
+the issue to the foregent account in Linear and moves it to `In Progress`, and
+completion moves it to `Done` unless the agent already closed or cancelled it,
+so the team must have states with exactly those two names. A queued issue
+waits its turn, in the order it was queued.
 
 `-d` is the **repository**, not the agent's working directory. Dispatch builds
 the agent a jj workspace of its own from it — `~/.foregent/workspaces/JIM-42`

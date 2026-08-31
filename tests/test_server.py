@@ -141,6 +141,9 @@ class DispatchTests(unittest.TestCase):
         claim = mock.patch.object(server.linear, "claim_issue")
         self.claim = claim.start()
         self.addCleanup(claim.stop)
+        close = mock.patch.object(server.linear, "close_issue")
+        self.close = close.start()
+        self.addCleanup(close.stop)
         # Dispatch installs foregent's skills into the box's Claude Code
         # config directory; point that somewhere disposable so running the
         # tests never writes into the real ~/.claude.
@@ -927,6 +930,9 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
         self.enterContext(mock.patch.object(server.linear, "claim_issue"))
+        self.close = self.enterContext(
+            mock.patch.object(server.linear, "close_issue")
+        )
         self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.enterContext(
             mock.patch.dict(
@@ -1128,6 +1134,32 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.git_head(), "the agent's work")
 
+    async def test_completion_closes_the_issue_in_linear(self) -> None:
+        # The other end of the claim (JIM-200). Bootstrap mode has no pull
+        # request whose merge moves the status, so an issue nobody closed by
+        # hand sat In Progress for good — the repo has no origin, which is
+        # what makes this bootstrap.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+
+        await server.complete_task("JIM-88")
+
+        self.close.assert_called_once_with("JIM-88")
+
+    async def test_a_linear_that_cannot_be_reached_still_completes(self) -> None:
+        # The work is landed and the agent is about to go: a status an
+        # operator can fix beats an issue stranded in flight.
+        server.store.queue("JIM-88", str(self.repo))
+        server.dispatch()
+        self.close.side_effect = server.linear.LinearError("Linear is down")
+
+        result = await server.complete_task("JIM-88")
+
+        self.assertIn("complete", result)
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.DONE)
+
     async def test_trunk_is_advanced_before_the_next_issue_is_dispatched(self) -> None:
         # The next dispatch builds its workspace on `main`, so a bookmark
         # moved after it would leave the next agent on a trunk this issue
@@ -1215,7 +1247,8 @@ class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
         )
         manager = FakeManager()
         with mock.patch.object(server, "manager", manager):
-            await server.complete_task("JIM-88")
+            with mock.patch.object(server.linear, "close_issue"):
+                await server.complete_task("JIM-88")
         self.assertEqual(manager.stopped, [ref])
 
         manager.stream = [AgentEvent(AgentEventKind.EXITED, ref, AgentStatus.GONE)]

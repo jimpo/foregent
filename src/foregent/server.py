@@ -679,8 +679,24 @@ def queue_issue(key: str, directory: Annotated[str, Body(embed=True)]) -> dict[s
 
 @app.post("/issues/{key}/complete")
 def complete_issue(key: str) -> dict[str, str]:
-    """Mark issue ``key`` Done, dispatch the next queued issue, and return the record."""
+    """Mark ``key`` Done here and in Linear, dispatch what is queued, and return it.
+
+    Closing in Linear is the other end of the claim (§4.1): the issue foregent
+    moved to In Progress is the issue foregent moves out of it, so the status
+    tells the truth in every mode rather than only where a merged pull request
+    happens to close it (JIM-200). An agent that already ended the issue its
+    own way — canceled, most often — keeps that answer
+    (:func:`foregent.linear.close_issue`).
+
+    Best-effort, because the work is landed and the agent is about to be torn
+    down: a Linear that cannot be reached leaves a status an operator can fix,
+    while failing here would strand a completed issue in flight.
+    """
     issue = store.complete(key)
+    try:
+        linear.close_issue(key)
+    except linear.LinearError as exc:
+        logger.error("could not close %s in Linear: %s", key, exc)
     # The completion above sticks even if dispatch 502s: the caller sees the
     # error, but the issue is Done and the next one stays Queued until a later
     # queue/complete triggers dispatch again. Retrying complete is safe.
