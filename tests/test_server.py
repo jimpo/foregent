@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import tomllib
 import unittest
 from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
@@ -1261,3 +1262,19 @@ class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class McpDependencyTest(unittest.TestCase):
+    """The mcp requirement must not admit a major that renames what we import.
+
+    ``server.py`` imports ``mcp.server.fastmcp``. mcp 2.x renamed FastMCP to
+    MCPServer, so an unbounded requirement resolves an install that cannot
+    import the bridge at all (JIM-202).
+    """
+
+    def test_mcp_requirement_excludes_v2(self):
+        pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+        with pyproject.open("rb") as fh:
+            deps = tomllib.load(fh)["project"]["dependencies"]
+        (requirement,) = [d for d in deps if d.startswith("mcp")]
+        self.assertIn("<2", requirement)

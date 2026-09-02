@@ -294,7 +294,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "gql", extras = ["requests"], specifier = ">=3.5" },
-    { name = "mcp", specifier = ">=1.2" },
+    { name = "mcp", specifier = ">=1.2,<2" },
     { name = "uvicorn", specifier = ">=0.34" },
     { name = "watchfiles", specifier = ">=0.24" },
 ]
