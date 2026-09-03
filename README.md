@@ -146,8 +146,9 @@ is better: `~/.claude.json` is rewritten by every running Claude Code session,
 and the entry above means foregent never has to touch it.
 
 Codex inherits nothing from a parent directory — it resolves trust to a git
-repository's root, and a jj workspace has no `.git` — so foregent appends an
-entry per workspace to `~/.codex/config.toml`:
+repository's root, and a jj workspace has no `.git` — and its
+`--dangerously-bypass-approvals-and-sandbox` does not skip the dialog either.
+So foregent appends an entry per workspace to `~/.codex/config.toml`:
 
 ```toml
 [projects."/home/you/.foregent/workspaces/JIM-42"]

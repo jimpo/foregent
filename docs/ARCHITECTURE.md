@@ -799,6 +799,23 @@ and none is obvious from either tool's documentation.
   it as an optimization rather than a guarantee — it writes the exact entry
   whenever its own copy of the rule says untrusted, which is the answer a
   stricter harness would give.
+- **Codex's trust follows git, and fails a dispatch later.** Established by
+  driving codex 0.153 under herdr in directories of each shape:
+  - **It resolves to a git repository's root** where the cwd is in one, and to
+    the exact directory otherwise, walking up no further: a trusted parent
+    does not cover its non-git child. A *git worktree* resolves to the main
+    repository's root, so one entry there would cover every worktree of it —
+    but a secondary jj workspace has no `.git` at all, so it is its own
+    project and gets its own entry.
+  - **`--dangerously-bypass-approvals-and-sandbox` does not skip the dialog.**
+    It governs what a running agent may do, not whether the directory is
+    opened at all.
+  - **herdr reads the dialog as `idle` and `interactive_ready`**, not
+    `blocked` as it does Claude Code's. So an untrusted Codex cwd does not
+    fail the launch; it fails the brief, which the prompt's own delivery check
+    catches as `agent_prompt_stalled` and reports with the screen quoted. A
+    later failure and a noisier one, which is why foregent writes the entry
+    rather than relying on the operator.
 - **Detection is screen-scraping underneath.** herdr's detection manifest
   updates on its own schedule, independent of the protocol version, so the
   startup protocol check says nothing about it.
@@ -839,18 +856,22 @@ installed.
   into its agents, which silently disables transcript saving and breaks
   resume. The systemd unit sets an explicit environment.
 - **Pre-accepted workspace trust.** A fresh directory makes a harness open its
-  trust dialog before accepting input, and herdr's detection reads that dialog
-  as `blocked` — so the agent never reaches idle and the launch fails. Every
-  workspace is a fresh directory, so trust the workspace *root* once and every
-  workspace under it inherits it (§7.1). Foregent writes the entry itself for
-  any workspace it finds untrusted, so this is a should, not a must; doing it
-  by hand keeps foregent out of `~/.claude.json`, which every running Claude
-  Code session rewrites.
+  trust dialog before accepting input. For Claude Code, herdr's detection reads
+  that dialog as `blocked` — so the agent never reaches idle and the launch
+  fails. Every workspace is a fresh directory, so trust the workspace *root*
+  once and every workspace under it inherits it (§7.1). Foregent writes the
+  entry itself for any workspace it finds untrusted, so this is a should, not a
+  must; doing it by hand keeps foregent out of `~/.claude.json`, which every
+  running Claude Code session rewrites.
 
-  **Codex inherits nothing**, because it resolves trust to a git repository's
-  root and a secondary jj workspace has no `.git`. Foregent writes the exact
-  workspace path there, appended to `$CODEX_HOME/config.toml` so an operator's
-  own comments and layout survive, and that file grows an entry per issue.
+  **Codex inherits nothing and there is nothing to pre-accept**, because it
+  resolves trust to a git repository's root and a secondary jj workspace has no
+  `.git`. Foregent writes the exact workspace path, appended to
+  `$CODEX_HOME/config.toml` so an operator's own comments and layout survive,
+  and that file grows an entry per issue. Nor does the bypass flag skip the
+  dialog, and herdr reads it as an idle agent rather than a blocked one, so
+  without the entry the dispatch fails at the brief instead of at the launch
+  (§7.1).
 - **The herdr integration for each harness** (`herdr integration install
   claude`, `herdr integration install codex`), so session identity is reported
   back to herdr.

@@ -399,10 +399,9 @@ def ensure_trusted(path: Path, provider: Provider = DEFAULT_PROVIDER) -> bool:
     """Record ``path`` as a trusted directory for ``provider``, if it is not one.
 
     Both harnesses open a *do you trust this folder* dialog in a directory
-    they have not seen, and herdr reads that dialog as ``blocked``, so an
-    untrusted cwd does not slow a dispatch down — it fails it, with nobody
-    there to answer. A per-issue workspace is always a fresh directory, and
-    its path is not known before the issue is queued, so the operator cannot
+    they have not seen, and answer nothing until it is dismissed, with nobody
+    there to do it. A per-issue workspace is always a fresh directory, and its
+    path is not known before the issue is queued, so the operator cannot
     pre-accept it by hand the way `README.md` describes for a fixed one.
 
     Returns whether an entry was written. **Trust is checked before it is
@@ -410,12 +409,14 @@ def ensure_trusted(path: Path, provider: Provider = DEFAULT_PROVIDER) -> bool:
     honest about :func:`foregent.mcp_servers.config_file`'s rule that a
     harness rewrites its own config file so foregent must not.
 
-    The two differ in how far one entry reaches. Claude Code walks up from the
-    directory, so a box whose workspace root is trusted writes nothing here at
-    all. Codex resolves trust to a git repository's root, and a secondary jj
-    workspace has no ``.git``, so an entry on the workspace root is not known
-    to cover the workspace under it: foregent writes the exact path, and
-    ``config.toml`` grows an entry per issue.
+    The two differ in how far one entry reaches, and in how the dispatch
+    fails without one (§7.1). Claude Code walks up from the directory, so a
+    box whose workspace root is trusted writes nothing here at all. Codex
+    resolves trust to a git repository's root and otherwise to the exact
+    directory, walking up no further; a secondary jj workspace has no
+    ``.git``, so an entry on the workspace root does not cover the workspace
+    under it. Foregent writes the exact path there, and ``config.toml`` grows
+    an entry per issue.
     """
     if trusted(path, provider):
         return False
@@ -433,8 +434,8 @@ def trusted(path: Path, provider: Provider = DEFAULT_PROVIDER) -> bool:
     Mirrors each harness's own rule. Claude Code's is an exact entry for the
     directory or one on any ancestor of it, which is why trusting a workspace
     root once covers every per-issue workspace under it. Codex's is the exact
-    directory, because it resolves a git project to its root and a jj
-    workspace is not one.
+    directory: outside a git project it walks up no further, established by
+    trusting a parent and watching codex 0.153 ask about the child anyway.
 
     Read off Claude Code 2.1.251 and codex-cli 0.153 and documented by
     neither, so both are treated as an optimization rather than a guarantee —
