@@ -72,9 +72,20 @@ work there. **Do not move the `main` bookmark** — foregent moves it for you
 when you call `complete_task`, at the repo root where jj exports it to git.
 
 **`pull-request`**: push a branch and open a PR through the GitHub MCP, then
-report yourself blocked on the review rather than waiting. Push the branch
-Linear names on the issue, so the PR is linked to it and foregent can find you
-when the review lands.
+report yourself blocked on the review rather than waiting.
+
+**The branch name is Linear's, not yours.** The Linear MCP returns it on the
+issue as `gitBranchName` (`aj/jim-42-short-title`). Put a bookmark of exactly
+that name on your work and push it:
+
+```
+jj bookmark set aj/jim-42-short-title -r @-
+jj git push --bookmark aj/jim-42-short-title
+```
+
+Linear links a pull request opened from that branch to the issue, and foregent
+reads your issue key back out of the branch to find you when a review lands. A
+branch you invent breaks both, and nothing tells you it did.
 
 **Rebase before every push.** Your workspace was built from the `main` your box
 had at dispatch, and you then wait on a review for as long as a review takes —

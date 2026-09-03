@@ -77,6 +77,14 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("complete_task", body)
         self.assertIn("report_blocked", body)
 
+    def test_the_worker_skill_names_the_branch_field(self) -> None:
+        # The bridge finds a pull request's issue by reading the key out of the
+        # head branch (§4.2), so a branch named anything but Linear's own
+        # `gitBranchName` strands the agent: no review ever reaches it, and
+        # nothing reports that it did not.
+        body = (skills.PACKAGED / "foregent-worker" / "SKILL.md").read_text()
+        self.assertIn("gitBranchName", body)
+
 
 class PackagingTests(unittest.TestCase):
     """The skills have to exist wherever foregent is installed, not just here."""
