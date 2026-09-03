@@ -44,10 +44,10 @@ its own effort on dispatch, event delivery and provisioning.
 The dependency is real: herdr is young and solo-maintained. A protocol
 mismatch stops the bridge at startup rather than surfacing mid-dispatch.
 
-### 1.3 Claude Code is a harness, not a foundation
+### 1.3 A harness is a choice, not a foundation
 
-Claude Code is the only harness today, and the design keeps it from being the
-only one possible. Everything harness-specific — the argv, the status
+Claude Code and Codex both run agents here, and neither is built into
+anything above the seam. Everything harness-specific — the argv, the status
 mapping, the socket calls — sits behind `AgentManager` (§7). Nothing above
 that seam knows what an agent is running.
 
@@ -113,7 +113,7 @@ One machine per project. Three layers.
   │  • event ingest, authentication, matching       │
   │  • delivery queues + drainers, one per issue    │
   │  • dispatch and capacity                        │
-  │  • AgentManager (herdr + Claude Code)           │
+  │  • AgentManager (herdr + Claude Code / Codex)   │
   │  • foregent MCP server (mounted at /mcp)        │
   │  • skill and MCP provisioning                   │
   │  • per-issue jj workspaces                      │
@@ -125,7 +125,7 @@ One machine per project. Three layers.
   │   workspaces • panes • agent state • events     │
   └───────────────┬─────────────────────────────────┘
                   ▼
-        Claude Code sessions, one per issue
+      Claude Code or Codex sessions, one per issue
 ```
 
 Agents talk to the world through the Linear and GitHub MCP servers, and to
@@ -145,7 +145,8 @@ the bridge through the foregent MCP server.
 | `agents/base.py` | The `AgentManager` protocol and its types, `Provider` among them. Harness-agnostic. |
 | `agents/herdr_manager.py` | The one implementation: drives `workspace.create` → `agent.start` → `agent.prompt` and translates herdr's events, for every harness. |
 | `agents/harness.py` | Which herdr agent kind a provider names, and which module renders its argv. |
-| `agents/claude.py` | Claude Code's own half: the agent kind, and the flags a `LaunchSpec` renders to. |
+| `agents/claude.py` | Claude Code's own half: the agent kind, the flags a `LaunchSpec` renders to, and the brief. |
+| `agents/codex.py` | The same for Codex. |
 | `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for Claude Code. |
 | `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's user-level Claude Code config. |
 | `skills/` | The packaged `foregent-worker` skill and its installer. |
@@ -500,21 +501,48 @@ fresh dispatch.
 
 ### 6.1 The launch spec
 
-`LaunchSpec` is the structure foregent owns; the manager renders it to
-`claude` flags. It carries the label, cwd, environment, model and effort, an
-appended system prompt, tool allow and deny lists, MCP servers, a
-conversation id, and whether to resume it.
+`LaunchSpec` is the structure foregent owns; the harness named by its
+`provider` renders it to arguments. It carries the label, cwd, environment,
+model and effort, an appended system prompt, tool allow and deny lists, MCP
+servers, a conversation id, and whether to resume it.
 
-`--permission-mode bypassPermissions` is not a spec field. It is a property
-of how foregent runs agents at all (§1.1), so the manager always sets it.
+Full permissions are not a spec field — `--permission-mode bypassPermissions`
+for Claude Code, `--dangerously-bypass-approvals-and-sandbox` for Codex. It is
+a property of how foregent runs agents at all (§1.1), so the harness always
+sets it.
+
+**An MCP server is declared in foregent's own spelling** — a URL and the
+*name* of the environment variable holding its token — and each harness
+renders that: a header holding `${VARIABLE}` for Claude Code, a
+`bearer_token_env_var` for Codex. Neither writes a credential (§6.3).
+
+**Three fields Codex cannot express are refused rather than dropped**: an
+appended system prompt, tool allow and deny lists, and restricting an agent to
+the servers foregent declares — Codex merges `-c` overrides onto the machine's
+config and has no argument meaning *only these*. Nothing sets any of them, and
+an agent launched quietly without a restriction its caller asked for is the
+failure nobody notices.
+
+**A fresh Codex conversation cannot be named in advance.** Codex has no
+counterpart of `--session-id`; it records a session of its own and `resume`
+takes that id afterwards, so the id foregent generates is unused there and the
+one worth keeping is read back off herdr once the agent has started. The
+asymmetry costs nothing today, because resuming a conversation is unbuilt
+(§5.4).
 
 ### 6.2 The workflow lives in a skill
 
 `foregent-worker` tells the agent its lifecycle: reading its assignment, the
 mode rules, when to report blocked, when to call `complete_task`, and the
 rebase requirement. The brief is one line, so the lifecycle has one
-definition. Its second word is the mode (§6.4), which is the one thing about
-the lifecycle the skill cannot work out for itself.
+definition. It names the issue and the mode (§6.4), which are the two things
+about the lifecycle the skill cannot work out for itself.
+
+**How a skill is named is the harness's own**, so the brief's wording comes
+from the harness rather than from the bridge: a `/foregent-worker JIM-42
+pull-request` slash command in Claude Code, and in Codex a sentence naming the
+skill, since Codex has no slash form for one and instead lists every skill it
+found by name and description in the model's own prompt.
 
 Skills ship inside the installed package, so they travel with a
 `uv tool install`. Two paths put them on disk, `foregent setup` and the server

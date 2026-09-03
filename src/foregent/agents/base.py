@@ -80,6 +80,7 @@ class Provider(StrEnum):
     """
 
     CLAUDE = "claude"
+    CODEX = "codex"
 
 
 DEFAULT_PROVIDER = Provider.CLAUDE
@@ -97,6 +98,24 @@ class AgentStatus(StrEnum):
     # The process is gone: no pane, no session, nothing to prompt. Distinct
     # from UNKNOWN, which means "running, state not readable".
     GONE = "gone"
+
+
+@dataclass(frozen=True, slots=True)
+class McpServer:
+    """One MCP server, in foregent's own spelling rather than a harness's.
+
+    Every server foregent declares is remote HTTP with at most a bearer token,
+    which is the whole of what the harnesses have in common; each renders this
+    into its own shape.
+
+    **The credential is named, never carried.** ``token_env`` is the
+    environment variable the harness expands for itself at session start, so
+    the token lives only in the herdr server's environment and nothing written
+    to disk holds it.
+    """
+
+    url: str
+    token_env: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,7 +141,7 @@ class LaunchSpec:
     system_prompt: str = ""
     tools_allow: tuple[str, ...] = ()
     tools_deny: tuple[str, ...] = ()
-    mcp_servers: Mapping[str, Mapping] = field(default_factory=dict)
+    mcp_servers: Mapping[str, McpServer] = field(default_factory=dict)
     # Whether the agent may use only the MCP servers declared above, ignoring
     # whatever the machine is configured with. Off by default, and separate
     # from `mcp_servers` on purpose: foregent can add its own tools without

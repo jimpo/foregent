@@ -184,7 +184,7 @@ class DispatchTests(unittest.TestCase):
         server.dispatch()
         spec = self.manager.launched[0]
         self.assertIn("foregent", spec.mcp_servers)
-        self.assertTrue(spec.mcp_servers["foregent"]["url"].endswith("/mcp"))
+        self.assertTrue(spec.mcp_servers["foregent"].url.endswith("/mcp"))
 
     def test_dispatch_leaves_the_machines_mcp_config_in_place(self) -> None:
         # Agents reach Linear and GitHub through the machine's own

@@ -17,7 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from foregent.agents import claude
+from foregent.agents import claude, codex
 from foregent.agents.base import LaunchSpec, Provider
 
 
@@ -31,10 +31,19 @@ class Harness:
     # The command-line arguments the harness's binary is given. herdr supplies
     # the binary itself from the agent kind's manifest.
     render_args: Callable[[LaunchSpec], list[str]]
+    # The opening message an agent is given, from an issue key and a mode.
+    # Harness-specific because invoking a skill is: a slash command in one, a
+    # sentence naming it in the other.
+    brief: Callable[[str, str], str]
 
 
 HARNESSES: dict[Provider, Harness] = {
-    Provider.CLAUDE: Harness(Provider.CLAUDE, claude.KIND, claude.render_args),
+    Provider.CLAUDE: Harness(
+        Provider.CLAUDE, claude.KIND, claude.render_args, claude.brief
+    ),
+    Provider.CODEX: Harness(
+        Provider.CODEX, codex.KIND, codex.render_args, codex.brief
+    ),
 }
 
 

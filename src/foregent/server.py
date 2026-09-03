@@ -43,6 +43,7 @@ from starlette.concurrency import run_in_threadpool
 
 from foregent import config, github, herdr, linear, mcp_servers, skills, workspaces
 from foregent.agents import (
+    DEFAULT_PROVIDER,
     AgentError,
     AgentEventKind,
     AgentManager,
@@ -50,9 +51,12 @@ from foregent.agents import (
     AgentRef,
     AgentStatus,
     LaunchSpec,
+    McpServer,
+    Provider,
     issue_key_from_label,
     label_for,
 )
+from foregent.agents.harness import harness_for
 from foregent.agents.herdr_manager import HerdrManager
 from foregent.events import Event, EventKind, delivery_message, wakes
 from foregent.models import Issue, IssueStatus, Mode
@@ -416,18 +420,20 @@ def _record(issue: Issue) -> dict[str, str]:
     }
 
 
-def brief_for(key: str, mode: Mode) -> str:
+def brief_for(key: str, mode: Mode, provider: Provider) -> str:
     """The opening message an agent is given for issue ``key``.
 
-    Invoking the skill by name leaves the lifecycle in one place — the skill —
-    instead of half-restating it here, where the two would drift.
+    Naming the skill leaves the lifecycle in one place — the skill — instead
+    of half-restating it here, where the two would drift. How it is named is
+    the harness's own: a slash command in Claude Code, a sentence in Codex,
+    which is why the wording comes from ``provider`` rather than from here.
 
     The mode rides along because it is the bridge's answer, not the agent's to
     look up: it is read off the repo's git remotes
     (:func:`foregent.workspaces.mode_for`), and the same answer decides
     whether the bridge advances ``main`` when the issue completes.
     """
-    return f"/foregent-worker {key} {mode}"
+    return harness_for(provider).brief(key, mode)
 
 
 def mode_of(issue: Issue) -> Mode:
@@ -452,7 +458,7 @@ def mode_of(issue: Issue) -> Mode:
     return workspaces.mode_for(Path(issue.repo))
 
 
-def agent_mcp_servers() -> dict[str, dict]:
+def agent_mcp_servers() -> dict[str, McpServer]:
     """The MCP servers a dispatched agent is given.
 
     Foregent's own lifecycle tools, served from this process — without them
@@ -465,7 +471,7 @@ def agent_mcp_servers() -> dict[str, dict]:
     (:mod:`foregent.mcp_servers`) and inherited, so one configuration serves
     agents and the operator's own sessions alike (JIM-93).
     """
-    return {"foregent": {"type": "http", "url": f"{config.api_url()}/mcp"}}
+    return {"foregent": McpServer(url=f"{config.api_url()}/mcp")}
 
 
 def check_agent_mcp() -> None:
@@ -615,7 +621,7 @@ def _dispatch_one() -> bool:
         # The mode is read off the repo rather than the workspace: a secondary
         # workspace shares the repo's remotes, and an adopted agent's dispatch
         # never built one to read.
-        manager.send(ref, brief_for(issue.key, mode_of(issue)))
+        manager.send(ref, brief_for(issue.key, mode_of(issue), DEFAULT_PROVIDER))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:

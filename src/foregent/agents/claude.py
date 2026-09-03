@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from foregent.agents.base import LaunchSpec
+from foregent.agents.base import LaunchSpec, McpServer
 
 # herdr's name for the Claude Code integration, and the detection manifest it
 # loads to read that agent's state off the screen.
@@ -47,7 +47,8 @@ def render_args(spec: LaunchSpec) -> list[str]:
     if spec.tools_deny:
         argv += ["--disallowedTools", *spec.tools_deny]
     if spec.mcp_servers:
-        argv += ["--mcp-config", json.dumps({"mcpServers": dict(spec.mcp_servers)})]
+        servers = {name: _server(s) for name, s in spec.mcp_servers.items()}
+        argv += ["--mcp-config", json.dumps({"mcpServers": servers})]
     if spec.strict_mcp:
         # Independent of the declaration above: this one says to ignore
         # whatever MCP config the machine already has, so what foregent
@@ -57,3 +58,29 @@ def render_args(spec: LaunchSpec) -> list[str]:
     # attached operator reads to tell agents apart.
     argv += ["-n", spec.label]
     return argv
+
+
+def _server(server: McpServer) -> dict:
+    """One MCP server in Claude Code's own spelling.
+
+    The token is named rather than written: Claude Code expands
+    ``${VARIABLE}`` from the environment of each session, so the config this
+    lands in is safe to read and copy.
+    """
+    declared: dict = {"type": "http", "url": server.url}
+    if server.token_env:
+        declared["headers"] = {"Authorization": f"Bearer ${{{server.token_env}}}"}
+    return declared
+
+
+BRIEF = "/foregent-worker {key} {mode}"
+"""The opening message a Claude Code agent is given.
+
+Invoking the skill by name, which is what a Claude Code slash command is, so
+the lifecycle has one definition — the skill — rather than half of one here.
+"""
+
+
+def brief(key: str, mode: str) -> str:
+    """The opening message for issue ``key`` in ``mode``."""
+    return BRIEF.format(key=key, mode=mode)
