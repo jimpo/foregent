@@ -35,9 +35,10 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, HTTPException, Request
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from starlette.concurrency import run_in_threadpool
 
 from foregent import config, github, herdr, linear, mcp_servers, skills, workspaces
@@ -59,9 +60,7 @@ from foregent.store import IN_FLIGHT, IssueStore
 
 logger = logging.getLogger(__name__)
 
-# stateless_http: these tools are fire-and-forget, so session-id bookkeeping
-# would be pure overhead.
-mcp = FastMCP("foregent", stateless_http=True)
+mcp = MCPServer("foregent")
 
 
 @asynccontextmanager
@@ -1013,9 +1012,8 @@ async def complete_task(issue_key: str) -> str:
     if landed is not None:
         return landed
     # complete_issue's dispatch() call can block on the harness for a minute
-    # or more; FastMCP runs sync tools inline on the event loop (no
-    # auto-offload like Starlette gives sync FastAPI routes), so this must be
-    # threadpooled to avoid stalling the whole server.
+    # or more, and this tool handler is a coroutine on the event loop, so it
+    # must be threadpooled to avoid stalling the whole server.
     try:
         await run_in_threadpool(complete_issue, issue_key)
         result = f"Marked {issue_key} complete."
@@ -1127,10 +1125,25 @@ async def report_blocked(issue_key: str, blocker: str) -> str:
     return f"Recorded blocker {blocker!r} on {issue_key}."
 
 
+def mcp_host() -> str:
+    """The host an agent's MCP client will name in its ``Host`` header.
+
+    mcp answers a request whose ``Host`` it does not expect with 421, as DNS
+    rebinding protection, and the allowlist it builds is derived from this.
+    Agents reach the bridge at :func:`config.api_url`, so that URL's host is
+    the one to declare: on the default loopback URL that keeps the protection
+    on, and a bridge published under any other name is reachable rather than
+    rejecting every agent that calls it.
+    """
+    return urlparse(config.api_url()).hostname or "127.0.0.1"
+
+
 # Mounted at "/" (not "/mcp") because streamable_http_app() already routes at
 # its own streamable_http_path (default "/mcp") — mounting it at "/mcp" would
 # yield "/mcp/mcp". Mounted last so the explicit REST routes above take
 # precedence and this catch-all doesn't shadow them. Calling
 # streamable_http_app() here (import time) is also what creates
 # `mcp.session_manager` lazily, which `lifespan` above depends on.
-app.mount("/", mcp.streamable_http_app())
+# stateless_http: these tools are fire-and-forget, so session-id bookkeeping
+# would be pure overhead.
+app.mount("/", mcp.streamable_http_app(stateless_http=True, host=mcp_host()))

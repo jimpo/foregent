@@ -21,7 +21,11 @@ from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 from unittest import mock
 
-from foregent import herdr, server
+import httpx2
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+from foregent import config, herdr, server
 from foregent.agents import (
     AgentError,
     AgentEvent,
@@ -1260,21 +1264,70 @@ class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issue.status, IssueStatus.DONE)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class McpEndpointTest(unittest.IsolatedAsyncioTestCase):
+    """The lifecycle tools answer over the transport an agent reaches them by.
+
+    Everything between the agent and :func:`server.report_blocked` belongs to
+    the mcp library — the mounted app, the session manager the lifespan
+    drives, the ``Host`` the transport will accept — and an upgrade of it
+    changes all three at once (JIM-203). Calling the tool in Python proves
+    none of that, so this drives it as an agent does: a real MCP client, over
+    HTTP, at the URL dispatch hands out.
+    """
+
+    async def test_an_agent_can_list_and_call_the_tools(self) -> None:
+        server.store = IssueStore()
+        server.store.add(Issue(key="JIM-1", title="", status=IssueStatus.IN_PROGRESS))
+        url = config.api_url()
+        async with server.mcp.session_manager.run():
+            transport = httpx2.ASGITransport(app=server.app)
+            async with httpx2.AsyncClient(transport=transport, base_url=url) as http:
+                async with streamable_http_client(f"{url}/mcp", http_client=http) as (
+                    read,
+                    write,
+                    *_,
+                ):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        result = await session.call_tool(
+                            "report_blocked",
+                            {"issue_key": "JIM-1", "blocker": "a review"},
+                        )
+        self.assertEqual(
+            {tool.name for tool in tools.tools}, {"complete_task", "report_blocked"}
+        )
+        self.assertFalse(result.is_error)
+        issue = server.store.get("JIM-1")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.BLOCKED)
+        self.assertEqual(issue.blocker, "a review")
+
+    def test_the_declared_host_is_the_one_agents_call(self) -> None:
+        # A bridge published under a name of its own still has to answer the
+        # agents it dispatched: mcp rejects a Host it was not told about with
+        # 421, and the URL in the launch spec is where that Host comes from.
+        with mock.patch.dict(os.environ, {"FOREGENT_API_URL": "http://box:9000"}):
+            self.assertEqual(server.mcp_host(), "box")
 
 
 class McpDependencyTest(unittest.TestCase):
-    """The mcp requirement must not admit a major that renames what we import.
+    """The mcp requirement must admit the 2.x line and nothing else.
 
-    ``server.py`` imports ``mcp.server.fastmcp``. mcp 2.x renamed FastMCP to
-    MCPServer, so an unbounded requirement resolves an install that cannot
-    import the bridge at all (JIM-202).
+    ``server.py`` imports ``mcp.server.mcpserver``, which only 2.x has: 1.x
+    called it ``mcp.server.fastmcp``, and a later major is free to rename it
+    again. A requirement open at either end resolves an install that cannot
+    import the bridge at all (JIM-202, JIM-203).
     """
 
-    def test_mcp_requirement_excludes_v2(self):
+    def test_mcp_requirement_is_the_v2_line(self) -> None:
         pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
         with pyproject.open("rb") as fh:
             deps = tomllib.load(fh)["project"]["dependencies"]
         (requirement,) = [d for d in deps if d.startswith("mcp")]
-        self.assertIn("<2", requirement)
+        self.assertIn(">=2", requirement)
+        self.assertIn("<3", requirement)
+
+
+if __name__ == "__main__":
+    unittest.main()
