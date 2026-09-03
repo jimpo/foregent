@@ -37,12 +37,17 @@ import re
 import shutil
 import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 
 from foregent import config, mcp_servers
+from foregent.agents import DEFAULT_PROVIDER, Provider
 from foregent.models import Mode
 
 logger = logging.getLogger(__name__)
+
+# Codex's own word for a directory it will work in without asking.
+CODEX_TRUSTED = "trusted"
 
 # The revision a fresh workspace starts on. Hardcoded rather than configured:
 # bootstrap mode already names `main` as the branch the agent rebases onto and
@@ -182,7 +187,7 @@ def repo_for(path: Path) -> Path | None:
     return (jj / named).resolve().parent.parent
 
 
-def create(repo: Path, key: str) -> Path:
+def create(repo: Path, key: str, provider: Provider = DEFAULT_PROVIDER) -> Path:
     """Build a fresh workspace for ``key`` under ``repo`` and return its path.
 
     A ``repo`` that is not a jj repo is returned unchanged and used as the
@@ -209,7 +214,7 @@ def create(repo: Path, key: str) -> Path:
     # agent would start from wherever they last were.
     _jj(repo, "workspace", "add", "--name", key, "-r", TRUNK, str(path))
     copy_included(repo, path)
-    ensure_trusted(path)
+    ensure_trusted(path, provider)
     logger.info("created the %s workspace at %s", key, path)
     return path
 
@@ -390,44 +395,57 @@ def _copy(source: Path, destination: Path) -> None:
         raise WorkspaceError(f"could not copy {source} to {destination}: {exc}") from exc
 
 
-def ensure_trusted(path: Path) -> bool:
-    """Record ``path`` as a trusted workspace if it is not one already.
+def ensure_trusted(path: Path, provider: Provider = DEFAULT_PROVIDER) -> bool:
+    """Record ``path`` as a trusted directory for ``provider``, if it is not one.
 
-    Claude Code opens its ``Yes, I trust this folder`` dialog in a directory it
-    has not seen, and herdr reads that dialog as ``blocked``, so an untrusted
-    cwd does not slow a dispatch down — it fails it, with nobody there to
-    answer. A per-issue workspace is always a fresh directory, and its path is
-    not known before the issue is queued, so the operator cannot pre-accept it
-    by hand the way `README.md` describes for a fixed one.
+    Both harnesses open a *do you trust this folder* dialog in a directory
+    they have not seen, and answer nothing until it is dismissed, with nobody
+    there to do it. A per-issue workspace is always a fresh directory, and its
+    path is not known before the issue is queued, so the operator cannot
+    pre-accept it by hand the way `README.md` describes for a fixed one.
 
     Returns whether an entry was written. **Trust is checked before it is
     written, and a trusted path is left alone**, which is what keeps this
-    honest about :func:`foregent.mcp_servers.config_file`'s rule that every
-    running Claude Code session rewrites that file so foregent must not. On a
-    box whose workspace root is trusted, :func:`trusted` answers yes by
-    inheritance and nothing here writes at all; the write is the fallback for
-    a box where it is not, where the alternative is a dispatch that hangs on a
-    dialog rather than one that runs.
+    honest about :func:`foregent.mcp_servers.config_file`'s rule that a
+    harness rewrites its own config file so foregent must not.
+
+    The two differ in how far one entry reaches, and in how the dispatch
+    fails without one (§7.1). Claude Code walks up from the directory, so a
+    box whose workspace root is trusted writes nothing here at all. Codex
+    resolves trust to a git repository's root and otherwise to the exact
+    directory, walking up no further; a secondary jj workspace has no
+    ``.git``, so an entry on the workspace root does not cover the workspace
+    under it. Foregent writes the exact path there, and ``config.toml`` grows
+    an entry per issue.
     """
-    if trusted(path):
+    if trusted(path, provider):
         return False
-    _write_trust(path)
-    logger.info("recorded %s as a trusted workspace for Claude Code", path)
+    if provider is Provider.CODEX:
+        _write_codex_trust(path)
+    else:
+        _write_trust(path)
+    logger.info("recorded %s as a trusted directory for %s", path, provider)
     return True
 
 
-def trusted(path: Path) -> bool:
-    """Whether Claude Code would open its trust dialog in ``path``.
+def trusted(path: Path, provider: Provider = DEFAULT_PROVIDER) -> bool:
+    """Whether ``provider`` would open its trust dialog in ``path``.
 
-    Mirrors the harness's own rule: an exact entry for the directory, or one
-    on any ancestor of it. The ancestor walk is why trusting a workspace root
-    once covers every per-issue workspace under it.
+    Mirrors each harness's own rule. Claude Code's is an exact entry for the
+    directory or one on any ancestor of it, which is why trusting a workspace
+    root once covers every per-issue workspace under it. Codex's is the exact
+    directory: outside a git project it walks up no further, established by
+    trusting a parent and watching codex 0.153 ask about the child anyway.
 
-    Read off Claude Code 2.1.251 and not documented by it, so it is treated as
-    an optimization rather than a guarantee — :func:`ensure_trusted` writes the
-    exact entry whenever this says no, which is the answer a stricter harness
-    would give.
+    Read off Claude Code 2.1.251 and codex-cli 0.153 and documented by
+    neither, so both are treated as an optimization rather than a guarantee —
+    :func:`ensure_trusted` writes the exact entry whenever this says no, which
+    is the answer a stricter harness would give.
     """
+    if provider is Provider.CODEX:
+        entry = _codex_config().get("projects", {})
+        entry = entry.get(str(path)) if isinstance(entry, dict) else None
+        return isinstance(entry, dict) and entry.get("trust_level") == CODEX_TRUSTED
     projects = _config().get("projects")
     if not isinstance(projects, dict):
         return False
@@ -451,8 +469,19 @@ def _config() -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _codex_config() -> dict:
+    """Codex's config, or an empty one if it cannot be read. As :func:`_config`."""
+    try:
+        loaded = tomllib.loads(
+            mcp_servers.config_file(Provider.CODEX).read_text()
+        )
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return {}
+    return loaded
+
+
 def _write_trust(path: Path) -> None:
-    """Add ``path`` to the config's trusted projects, atomically.
+    """Add ``path`` to Claude Code's trusted projects, atomically.
 
     Staged and renamed so a session reading the file never sees a partial one.
     The read-modify-write can still lose whatever a session wrote in between;
@@ -468,6 +497,38 @@ def _write_trust(path: Path) -> None:
         **(entry if isinstance(entry, dict) else {}),
         "hasTrustDialogAccepted": True,
     }
+    _replace(config_file, json.dumps(loaded, indent=2), path)
+
+
+def _write_codex_trust(path: Path) -> None:
+    """Append ``path``'s trust to Codex's config, atomically.
+
+    Appended rather than re-serialized: Codex's config is TOML an operator
+    writes by hand and comments, and rewriting it from a parse would return it
+    stripped of both. A repeated section would be a parse error, which is why
+    the caller reaches this only for a path with no entry.
+    """
+    config_file = mcp_servers.config_file(Provider.CODEX)
+    try:
+        existing = config_file.read_text()
+    except OSError:
+        existing = ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    section = (
+        f'\n[projects."{_toml_string(str(path))}"]\n'
+        f'trust_level = "{CODEX_TRUSTED}"\n'
+    )
+    _replace(config_file, existing + section, path)
+
+
+def _toml_string(value: str) -> str:
+    """``value`` escaped for a TOML basic string."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _replace(config_file: Path, text: str, path: Path) -> None:
+    """Write ``text`` over ``config_file`` without ever exposing a partial one."""
     try:
         config_file.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.NamedTemporaryFile(
@@ -476,7 +537,7 @@ def _write_trust(path: Path) -> None:
             prefix=f".{config_file.name}.",
             delete=False,
         ) as staged:
-            json.dump(loaded, staged, indent=2)
+            staged.write(text)
             staged.flush()
             os.fsync(staged.fileno())
         os.replace(staged.name, config_file)

@@ -34,8 +34,8 @@ from foregent.agents import (
     AgentStatus,
     LaunchSpec,
 )
-from foregent.agents import herdr_claude
-from foregent.agents.herdr_claude import HerdrClaudeManager
+from foregent.agents import herdr_manager
+from foregent.agents.herdr_manager import HerdrManager
 
 _HERDR = shutil.which("herdr")
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -249,13 +249,13 @@ class AgentIntegrationTests(unittest.TestCase):
 @unittest.skipUnless(_HERDR, "herdr is not installed")
 @unittest.skipUnless(_AGENT_TESTS, "FOREGENT_HERDR_AGENT_TESTS is not set")
 class ManagerIntegrationTests(unittest.TestCase):
-    """HerdrClaudeManager against a real herdr and a real Claude Code."""
+    """HerdrManager against a real herdr and a real Claude Code."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.session = _session_name("manager")
         cls.process = _start_server(cls.session)
-        cls.manager = HerdrClaudeManager(herdr.HerdrClient(session=cls.session))
+        cls.manager = HerdrManager(herdr.HerdrClient(session=cls.session))
 
     @classmethod
     def tearDownClass(cls) -> None:

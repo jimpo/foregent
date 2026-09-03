@@ -44,12 +44,23 @@ its own effort on dispatch, event delivery and provisioning.
 The dependency is real: herdr is young and solo-maintained. A protocol
 mismatch stops the bridge at startup rather than surfacing mid-dispatch.
 
-### 1.3 Claude Code is a harness, not a foundation
+### 1.3 A harness is a choice, not a foundation
 
-Claude Code is the only harness today, and the design keeps it from being the
-only one possible. Everything harness-specific — the argv, the status
+Claude Code and Codex both run agents here, and neither is built into
+anything above the seam. Everything harness-specific — the argv, the status
 mapping, the socket calls — sits behind `AgentManager` (§7). Nothing above
 that seam knows what an agent is running.
+
+**Which harness runs an agent is a `Provider`**, carried on the launch spec
+and reported back on every live agent. It is not derived the way a project's
+mode is (§6.4): which harness works an issue is not a property of the
+repository, so there is nothing in it to read the answer off.
+
+**One manager serves every harness**, because herdr is what normalizes them.
+herdr owns the detection manifest that reads each agent's state off its
+screen, so a pane is prompted, read, waited on and closed by the same call
+whatever runs in it. Only starting one differs, in the agent kind and the
+argv, and both are looked up from the provider.
 
 ### 1.4 Linear and herdr hold the state
 
@@ -102,7 +113,7 @@ One machine per project. Three layers.
   │  • event ingest, authentication, matching       │
   │  • delivery queues + drainers, one per issue    │
   │  • dispatch and capacity                        │
-  │  • AgentManager (herdr + Claude Code)           │
+  │  • AgentManager (herdr + Claude Code / Codex)   │
   │  • foregent MCP server (mounted at /mcp)        │
   │  • skill and MCP provisioning                   │
   │  • per-issue jj workspaces                      │
@@ -114,7 +125,7 @@ One machine per project. Three layers.
   │   workspaces • panes • agent state • events     │
   └───────────────┬─────────────────────────────────┘
                   ▼
-        Claude Code sessions, one per issue
+      Claude Code or Codex sessions, one per issue
 ```
 
 Agents talk to the world through the Linear and GitHub MCP servers, and to
@@ -131,10 +142,13 @@ the bridge through the foregent MCP server.
 | `linear.py` | Linear GraphQL client: claim an issue, close it, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
 | `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server; the bridge's own reach is one GET, for the one delivery that names no branch. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
-| `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
-| `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
-| `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for Claude Code. |
-| `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's user-level Claude Code config. |
+| `agents/base.py` | The `AgentManager` protocol and its types, `Provider` among them. Harness-agnostic. |
+| `agents/herdr_manager.py` | The one implementation: drives `workspace.create` → `agent.start` → `agent.prompt` and translates herdr's events, for every harness. |
+| `agents/harness.py` | Which herdr agent kind a provider names, and which module renders its argv. |
+| `agents/claude.py` | Claude Code's own half: the agent kind, the flags a `LaunchSpec` renders to, and the brief. |
+| `agents/codex.py` | The same for Codex. |
+| `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for the harness that will run there. |
+| `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's config, once per harness. |
 | `skills/` | The packaged `foregent-worker` skill and its installer. |
 | `cli.py` | `status`, `queue`, `setup`, `serve`. A thin HTTP client of the bridge, except `setup`. |
 | `config.py` | Environment-overridable settings. |
@@ -143,25 +157,35 @@ the bridge through the foregent MCP server.
 
 ### 4.1 Dispatch
 
-`foregent queue JIM-42 --directory <path>` records the issue as Queued, then:
+`foregent queue JIM-42 --directory <path> [--provider <harness>]` records the
+issue as Queued against that repo and that harness, then:
 
 1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
    time in bootstrap mode, up to `FOREGENT_MAX_AGENTS` in pull request mode.
    Every in-flight issue holds a slot; anything else waits.
-2. **Skills.** Every packaged skill is written first, over whatever is there.
-   Claude Code picks up live edits to a skill directory, but only one that
-   existed when the session started, so this must finish before launch.
+2. **Skills.** Every packaged skill is written first, over whatever is there,
+   into the skill directory of the harness this issue names. Claude Code picks
+   up live edits to a skill directory, but only one that existed when the
+   session started, so this must finish before launch.
 3. **Claim.** Assignee and In Progress are set in Linear in one step. Nothing
    is dispatched without a durable ownership record.
 4. **Workspace.** A fresh jj workspace is built from the queued repo, named
    for the issue key, and the repo's `.worktreeinclude` files are copied into
    it (§6.5). Before the launch, because it is the agent's cwd.
-5. **Launch.** A herdr workspace opens at that directory and Claude Code
-   starts in it, with a conversation id foregent generates rather than
-   scrapes.
-6. **Brief.** The agent is prompted with `/foregent-worker JIM-42 bootstrap`
-   or `… pull-request`, so the lifecycle has one definition — the skill — and
-   the mode is told to the agent rather than looked up by it (§6.4).
+5. **Launch.** A herdr workspace opens at that directory and the named
+   harness starts in it, with a conversation id foregent generates rather than
+   scrapes — for Claude Code, which takes one; Codex records its own, which
+   herdr reports back (§6.1).
+6. **Brief.** The agent is prompted with the skill, the issue and the mode —
+   `/foregent-worker JIM-42 bootstrap` for Claude Code, a sentence naming the
+   same three for Codex (§6.2) — so the lifecycle has one definition, the
+   skill, and the mode is told to the agent rather than looked up by it
+   (§6.4).
+
+**The harness is the operator's answer and the mode is the repository's.**
+Which harness works an issue is not a property of the repo, so there is
+nothing in it to derive one from; how work lands there is, so `--provider` is
+a flag and the mode is not (§1.3, §6.4).
 
 One call launches until the queue is empty or the next issue does not fit, so
 a completion can start more than one agent where the queue has been waiting on
@@ -447,10 +471,17 @@ in a workspace labeled with the uppercase key. The name is the binding: it is
 unique among live agents and the issue key parses back out of it, so nothing
 about a running agent needs persisting to find it again.
 
+The harness is not in the name and does not need to be: herdr reports the
+agent kind it detected, and `Provider`'s values are those kinds.
+
 ### 5.4 What a restart recovers
 
 One `agent.list` against herdr rebuilds the issue-to-agent map from the
-labels, finding every live agent including parked ones.
+labels, finding every live agent including parked ones. **Which harness each
+one runs comes back with it**, from the agent kind in that same listing; an
+agent of a kind foregent does not know reads as the default, which costs
+nothing, because the provider decides a brief, a skill directory and a
+workspace's trust and this issue was dispatched already.
 
 **Whether an agent was parked comes back with it**, from the status in that
 same listing rather than from the label, which does not record it: an agent
@@ -487,26 +518,59 @@ fresh dispatch.
 
 ### 6.1 The launch spec
 
-`LaunchSpec` is the structure foregent owns; the manager renders it to
-`claude` flags. It carries the label, cwd, environment, model and effort, an
-appended system prompt, tool allow and deny lists, MCP servers, a
-conversation id, and whether to resume it.
+`LaunchSpec` is the structure foregent owns; the harness named by its
+`provider` renders it to arguments. It carries the label, cwd, environment,
+model and effort, an appended system prompt, tool allow and deny lists, MCP
+servers, a conversation id, and whether to resume it.
 
-`--permission-mode bypassPermissions` is not a spec field. It is a property
-of how foregent runs agents at all (§1.1), so the manager always sets it.
+Full permissions are not a spec field — `--permission-mode bypassPermissions`
+for Claude Code, `--dangerously-bypass-approvals-and-sandbox` for Codex. It is
+a property of how foregent runs agents at all (§1.1), so the harness always
+sets it.
+
+**An MCP server is declared in foregent's own spelling** — a URL and the
+*name* of the environment variable holding its token — and each harness
+renders that: a header holding `${VARIABLE}` for Claude Code, a
+`bearer_token_env_var` for Codex. Neither writes a credential (§6.3).
+
+**Three fields Codex cannot express are refused rather than dropped**: an
+appended system prompt, tool allow and deny lists, and restricting an agent to
+the servers foregent declares — Codex merges `-c` overrides onto the machine's
+config and has no argument meaning *only these*. Nothing sets any of them, and
+an agent launched quietly without a restriction its caller asked for is the
+failure nobody notices.
+
+**A fresh Codex conversation cannot be named in advance.** Codex has no
+counterpart of `--session-id`; it records a session of its own and `resume`
+takes that id afterwards, so the id foregent generates is unused there and the
+one worth keeping is read back off herdr once the agent has started. The
+asymmetry costs nothing today, because resuming a conversation is unbuilt
+(§5.4).
 
 ### 6.2 The workflow lives in a skill
 
 `foregent-worker` tells the agent its lifecycle: reading its assignment, the
 mode rules, when to report blocked, when to call `complete_task`, and the
 rebase requirement. The brief is one line, so the lifecycle has one
-definition. Its second word is the mode (§6.4), which is the one thing about
-the lifecycle the skill cannot work out for itself.
+definition. It names the issue and the mode (§6.4), which are the two things
+about the lifecycle the skill cannot work out for itself.
+
+**How a skill is named is the harness's own**, so the brief's wording comes
+from the harness rather than from the bridge: a `/foregent-worker JIM-42
+pull-request` slash command in Claude Code, and in Codex a sentence naming the
+skill, since Codex has no slash form for one and instead lists every skill it
+found by name and description in the model's own prompt.
+
+**Both harnesses read the same file.** A skill is `<name>/SKILL.md` with
+name-and-description front matter, in a user-level directory that applies to
+every project: `~/.claude/skills` and `$CODEX_HOME/skills`. So foregent ships
+one skill and installs it twice, rather than one per harness.
 
 Skills ship inside the installed package, so they travel with a
-`uv tool install`. Two paths put them on disk, `foregent setup` and the server
-before a launch, and both call the one installer in `skills/__init__.py`: what
-an agent is briefed from is what foregent ships. Dispatch overwrites because
+`uv tool install`. Two paths put them on disk, `foregent setup` for every
+harness and the server for the one an issue is about to be worked on, and both
+call the one installer in `skills/__init__.py`: what an agent is briefed from
+is what foregent ships. Dispatch overwrites because
 the drift is otherwise silent in both directions — a skill left over from an
 older foregent can name a file that no longer exists, and neither the agent
 nor the log has any way to say so (JIM-143). The cost is a hand-edited skill
@@ -517,21 +581,33 @@ loads a half-written `SKILL.md`.
 ### 6.3 MCP servers are split by lifetime
 
 **Foregent's own server is per-run.** Its URL is this bridge's, so the launch
-spec declares it with `--mcp-config`.
+spec declares it — `--mcp-config` for Claude Code, `-c mcp_servers.…` for
+Codex, which merges over the machine's own table.
 
 **Linear and GitHub are per-machine.** `foregent setup` writes them at Claude
-Code's *user* scope — the only scope that applies in a fresh workspace — and
-every agent inherits them. They go in through `claude mcp add-json -s user`
-rather than by editing the config file, because every running session
-rewrites that file.
+Code's *user* scope — the only scope that applies in a fresh workspace, and
+the only kind Codex has — and every agent inherits them. They go in through
+`claude mcp add-json -s user` and `codex mcp add --url` rather than by editing
+either config file, because a harness rewrites its own.
 
-`--strict-mcp-config` stays off, so one configuration serves agents and the
-operator's own sessions alike. The machine is already the isolation boundary
-(§1.1).
+Nothing restricts an agent to what foregent declares, so one configuration
+serves agents and the operator's own sessions alike. The machine is already
+the isolation boundary (§1.1). It is also not expressible in Codex, whose
+`-c` overrides merge rather than replace (§6.1).
 
-Credentials never reach disk: the stored header is the literal
-`${LINEAR_API_KEY}` or `${GITHUB_TOKEN}`, expanded per session from the herdr
-server's environment.
+**A server is declared once, in foregent's own spelling** — a URL and the
+*name* of the variable holding its token — and each harness renders it. That
+is what keeps one list of servers from becoming two that can disagree.
+
+Credentials never reach disk. Claude Code stores the literal
+`${LINEAR_API_KEY}` or `${GITHUB_TOKEN}` in a header; Codex stores the
+variable's name as `bearer_token_env_var`. Both expand it per session from
+the herdr server's environment.
+
+**Each harness is provisioned separately**, and every one on the box is,
+whether or not it will be used: the files are small, and a harness provisioned
+only when it is first needed is one whose first dispatch is where the operator
+finds out it was not.
 
 ### 6.4 Project modes
 
@@ -723,6 +799,23 @@ and none is obvious from either tool's documentation.
   it as an optimization rather than a guarantee — it writes the exact entry
   whenever its own copy of the rule says untrusted, which is the answer a
   stricter harness would give.
+- **Codex's trust follows git, and fails a dispatch later.** Established by
+  driving codex 0.153 under herdr in directories of each shape:
+  - **It resolves to a git repository's root** where the cwd is in one, and to
+    the exact directory otherwise, walking up no further: a trusted parent
+    does not cover its non-git child. A *git worktree* resolves to the main
+    repository's root, so one entry there would cover every worktree of it —
+    but a secondary jj workspace has no `.git` at all, so it is its own
+    project and gets its own entry.
+  - **`--dangerously-bypass-approvals-and-sandbox` does not skip the dialog.**
+    It governs what a running agent may do, not whether the directory is
+    opened at all.
+  - **herdr reads the dialog as `idle` and `interactive_ready`**, not
+    `blocked` as it does Claude Code's. So an untrusted Codex cwd does not
+    fail the launch; it fails the brief, which the prompt's own delivery check
+    catches as `agent_prompt_stalled` and reports with the screen quoted. A
+    later failure and a noisier one, which is why foregent writes the entry
+    rather than relying on the operator.
 - **Detection is screen-scraping underneath.** herdr's detection manifest
   updates on its own schedule, independent of the protocol version, so the
   startup protocol check says nothing about it.
@@ -762,16 +855,29 @@ installed.
   server started from inside another Claude Code session leaks `CLAUDECODE=1`
   into its agents, which silently disables transcript saving and breaks
   resume. The systemd unit sets an explicit environment.
-- **Pre-accepted workspace trust.** A fresh directory makes Claude Code open
-  its trust dialog before accepting input, and herdr's detection reads that
-  dialog as `blocked` — so the agent never reaches idle and the launch fails.
-  Every workspace is a fresh directory, so trust the workspace *root* once and
-  every workspace under it inherits it (§7.1). Foregent writes the entry
-  itself for any workspace it finds untrusted, so this is a should, not a
+- **Pre-accepted workspace trust.** A fresh directory makes a harness open its
+  trust dialog before accepting input. For Claude Code, herdr's detection reads
+  that dialog as `blocked` — so the agent never reaches idle and the launch
+  fails. Every workspace is a fresh directory, so trust the workspace *root*
+  once and every workspace under it inherits it (§7.1). Foregent writes the
+  entry itself for any workspace it finds untrusted, so this is a should, not a
   must; doing it by hand keeps foregent out of `~/.claude.json`, which every
   running Claude Code session rewrites.
-- **The herdr Claude integration** (`herdr integration install claude`), so
-  session identity is reported back to herdr.
+
+  **Codex inherits nothing and there is nothing to pre-accept**, because it
+  resolves trust to a git repository's root and a secondary jj workspace has no
+  `.git`. Foregent writes the exact workspace path, appended to
+  `$CODEX_HOME/config.toml` so an operator's own comments and layout survive,
+  and that file grows an entry per issue. Nor does the bypass flag skip the
+  dialog, and herdr reads it as an idle agent rather than a blocked one, so
+  without the entry the dispatch fails at the brief instead of at the launch
+  (§7.1).
+- **The herdr integration for each harness** (`herdr integration install
+  claude`, `herdr integration install codex`), so session identity is reported
+  back to herdr.
+- **A logged-in harness.** `claude` and `codex login` each hold their own
+  credentials, and an unauthenticated one opens a sign-in screen that herdr
+  reads exactly as it reads a trust dialog.
 - **`LINEAR_API_KEY` and `GITHUB_TOKEN` in the herdr server's environment.**
   The MCP configuration stores the variable name, not the token, so a server
   missing the variable looks installed and fails to authenticate once an
@@ -793,3 +899,5 @@ installed.
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
 | `GITHUB_TOKEN` | bridge, agents | GitHub MCP authentication, and the bridge's lookup of a pull request's head branch (§4.2). |
 | `GITHUB_WEBHOOK_SECRET` | bridge | GitHub webhook signature verification. |
+| `CLAUDE_CONFIG_DIR` | bridge | Claude Code's own: where its skills and trusted projects are read and written. Default `~/.claude`. |
+| `CODEX_HOME` | bridge | Codex's own: the same, plus its MCP servers. Default `~/.codex`. |

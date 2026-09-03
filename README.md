@@ -3,7 +3,8 @@
 An autonomous multi-agent software development system: agents work Linear
 issues and GitHub PRs unattended on a dedicated machine per project, built on
 [herdr](https://herdr.dev/) as the terminal and agent-state substrate, with
-[Claude Code](https://claude.com/claude-code) as the agent harness.
+[Claude Code](https://claude.com/claude-code) and
+[Codex](https://developers.openai.com/codex/cli) as the agent harnesses.
 
 Foregent is not itself a harness. It provides solutions for:
 
@@ -17,8 +18,10 @@ lives in the Linear project *Foregent*.
 
 `foregent serve` runs a small FastAPI service — the *bridge*. You give it a
 Linear issue key and a directory; it claims the issue in Linear, opens a herdr
-workspace on that directory, starts a Claude Code agent in it, and briefs the
-agent with the `foregent-worker` skill. The agent owns the issue end to end.
+workspace on that directory, starts an agent in it, and briefs it with the
+`foregent-worker` skill. The agent owns the issue end to end. Which harness it
+runs is yours to name — `--provider claude` or `--provider codex`, Claude Code
+by default — and nothing else about the dispatch changes with it.
 
 Linear pushes what happens next. A comment or a field change on an agent's own
 issue arrives at `POST /webhooks/linear`, is authenticated against the
@@ -41,8 +44,11 @@ Install these on the machine that runs the agents:
   `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - **[herdr](https://herdr.dev/)** — terminal and agent-state server.
   `curl -fsSL https://herdr.dev/install.sh | sh`
-- **[Claude Code](https://claude.com/claude-code)** — the agent harness. The
-  `claude` binary must be on `PATH`; `foregent setup` calls it.
+- **An agent harness**, one or both. Each binary must be on `PATH`, because
+  `foregent setup` calls it, and each must be signed in — an unauthenticated
+  harness opens a login screen that herdr reads as a stuck agent.
+  - **[Claude Code](https://claude.com/claude-code)** — the default.
+  - **[Codex](https://developers.openai.com/codex/cli)** — `codex login`.
 - **[Jujutsu](https://jj-vcs.github.io/jj/) (`jj`)** — the version control the
   worker skill tells agents to use. Colocated with git.
 - **[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)**
@@ -86,41 +92,49 @@ These belong in the environment of the **herdr server**, because every pane
 herdr opens inherits it. A herdr server started before the variables were
 exported gives its agents nothing.
 
-### 2. Provision Claude Code
+### 2. Provision the harnesses
 
 ```sh
 foregent setup
 ```
 
-This copies every skill foregent ships into `~/.claude/skills/` and adds the
-Linear and GitHub MCP servers to the machine's user-level Claude Code config,
-where agents and your own sessions both read them. The config stores
-`${LINEAR_API_KEY}`, never the token itself.
+For every harness foregent can run agents on, this copies the skills foregent
+ships into that harness's own skill directory — `~/.claude/skills/` and
+`~/.codex/skills/`, which read the same `SKILL.md` — and adds the Linear and
+GitHub MCP servers to its machine-level config, where agents and your own
+sessions both read them. Both configs store the *name* of the variable holding
+each token, never the token itself.
+
+Every harness is provisioned whether or not you will queue it: the files are
+small, and one provisioned first-use-first is one whose first dispatch is
+where you find out it was not.
 
 Run it once per machine, and again after every foregent upgrade. The bridge
 also rewrites the packaged skills before every launch, so an agent is always
-briefed from the version foregent ships — a hand-edited skill in
-`~/.claude/skills/` does not survive a dispatch.
+briefed from the version foregent ships — a hand-edited skill in a harness's
+skill directory does not survive a dispatch.
 
 `setup` warns when a credential is unset. Fix that before dispatching: an
 unauthenticated agent discovers the problem only once it is working an issue.
 
-### 3. Install the herdr Claude integration
+### 3. Install the herdr integrations
 
 ```sh
 herdr integration install claude
+herdr integration install codex
 ```
 
-This lets Claude Code report its session identity back to herdr.
+This lets each harness report its session identity back to herdr.
 
 ### 4. Pre-accept the workspace trust dialog
 
-Claude Code asks `Yes, I trust this folder` in a directory it has not seen, and
-answers nothing until it is told. herdr reads that dialog as `blocked`, so
-**dispatch into an untrusted directory fails**.
+Both harnesses ask whether they may work in a directory they have not seen, and
+answer nothing until told. herdr reads that dialog as `blocked`, so **dispatch
+into an untrusted directory fails**.
 
-Every agent runs in a fresh per-issue workspace, so trust the directory those
-are built under — once, and every workspace under it is covered:
+Every agent runs in a fresh per-issue workspace, so for Claude Code trust the
+directory those are built under — once, and every workspace under it is
+covered, in `~/.claude.json`:
 
 ```json
 { "projects": { "/home/you/.foregent/workspaces": { "hasTrustDialogAccepted": true } } }
@@ -130,6 +144,19 @@ Foregent falls back to writing the entry for each workspace it creates if it
 finds one untrusted, so a box that skips this still dispatches. Doing it here
 is better: `~/.claude.json` is rewritten by every running Claude Code session,
 and the entry above means foregent never has to touch it.
+
+Codex inherits nothing from a parent directory — it resolves trust to a git
+repository's root, and a jj workspace has no `.git` — and its
+`--dangerously-bypass-approvals-and-sandbox` does not skip the dialog either.
+So foregent appends an entry per workspace to `~/.codex/config.toml`:
+
+```toml
+[projects."/home/you/.foregent/workspaces/JIM-42"]
+trust_level = "trusted"
+```
+
+There is nothing to pre-accept for Codex, and that file grows one entry per
+issue.
 
 ## Webhook ingress (Cloudflare tunnel)
 
@@ -226,6 +253,7 @@ server or credential the machine is missing.
 
 ```sh
 foregent queue JIM-42 -d ~/src/myrepo   # queue an issue against a repo
+foregent queue JIM-42 -d ~/src/myrepo --provider codex   # …on Codex instead
 foregent status                         # what is tracked, and its state
 ```
 
@@ -318,6 +346,7 @@ state.
 | `FOREGENT_LOG_LEVEL` | What level `serve` logs at (default `info`), for uvicorn's loggers and foregent's own. `--log-level` overrides it. |
 | `FOREGENT_MAX_AGENTS` | How many agents run at once in Pull Request mode (default 3). Bootstrap mode is always one. |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
+| `CODEX_HOME` | Relocates `~/.codex`, the same. |
 
 ## Development
 

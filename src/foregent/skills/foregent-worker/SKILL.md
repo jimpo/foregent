@@ -13,8 +13,8 @@ may attach to observe, but never to answer questions.
 Your issue key is in the message that started you (e.g. `JIM-42`). Every
 foregent tool takes it as an argument.
 
-The word after it is the **mode** the project lands work in — `bootstrap` or
-`pull-request` — which foregent reads off the repo's git remotes and tells
+That message also names the **mode** the project lands work in — `bootstrap`
+or `pull-request` — which foregent reads off the repo's git remotes and tells
 you, so you never have to work it out. See *Landing the change*.
 
 ## The two tools that matter

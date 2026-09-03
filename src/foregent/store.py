@@ -11,6 +11,7 @@ import threading
 from collections.abc import Iterator
 from dataclasses import replace
 
+from foregent.agents import DEFAULT_PROVIDER, Provider
 from foregent.models import Issue, IssueStatus
 
 # An issue with a live agent working it, whether or not that agent is busy.
@@ -49,20 +50,30 @@ class IssueStore:
         with self._lock:
             return self._issues.get(key)
 
-    def queue(self, key: str, repo: str) -> Issue:
+    def queue(
+        self,
+        key: str,
+        repo: str,
+        provider: Provider = DEFAULT_PROVIDER,
+    ) -> Issue:
         """Mark issue ``key`` Queued against ``repo``, at the back of the queue.
 
         Re-inserting the key makes dict insertion order the queue (FIFO)
         order, so :meth:`next_queued` needs no separate queue structure.
         Unknown keys are upserted, as in :meth:`complete`.
 
-        Only the repo is known here. The agent's own directory is the
-        workspace dispatch builds from it, so it is set there.
+        Only the repo and the harness are known here. The agent's own
+        directory is the workspace dispatch builds from them, so it is set
+        there.
         """
         with self._lock:
             existing = self._issues.pop(key, None) or Issue(key=key, title="")
             issue = replace(
-                existing, status=IssueStatus.QUEUED, repo=repo, directory=""
+                existing,
+                status=IssueStatus.QUEUED,
+                repo=repo,
+                directory="",
+                provider=provider,
             )
             self._issues[key] = issue
             return issue

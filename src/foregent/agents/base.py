@@ -66,6 +66,27 @@ def issue_key_from_label(label: str) -> str | None:
     return key.upper() or None
 
 
+class Provider(StrEnum):
+    """Which agent harness runs an agent.
+
+    Declared by the operator at ``foregent queue`` rather than derived the way
+    a project's mode is (:func:`foregent.workspaces.mode_for`): which harness
+    works an issue is not a property of the repository, so there is nothing in
+    it to read the answer off.
+
+    The value is also herdr's own name for the agent kind, which is what lets a
+    restart recover an agent's provider from the harness instead of from
+    anything foregent persisted (:meth:`AgentManager.list_agents`).
+    """
+
+    CLAUDE = "claude"
+    CODEX = "codex"
+
+
+DEFAULT_PROVIDER = Provider.CLAUDE
+"""The harness an issue is worked on when the operator names none."""
+
+
 class AgentStatus(StrEnum):
     """What an agent is doing, normalized across harnesses."""
 
@@ -77,6 +98,24 @@ class AgentStatus(StrEnum):
     # The process is gone: no pane, no session, nothing to prompt. Distinct
     # from UNKNOWN, which means "running, state not readable".
     GONE = "gone"
+
+
+@dataclass(frozen=True, slots=True)
+class McpServer:
+    """One MCP server, in foregent's own spelling rather than a harness's.
+
+    Every server foregent declares is remote HTTP with at most a bearer token,
+    which is the whole of what the harnesses have in common; each renders this
+    into its own shape.
+
+    **The credential is named, never carried.** ``token_env`` is the
+    environment variable the harness expands for itself at session start, so
+    the token lives only in the herdr server's environment and nothing written
+    to disk holds it.
+    """
+
+    url: str
+    token_env: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +131,9 @@ class LaunchSpec:
     # per issue.
     label: str
     cwd: str
+    # Which harness to run. Everything below the seam is the same call
+    # whichever it is; this decides the agent kind and the argv alone.
+    provider: Provider = DEFAULT_PROVIDER
     env: Mapping[str, str] = field(default_factory=dict)
     model: str | None = None
     effort: str | None = None
@@ -99,7 +141,7 @@ class LaunchSpec:
     system_prompt: str = ""
     tools_allow: tuple[str, ...] = ()
     tools_deny: tuple[str, ...] = ()
-    mcp_servers: Mapping[str, Mapping] = field(default_factory=dict)
+    mcp_servers: Mapping[str, McpServer] = field(default_factory=dict)
     # Whether the agent may use only the MCP servers declared above, ignoring
     # whatever the machine is configured with. Off by default, and separate
     # from `mcp_servers` on purpose: foregent can add its own tools without
@@ -131,6 +173,10 @@ class AgentRecord:
     ref: AgentRef
     status: AgentStatus
     cwd: str = ""
+    # The harness the agent is running, or None where it reports one foregent
+    # does not know. None rather than a default, so a caller that has to guess
+    # does so where the cost of guessing is written down.
+    provider: Provider | None = None
 
 
 class AgentEventKind(StrEnum):

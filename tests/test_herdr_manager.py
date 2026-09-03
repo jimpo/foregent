@@ -1,13 +1,13 @@
-"""Unit tests for the herdr + Claude Code manager (JIM-85).
+"""Unit tests for the herdr agent manager (JIM-85).
 
 Driven through a fake herdr client: these pin the socket calls the manager
-makes and the flags it renders, without needing a server. The live behavior
-is covered by ``ManagerIntegrationTests`` in ``tests.test_herdr_integration``.
+makes, without needing a server. The flags each harness renders are pinned by
+``tests.test_harness``; the live behavior is covered by
+``ManagerIntegrationTests`` in ``tests.test_herdr_integration``.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import unittest
 from itertools import islice
@@ -23,7 +23,7 @@ from foregent.agents import (
     AgentStatus,
     LaunchSpec,
 )
-from foregent.agents.herdr_claude import HerdrClaudeManager, render_args
+from foregent.agents.herdr_manager import HerdrManager
 
 WORKSPACE = {
     "workspace": {"workspace_id": "w1", "label": "JIM-85"},
@@ -117,8 +117,8 @@ class FakeClient:
         return self.methods().count(method)
 
 
-def manager(client: FakeClient) -> HerdrClaudeManager:
-    return HerdrClaudeManager(client)  # ty: ignore[invalid-argument-type]
+def manager(client: FakeClient) -> HerdrManager:
+    return HerdrManager(client)  # ty: ignore[invalid-argument-type]
 
 
 class SessionTests(unittest.TestCase):
@@ -128,7 +128,7 @@ class SessionTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"HERDR_SOCKET_PATH": "/tmp/other.sock"}, clear=True
         ):
-            client = HerdrClaudeManager(session="foregent").client
+            client = HerdrManager(session="foregent").client
         self.assertEqual(
             client.path,
             str(herdr.CONFIG_DIR / "sessions" / "foregent" / "herdr.sock"),
@@ -140,13 +140,13 @@ class SessionTests(unittest.TestCase):
         with mock.patch.dict(
             os.environ, {"HERDR_SOCKET_PATH": "/tmp/inherited.sock"}, clear=True
         ):
-            runner = HerdrClaudeManager()
+            runner = HerdrManager()
             self.assertEqual(runner.client.path, "/tmp/inherited.sock")
             self.assertIn("this process runs in", runner.describe())
 
     def test_nothing_at_all_falls_back_to_the_default_session(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
-            runner = HerdrClaudeManager()
+            runner = HerdrManager()
             self.assertEqual(runner.client.path, str(herdr.CONFIG_DIR / "herdr.sock"))
             self.assertIn("default", runner.describe())
 
@@ -154,61 +154,6 @@ class SessionTests(unittest.TestCase):
         # The client resolved the socket, so it is the only thing that can say
         # which session that was.
         self.assertEqual(manager(FakeClient()).describe(), "a fake herdr")
-
-
-class RenderArgsTests(unittest.TestCase):
-    def test_a_fresh_agent_names_its_conversation(self) -> None:
-        args = render_args(spec(conversation_id="abc-123"))
-        self.assertIn("--session-id", args)
-        self.assertEqual(args[args.index("--session-id") + 1], "abc-123")
-        self.assertNotIn("--resume", args)
-
-    def test_a_resumed_agent_continues_it_instead(self) -> None:
-        # --session-id and --resume contradict each other: one names a new
-        # conversation, the other reopens a recorded one.
-        args = render_args(spec(conversation_id="abc-123", resume=True))
-        self.assertIn("--resume", args)
-        self.assertNotIn("--session-id", args)
-
-    def test_permissions_are_always_bypassed(self) -> None:
-        # Full permissions on a dedicated box: not a per-agent choice, so it
-        # cannot be omitted by a caller.
-        args = render_args(spec())
-        self.assertEqual(args[args.index("--permission-mode") + 1], "bypassPermissions")
-
-    def test_mcp_servers_are_declared(self) -> None:
-        args = render_args(spec(mcp_servers={"foregent": {"type": "http"}}))
-        declared = json.loads(args[args.index("--mcp-config") + 1])
-        self.assertEqual(declared, {"mcpServers": {"foregent": {"type": "http"}}})
-
-    def test_declaring_servers_does_not_exclude_the_machines_own(self) -> None:
-        # The two flags are independent: foregent can add its own tools
-        # without also having to supply everything else the agent needs.
-        args = render_args(spec(mcp_servers={"foregent": {"type": "http"}}))
-        self.assertNotIn("--strict-mcp-config", args)
-
-    def test_strict_mode_is_asked_for_explicitly(self) -> None:
-        args = render_args(
-            spec(mcp_servers={"foregent": {"type": "http"}}, strict_mcp=True)
-        )
-        self.assertIn("--strict-mcp-config", args)
-
-    def test_no_mcp_servers_means_no_mcp_config(self) -> None:
-        args = render_args(spec())
-        self.assertNotIn("--mcp-config", args)
-        self.assertNotIn("--strict-mcp-config", args)
-
-    def test_optional_fields_are_omitted_when_unset(self) -> None:
-        args = render_args(spec())
-        for flag in ("--model", "--effort", "--append-system-prompt", "--allowedTools"):
-            self.assertNotIn(flag, args)
-
-    def test_label_becomes_the_display_name(self) -> None:
-        args = render_args(spec())
-        self.assertEqual(args[args.index("-n") + 1], "fg-jim-85")
-
-    def test_the_binary_is_left_to_herdr(self) -> None:
-        self.assertNotIn("claude", render_args(spec()))
 
 
 class LaunchTests(unittest.TestCase):
@@ -276,7 +221,7 @@ class SendTests(unittest.TestCase):
 
     def setUp(self) -> None:
         for name, value in [("RETRY_SECONDS", 0), ("POLL_SECONDS", 0)]:
-            patcher = mock.patch(f"foregent.agents.herdr_claude.{name}", value)
+            patcher = mock.patch(f"foregent.agents.herdr_manager.{name}", value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -554,7 +499,7 @@ class EventTests(unittest.TestCase):
     """Translating herdr's pane events into agent events."""
 
     def setUp(self) -> None:
-        patcher = mock.patch("foregent.agents.herdr_claude.RECONNECT_SECONDS", 0)
+        patcher = mock.patch("foregent.agents.herdr_manager.RECONNECT_SECONDS", 0)
         patcher.start()
         self.addCleanup(patcher.stop)
 

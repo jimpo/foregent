@@ -21,7 +21,9 @@ from pathlib import Path
 from unittest import mock
 
 import foregent
-from foregent import cli, server, skills
+from foregent import cli, mcp_servers, server, skills
+from foregent.agents import Provider
+from foregent.agents import Provider
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -176,6 +178,30 @@ class InstallTests(unittest.TestCase):
         self.assertTrue(self.worker().is_file())
 
 
+class CodexSkillsRootTests(unittest.TestCase):
+    """Codex reads the same SKILL.md, from a directory of its own."""
+
+    def test_codex_home_relocates_the_skills(self) -> None:
+        with mock.patch.dict(os.environ, {"CODEX_HOME": "/opt/codex"}):
+            self.assertEqual(
+                skills.skills_root(Provider.CODEX), Path("/opt/codex/skills")
+            )
+
+    def test_the_default_is_beside_the_claude_one(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CODEX_HOME", None)
+            self.assertEqual(
+                skills.skills_root(Provider.CODEX),
+                Path.home() / ".codex" / "skills",
+            )
+
+    def test_a_skill_installs_into_it(self) -> None:
+        home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            skills.install(provider=Provider.CODEX)
+        self.assertTrue((home / "skills" / "foregent-worker" / "SKILL.md").is_file())
+
+
 class DispatchRefreshesSkillsTests(unittest.TestCase):
     """JIM-143: an agent is briefed from the copy on disk, so dispatch writes it.
 
@@ -193,7 +219,7 @@ class DispatchRefreshesSkillsTests(unittest.TestCase):
         skills.install()
         self.worker.write_text("read docs/PLAN.md\n")
         with self.assertLogs("foregent.server", level="INFO") as logs:
-            server.ensure_skills()
+            server.ensure_skills(Provider.CLAUDE)
         packaged = (skills.PACKAGED / "foregent-worker" / "SKILL.md").read_text()
         self.assertEqual(self.worker.read_text(), packaged)
         self.assertIn("updated the foregent-worker skill", "\n".join(logs.output))
@@ -202,26 +228,64 @@ class DispatchRefreshesSkillsTests(unittest.TestCase):
         # Every dispatch runs this; a line per skill per launch is noise.
         skills.install()
         with mock.patch.object(server.logger, "info") as info:
-            server.ensure_skills()
+            server.ensure_skills(Provider.CLAUDE)
         info.assert_not_called()
 
     def test_a_machine_that_cannot_be_written_to_still_dispatches(self) -> None:
         with mock.patch.object(skills, "install", side_effect=OSError("read-only")):
             with self.assertLogs("foregent.server", level="WARNING") as logs:
-                server.ensure_skills()
+                server.ensure_skills(Provider.CLAUDE)
         self.assertIn("could not install", "\n".join(logs.output))
 
 
 class SetupCommandTests(unittest.TestCase):
-    def test_setup_installs_and_reports(self) -> None:
-        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}))
+    def setUp(self) -> None:
+        # Every harness home is redirected, and every `mcp add` is a stub:
+        # `setup` provisions the whole machine, so a test that leaves either
+        # real edits the developer's own box.
+        self.claude = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.codex = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(
+            mock.patch.dict(
+                os.environ,
+                {"CLAUDE_CONFIG_DIR": str(self.claude), "CODEX_HOME": str(self.codex)},
+            )
+        )
+        self.mcp_add = self.enterContext(
+            mock.patch.object(
+                mcp_servers.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            )
+        )
+
+    def run_setup(self) -> str:
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli.main(["setup"]), 0)
-        self.assertIn("foregent-worker", out.getvalue())
-        self.assertIn("installed", out.getvalue())
-        self.assertTrue((config / "skills" / "foregent-worker" / "SKILL.md").is_file())
+        return out.getvalue()
+
+    def test_setup_installs_and_reports(self) -> None:
+        output = self.run_setup()
+        self.assertIn("foregent-worker", output)
+        self.assertIn("installed", output)
+        self.assertTrue(
+            (self.claude / "skills" / "foregent-worker" / "SKILL.md").is_file()
+        )
+
+    def test_setup_provisions_every_harness(self) -> None:
+        # A harness provisioned only when it is first used is one whose first
+        # dispatch is where the operator finds out it was not.
+        self.run_setup()
+        for provider in Provider:
+            with self.subTest(provider=provider):
+                self.assertTrue(
+                    (
+                        skills.skills_root(provider) / "foregent-worker" / "SKILL.md"
+                    ).is_file()
+                )
+        added = {call.args[0][0] for call in self.mcp_add.call_args_list}
+        self.assertEqual(added, {"claude", "codex"})
 
 
 if __name__ == "__main__":

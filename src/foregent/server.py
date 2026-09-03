@@ -43,6 +43,7 @@ from starlette.concurrency import run_in_threadpool
 
 from foregent import config, github, herdr, linear, mcp_servers, skills, workspaces
 from foregent.agents import (
+    DEFAULT_PROVIDER,
     AgentError,
     AgentEventKind,
     AgentManager,
@@ -50,10 +51,13 @@ from foregent.agents import (
     AgentRef,
     AgentStatus,
     LaunchSpec,
+    McpServer,
+    Provider,
     issue_key_from_label,
     label_for,
 )
-from foregent.agents.herdr_claude import HerdrClaudeManager
+from foregent.agents.harness import harness_for
+from foregent.agents.herdr_manager import HerdrManager
 from foregent.events import Event, EventKind, delivery_message, wakes
 from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
@@ -91,7 +95,7 @@ store = IssueStore()
 
 # The harness foregent runs agents on. One process-wide manager, swapped
 # wholesale to change harness.
-manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
+manager: AgentManager = HerdrManager(session=config.herdr_session())
 
 # Events waiting for the agent they are for, one queue per issue key, oldest
 # first. Each has a drainer of its own, so two events for one agent reach it
@@ -213,6 +217,14 @@ def rebuild_store() -> None:
                 status=status,
                 repo=str(repo) if repo else "",
                 directory=record.cwd,
+                # Which harness the agent runs is the agent kind herdr
+                # detected, so this needs nothing persisted either. An agent
+                # of a kind foregent does not know reads as the default, which
+                # costs nothing: the provider decides a brief, a skill
+                # directory and a workspace's trust, and this issue has been
+                # dispatched already. What is left of its life — a prompt, a
+                # status, a stop — is the same call whatever it runs.
+                provider=record.provider or DEFAULT_PROVIDER,
                 blocker=RECOVERED_BLOCKER if status is IssueStatus.BLOCKED else "",
                 agent=record.ref,
             )
@@ -412,22 +424,25 @@ def _record(issue: Issue) -> dict[str, str]:
         "key": issue.key,
         "title": issue.title,
         "status": issue.status,
+        "provider": issue.provider,
         "blocker": issue.blocker,
     }
 
 
-def brief_for(key: str, mode: Mode) -> str:
+def brief_for(key: str, mode: Mode, provider: Provider) -> str:
     """The opening message an agent is given for issue ``key``.
 
-    Invoking the skill by name leaves the lifecycle in one place — the skill —
-    instead of half-restating it here, where the two would drift.
+    Naming the skill leaves the lifecycle in one place — the skill — instead
+    of half-restating it here, where the two would drift. How it is named is
+    the harness's own: a slash command in Claude Code, a sentence in Codex,
+    which is why the wording comes from ``provider`` rather than from here.
 
     The mode rides along because it is the bridge's answer, not the agent's to
     look up: it is read off the repo's git remotes
     (:func:`foregent.workspaces.mode_for`), and the same answer decides
     whether the bridge advances ``main`` when the issue completes.
     """
-    return f"/foregent-worker {key} {mode}"
+    return harness_for(provider).brief(key, mode)
 
 
 def mode_of(issue: Issue) -> Mode:
@@ -452,7 +467,7 @@ def mode_of(issue: Issue) -> Mode:
     return workspaces.mode_for(Path(issue.repo))
 
 
-def agent_mcp_servers() -> dict[str, dict]:
+def agent_mcp_servers() -> dict[str, McpServer]:
     """The MCP servers a dispatched agent is given.
 
     Foregent's own lifecycle tools, served from this process — without them
@@ -465,7 +480,7 @@ def agent_mcp_servers() -> dict[str, dict]:
     (:mod:`foregent.mcp_servers`) and inherited, so one configuration serves
     agents and the operator's own sessions alike (JIM-93).
     """
-    return {"foregent": {"type": "http", "url": f"{config.api_url()}/mcp"}}
+    return {"foregent": McpServer(url=f"{config.api_url()}/mcp")}
 
 
 def check_agent_mcp() -> None:
@@ -476,19 +491,27 @@ def check_agent_mcp() -> None:
     and only discovered once one is already running. A warning rather than a
     refusal: the fix is `foregent setup`, and a bridge that will not start is
     a worse way to say so.
+
+    Once per harness, because each keeps its own config. A box that will only
+    ever queue one harness is warned about the other, which is the cheaper of
+    the two mistakes: the fix is one command, and a bridge silent about a
+    harness nobody provisioned says nothing until a dispatch has already been
+    paid for.
     """
-    absent = sorted(set(mcp_servers.SERVERS) - mcp_servers.configured())
-    if absent:
-        logger.warning(
-            "%s MCP not configured on this machine; run `foregent setup`",
-            ", ".join(absent),
-        )
+    for provider in Provider:
+        absent = sorted(set(mcp_servers.SERVERS) - mcp_servers.configured(provider))
+        if absent:
+            logger.warning(
+                "%s MCP not configured for %s on this machine; run `foregent setup`",
+                ", ".join(absent),
+                provider,
+            )
     for variable in mcp_servers.missing_credentials():
         logger.warning("%s is not set; agents cannot authenticate with it", variable)
 
 
-def ensure_skills() -> None:
-    """Install every packaged skill onto this machine, before a launch.
+def ensure_skills(provider: Provider) -> None:
+    """Install every packaged skill for ``provider``, before a launch.
 
     The agent is briefed from the copy on disk, so dispatch writes the
     packaged text over whatever is there (JIM-143). A box where `foregent
@@ -507,18 +530,19 @@ def ensure_skills() -> None:
     working the issue without foregent's lifecycle instructions, which beats
     not dispatching at all.
 
-    Knowing where a Claude Code session looks for skills is a harness detail
-    leaking through the `AgentManager` seam. Acceptable
-    while there is one harness; a second one makes this a manager method.
+    Only the harness the issue will be worked on. Refreshing every one at
+    every dispatch would write files no agent about to start will read.
     """
     try:
-        outcomes = skills.install()
+        outcomes = skills.install(provider=provider)
     except OSError as exc:
-        logger.warning("could not install foregent's skills: %s", exc)
+        logger.warning("could not install foregent's skills for %s: %s", provider, exc)
         return
     for name, outcome in outcomes:
         if outcome is not skills.Outcome.UNCHANGED:
-            logger.info("%s the %s skill in %s", outcome, name, skills.skills_root())
+            logger.info(
+                "%s the %s skill in %s", outcome, name, skills.skills_root(provider)
+            )
 
 
 def dispatch() -> None:
@@ -593,7 +617,8 @@ def _dispatch_one() -> bool:
         return False
     label = label_for(issue.key)
     repo = Path(issue.repo)
-    ensure_skills()
+    provider = issue.provider
+    ensure_skills(provider)
     try:
         linear.claim_issue(issue.key)
         running = _adopt(label)
@@ -604,18 +629,19 @@ def _dispatch_one() -> bool:
             ref, cwd = running.ref, running.cwd
         else:
             # Before the launch, because the workspace is the agent's cwd.
-            cwd = str(workspaces.create(repo, issue.key))
+            cwd = str(workspaces.create(repo, issue.key, provider))
             ref = manager.launch(
                 LaunchSpec(
                     label=label,
                     cwd=cwd,
+                    provider=provider,
                     mcp_servers=agent_mcp_servers(),
                 )
             )
         # The mode is read off the repo rather than the workspace: a secondary
         # workspace shares the repo's remotes, and an adopted agent's dispatch
         # never built one to read.
-        manager.send(ref, brief_for(issue.key, mode_of(issue)))
+        manager.send(ref, brief_for(issue.key, mode_of(issue), provider))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:
@@ -660,12 +686,21 @@ def list_issues() -> list[dict[str, str]]:
 
 
 @app.post("/issues/{key}/queue")
-def queue_issue(key: str, directory: Annotated[str, Body(embed=True)]) -> dict[str, str]:
+def queue_issue(
+    key: str,
+    directory: Annotated[str, Body(embed=True)],
+    provider: Annotated[Provider, Body(embed=True)] = DEFAULT_PROVIDER,
+) -> dict[str, str]:
     """Queue issue ``key`` against the repo at ``directory``, dispatching if free.
 
     ``directory`` is the project, not the agent's cwd: dispatch builds a
     per-issue workspace from it and runs the agent there
     (:mod:`foregent.workspaces`).
+
+    ``provider`` is which harness works it, and is the operator's to name
+    (§1.3) — unlike the mode, which is read off the repo. A harness foregent
+    does not run is refused here rather than at launch, where an issue would
+    already have been claimed.
     """
     existing = store.get(key)
     if existing is not None and existing.status in (
@@ -675,7 +710,7 @@ def queue_issue(key: str, directory: Annotated[str, Body(embed=True)]) -> dict[s
         raise HTTPException(
             status_code=409, detail=f"{key} is already {existing.status}"
         )
-    issue = store.queue(key, directory)
+    issue = store.queue(key, directory, provider)
     dispatch()
     return _record(store.get(key) or issue)
 
