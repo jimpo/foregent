@@ -11,10 +11,13 @@ import argparse
 import copy
 import json
 import os
+import signal
 import sys
 import urllib.error
 import urllib.request
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from types import FrameType
+from typing import Any, cast
 from urllib.parse import quote, urlparse
 
 from foregent import __version__, mcp_servers, skills
@@ -238,11 +241,31 @@ def serve_log_config(level: str) -> dict:
     return config
 
 
+def exit_on_second_signal(
+    graceful_exit: Callable[[Any, int, FrameType | None], None],
+) -> Callable[[Any, int, FrameType | None], None]:
+    """Make a second shutdown signal interrupt uvicorn's graceful wait."""
+
+    def handle_exit(server: Any, sig: int, frame: FrameType | None) -> None:
+        if server.should_exit:
+            server.force_exit = True
+            raise KeyboardInterrupt
+        graceful_exit(server, sig, frame)
+
+    return handle_exit
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     """Run the API server on the host/port from the configured API URL."""
     import uvicorn
 
     url = urlparse(api_url())
+    # Uvicorn's force-exit flag only short-circuits some shutdown phases and
+    # only treats a repeated SIGINT as forceful. A second SIGINT or SIGTERM is
+    # an operator asking to stop now, including from a stuck MCP connection.
+    uvicorn.Server.handle_exit = cast(
+        Any, exit_on_second_signal(uvicorn.Server.handle_exit)
+    )
     uvicorn.run(
         "foregent.server:app",
         host=url.hostname or "127.0.0.1",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import signal
 import unittest
 from unittest import mock
 
@@ -42,6 +43,28 @@ class ServeLogLevelTests(unittest.TestCase):
         for level in cli.LOG_LEVELS:
             with self.subTest(level=level):
                 self.assertIn(cli.serve_log_config(level)["root"]["level"], known)
+
+
+class ServeShutdownTests(unittest.TestCase):
+    def test_first_signal_starts_a_graceful_shutdown(self) -> None:
+        graceful_exit = mock.Mock()
+        server = mock.Mock(should_exit=False)
+
+        cli.exit_on_second_signal(graceful_exit)(server, signal.SIGTERM, None)
+
+        graceful_exit.assert_called_once_with(server, signal.SIGTERM, None)
+
+    def test_second_interrupt_or_terminate_signal_stops_immediately(self) -> None:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with self.subTest(sig=sig):
+                graceful_exit = mock.Mock()
+                server = mock.Mock(should_exit=True)
+
+                with self.assertRaises(KeyboardInterrupt):
+                    cli.exit_on_second_signal(graceful_exit)(server, sig, None)
+
+                self.assertTrue(server.force_exit)
+                graceful_exit.assert_not_called()
 
 
 if __name__ == "__main__":
