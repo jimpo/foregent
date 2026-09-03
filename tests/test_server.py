@@ -21,7 +21,11 @@ from collections.abc import Callable, Collection, Iterator
 from pathlib import Path
 from unittest import mock
 
-from foregent import herdr, server
+import httpx2
+from mcp.client.session import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+from foregent import config, herdr, server
 from foregent.agents import (
     AgentError,
     AgentEvent,
@@ -1258,6 +1262,46 @@ class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
         issue = server.store.get("JIM-88")
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.DONE)
+
+
+class McpEndpointTest(unittest.IsolatedAsyncioTestCase):
+    """The lifecycle tools answer over the transport an agent reaches them by.
+
+    Everything between the agent and :func:`server.report_blocked` belongs to
+    the mcp library — the mounted app, the session manager the lifespan
+    drives, the ``Host`` the transport will accept — and an upgrade of it
+    changes all three at once (JIM-203). Calling the tool in Python proves
+    none of that, so this drives it as an agent does: a real MCP client, over
+    HTTP, at the URL dispatch hands out.
+    """
+
+    async def test_an_agent_can_list_and_call_the_tools(self) -> None:
+        server.store = IssueStore()
+        server.store.add(Issue(key="JIM-1", title="", status=IssueStatus.IN_PROGRESS))
+        url = config.api_url()
+        async with server.mcp.session_manager.run():
+            transport = httpx2.ASGITransport(app=server.app)
+            async with httpx2.AsyncClient(transport=transport, base_url=url) as http:
+                async with streamable_http_client(f"{url}/mcp", http_client=http) as (
+                    read,
+                    write,
+                    *_,
+                ):
+                    async with ClientSession(read, write) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+                        result = await session.call_tool(
+                            "report_blocked",
+                            {"issue_key": "JIM-1", "blocker": "a review"},
+                        )
+        self.assertEqual(
+            {tool.name for tool in tools.tools}, {"complete_task", "report_blocked"}
+        )
+        self.assertFalse(result.is_error)
+        issue = server.store.get("JIM-1")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.BLOCKED)
+        self.assertEqual(issue.blocker, "a review")
 
 
 class McpDependencyTest(unittest.TestCase):
