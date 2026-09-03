@@ -482,19 +482,27 @@ def check_agent_mcp() -> None:
     and only discovered once one is already running. A warning rather than a
     refusal: the fix is `foregent setup`, and a bridge that will not start is
     a worse way to say so.
+
+    Once per harness, because each keeps its own config. A box that will only
+    ever queue one harness is warned about the other, which is the cheaper of
+    the two mistakes: the fix is one command, and a bridge silent about a
+    harness nobody provisioned says nothing until a dispatch has already been
+    paid for.
     """
-    absent = sorted(set(mcp_servers.SERVERS) - mcp_servers.configured())
-    if absent:
-        logger.warning(
-            "%s MCP not configured on this machine; run `foregent setup`",
-            ", ".join(absent),
-        )
+    for provider in Provider:
+        absent = sorted(set(mcp_servers.SERVERS) - mcp_servers.configured(provider))
+        if absent:
+            logger.warning(
+                "%s MCP not configured for %s on this machine; run `foregent setup`",
+                ", ".join(absent),
+                provider,
+            )
     for variable in mcp_servers.missing_credentials():
         logger.warning("%s is not set; agents cannot authenticate with it", variable)
 
 
-def ensure_skills() -> None:
-    """Install every packaged skill onto this machine, before a launch.
+def ensure_skills(provider: Provider) -> None:
+    """Install every packaged skill for ``provider``, before a launch.
 
     The agent is briefed from the copy on disk, so dispatch writes the
     packaged text over whatever is there (JIM-143). A box where `foregent
@@ -513,18 +521,19 @@ def ensure_skills() -> None:
     working the issue without foregent's lifecycle instructions, which beats
     not dispatching at all.
 
-    Knowing where a Claude Code session looks for skills is a harness detail
-    leaking through the `AgentManager` seam. Acceptable
-    while there is one harness; a second one makes this a manager method.
+    Only the harness the issue will be worked on. Refreshing every one at
+    every dispatch would write files no agent about to start will read.
     """
     try:
-        outcomes = skills.install()
+        outcomes = skills.install(provider=provider)
     except OSError as exc:
-        logger.warning("could not install foregent's skills: %s", exc)
+        logger.warning("could not install foregent's skills for %s: %s", provider, exc)
         return
     for name, outcome in outcomes:
         if outcome is not skills.Outcome.UNCHANGED:
-            logger.info("%s the %s skill in %s", outcome, name, skills.skills_root())
+            logger.info(
+                "%s the %s skill in %s", outcome, name, skills.skills_root(provider)
+            )
 
 
 def dispatch() -> None:
@@ -599,7 +608,8 @@ def _dispatch_one() -> bool:
         return False
     label = label_for(issue.key)
     repo = Path(issue.repo)
-    ensure_skills()
+    provider = DEFAULT_PROVIDER
+    ensure_skills(provider)
     try:
         linear.claim_issue(issue.key)
         running = _adopt(label)
@@ -610,18 +620,19 @@ def _dispatch_one() -> bool:
             ref, cwd = running.ref, running.cwd
         else:
             # Before the launch, because the workspace is the agent's cwd.
-            cwd = str(workspaces.create(repo, issue.key))
+            cwd = str(workspaces.create(repo, issue.key, provider))
             ref = manager.launch(
                 LaunchSpec(
                     label=label,
                     cwd=cwd,
+                    provider=provider,
                     mcp_servers=agent_mcp_servers(),
                 )
             )
         # The mode is read off the repo rather than the workspace: a secondary
         # workspace shares the repo's remotes, and an adopted agent's dispatch
         # never built one to read.
-        manager.send(ref, brief_for(issue.key, mode_of(issue), DEFAULT_PROVIDER))
+        manager.send(ref, brief_for(issue.key, mode_of(issue), provider))
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:

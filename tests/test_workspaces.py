@@ -14,11 +14,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from foregent import workspaces
+from foregent.agents import Provider
 from foregent.models import Mode
 
 JJ = shutil.which("jj")
@@ -59,7 +61,7 @@ class WorkspaceTest(unittest.TestCase):
         # way here so these never touch the real ~/.claude.json.
         patches = [
             mock.patch.object(workspaces.config, "workspace_root", lambda: self.root),
-            mock.patch.object(workspaces, "ensure_trusted", lambda path: False),
+            mock.patch.object(workspaces, "ensure_trusted", lambda path, provider: False),
         ]
         for patch in patches:
             patch.start()
@@ -679,6 +681,100 @@ class TrustTest(unittest.TestCase):
         self.write({"projects": {}})
         with mock.patch.object(workspaces.os, "replace") as replace:
             workspaces.ensure_trusted(Path("/ws/JIM-1"))
+
+        replace.assert_called_once()
+        staged, destination = replace.call_args.args
+        self.assertEqual(Path(destination), self.config)
+        self.assertEqual(Path(staged).parent, self.config.parent)
+        os.unlink(staged)
+
+
+class CodexTrustTests(unittest.TestCase):
+    """Codex opens the same kind of dialog, and records the answer in TOML.
+
+    herdr reads that dialog as `blocked`, so an untrusted cwd fails a dispatch
+    rather than slowing it. Codex resolves trust to a git repository's root and
+    a secondary jj workspace has no `.git`, so the entry is the workspace path
+    itself.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.config = self.tmp / "config.toml"
+        patch = mock.patch.object(
+            workspaces.mcp_servers,
+            "config_file",
+            lambda provider=None: self.config,
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def trust(self, path: str) -> bool:
+        return workspaces.ensure_trusted(Path(path), Provider.CODEX)
+
+    def loaded(self) -> dict:
+        return tomllib.loads(self.config.read_text())
+
+    def test_an_unknown_directory_is_recorded(self) -> None:
+        self.assertTrue(self.trust("/ws/JIM-1"))
+
+        entry = self.loaded()["projects"]["/ws/JIM-1"]
+        self.assertEqual(entry["trust_level"], "trusted")
+
+    def test_a_trusted_directory_is_left_alone(self) -> None:
+        self.trust("/ws/JIM-1")
+        before = self.config.read_text()
+
+        self.assertFalse(self.trust("/ws/JIM-1"))
+
+        self.assertEqual(self.config.read_text(), before)
+
+    def test_an_ancestor_does_not_count(self) -> None:
+        # Unlike Claude Code: Codex resolves a git project to its root, and a
+        # jj workspace is not one, so trusting the workspace root buys nothing.
+        self.trust("/ws")
+
+        self.assertFalse(workspaces.trusted(Path("/ws/JIM-1"), Provider.CODEX))
+
+    def test_writing_preserves_what_the_config_already_held(self) -> None:
+        # Codex's config is TOML an operator writes by hand and comments;
+        # rewriting it from a parse would return it stripped of both.
+        self.config.write_text(
+            '# keep me\n[mcp_servers.linear]\nurl = "https://mcp.linear.app/mcp"\n'
+        )
+
+        self.trust("/ws/JIM-1")
+
+        text = self.config.read_text()
+        self.assertIn("# keep me", text)
+        self.assertEqual(
+            self.loaded()["mcp_servers"]["linear"]["url"],
+            "https://mcp.linear.app/mcp",
+        )
+
+    def test_an_absent_config_is_created(self) -> None:
+        self.assertTrue(self.trust("/ws/JIM-1"))
+
+        self.assertEqual(
+            self.loaded()["projects"]["/ws/JIM-1"]["trust_level"], "trusted"
+        )
+
+    def test_a_malformed_config_reads_as_untrusted(self) -> None:
+        self.config.write_text("[not toml")
+
+        self.assertFalse(workspaces.trusted(Path("/ws/JIM-1"), Provider.CODEX))
+
+    def test_a_path_that_needs_quoting_stays_readable(self) -> None:
+        # A TOML basic string, so a quote or a backslash in a path must not
+        # produce a config Codex cannot parse.
+        self.assertTrue(self.trust('/ws/od"d'))
+
+        self.assertIn('/ws/od"d', self.loaded()["projects"])
+
+    def test_the_config_is_replaced_atomically(self) -> None:
+        with mock.patch.object(workspaces.os, "replace") as replace:
+            self.trust("/ws/JIM-1")
 
         replace.assert_called_once()
         staged, destination = replace.call_args.args

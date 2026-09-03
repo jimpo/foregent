@@ -21,6 +21,7 @@ from typing import Any, cast
 from urllib.parse import quote, urlparse
 
 from foregent import __version__, mcp_servers, skills
+from foregent.agents import Provider
 from foregent.config import LOG_LEVELS, api_url, log_level
 from foregent.models import Issue, IssueStatus
 
@@ -67,13 +68,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     setup = subparsers.add_parser(
         "setup",
-        help="Prepare this machine's Claude Code configuration for foregent.",
+        help="Prepare this machine's harness configuration for foregent.",
         description=(
-            "Copy every skill foregent ships into the user-level Claude Code "
-            "skill directory, and add the Linear and GitHub MCP servers to "
-            "the machine's user config, where agents and your own sessions "
-            "both load them from. Run once per machine, and again after "
-            "upgrading foregent."
+            "For every harness foregent can run agents on: copy every skill "
+            "foregent ships into that harness's user-level skill directory, "
+            "and add the Linear and GitHub MCP servers to its machine-level "
+            "config, where agents and your own sessions both load them from. "
+            "Run once per machine, and again after upgrading foregent."
         ),
     )
     setup.set_defaults(func=cmd_setup)
@@ -194,19 +195,27 @@ def cmd_queue(args: argparse.Namespace) -> int:
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Prepare this machine: install the packaged skills and the MCP servers."""
-    root = skills.skills_root()
-    print(f"Installing foregent's skills into {root}")
-    for name, outcome in skills.install(root):
-        print(f"  {outcome:<9}  {name}")
+    """Prepare this machine: install the packaged skills and the MCP servers.
 
-    print(f"Adding MCP servers to {mcp_servers.config_file()}")
-    try:
-        for name, installed in mcp_servers.install():
-            print(f"  {'added' if installed else 'kept':<9}  {name}")
-    except mcp_servers.MCPError as exc:
-        print(f"  {exc}", file=sys.stderr)
-        return 1
+    Once per harness, because each keeps its own skill directory and its own
+    MCP config. A box that runs agents on only one still provisions both: the
+    files are small, and a harness provisioned only when it is first used is
+    one whose first dispatch is where the operator finds out it was not.
+    """
+    for provider in Provider:
+        print(f"Provisioning {provider}")
+        root = skills.skills_root(provider)
+        print(f"  Installing foregent's skills into {root}")
+        for name, outcome in skills.install(provider=provider):
+            print(f"    {outcome:<9}  {name}")
+
+        print(f"  Adding MCP servers to {mcp_servers.config_file(provider)}")
+        try:
+            for name, installed in mcp_servers.install(provider):
+                print(f"    {'added' if installed else 'kept':<9}  {name}")
+        except mcp_servers.MCPError as exc:
+            print(f"  {exc}", file=sys.stderr)
+            return 1
 
     # The config stores `${LINEAR_API_KEY}`, not the token: a server whose
     # variable is unset is configured but cannot authenticate, and an agent

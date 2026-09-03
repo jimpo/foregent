@@ -1,10 +1,12 @@
 """The skills foregent ships, and where they are installed (JIM-91).
 
-Foregent's skills are Claude Code *personal* skills: they live in the box's
-user-level skill directory (``~/.claude/skills/<name>/SKILL.md``), the one
-place a session loads for every project. The skill files themselves sit
-alongside this module inside the installed package, so they travel with a
-``uv tool install foregent`` rather than only existing in a repo checkout.
+Foregent's skills are *personal* skills: they live in the box's user-level
+skill directory, the one place a session loads for every project — and both
+harnesses have one, ``~/.claude/skills`` and ``$CODEX_HOME/skills``, reading
+the same ``<name>/SKILL.md`` with the same name-and-description front matter.
+The skill files themselves sit alongside this module inside the installed
+package, so they travel with a ``uv tool install foregent`` rather than only
+existing in a repo checkout.
 
 Two callers install them through the one function :func:`install`, so what
 an agent is briefed from cannot drift from what foregent ships:
@@ -22,10 +24,13 @@ import tempfile
 from enum import StrEnum
 from pathlib import Path
 
+from foregent.agents import DEFAULT_PROVIDER, Provider
+
 PACKAGED = Path(__file__).resolve().parent
 """The directory holding the packaged skills — this module's own."""
 
 DEFAULT_CONFIG_DIR = "~/.claude"
+DEFAULT_CODEX_HOME = "~/.codex"
 
 
 class Outcome(StrEnum):
@@ -36,13 +41,18 @@ class Outcome(StrEnum):
     UNCHANGED = "unchanged"
 
 
-def skills_root() -> Path:
-    """The user-level Claude Code skill directory to install into.
+def skills_root(provider: Provider = DEFAULT_PROVIDER) -> Path:
+    """The user-level skill directory ``provider``'s agents load from.
 
-    ``CLAUDE_CONFIG_DIR`` relocates the whole of ``~/.claude``, so honor it
-    rather than hardcoding the home-relative path — a box that sets it has no
-    ``~/.claude`` for Claude Code to read at all.
+    Each harness relocates its own home with an environment variable —
+    ``CLAUDE_CONFIG_DIR`` for the whole of ``~/.claude``, ``CODEX_HOME`` for
+    ``~/.codex`` — so honor them rather than hardcoding the home-relative
+    path: a box that sets one has no default directory for that harness to
+    read at all.
     """
+    if provider is Provider.CODEX:
+        home = os.environ.get("CODEX_HOME") or DEFAULT_CODEX_HOME
+        return Path(home).expanduser() / "skills"
     config = os.environ.get("CLAUDE_CONFIG_DIR") or DEFAULT_CONFIG_DIR
     return Path(config).expanduser() / "skills"
 
@@ -56,14 +66,21 @@ def packaged() -> list[Path]:
     return sorted(path.parent for path in PACKAGED.glob("*/SKILL.md"))
 
 
-def install(root: Path | None = None) -> list[tuple[str, Outcome]]:
+def install(
+    root: Path | None = None,
+    provider: Provider = DEFAULT_PROVIDER,
+) -> list[tuple[str, Outcome]]:
     """Install every packaged skill under ``root``, overwriting stale copies.
+
+    ``root`` defaults to where ``provider``'s agents look
+    (:func:`skills_root`); passing one is for a caller that already knows the
+    directory, which is every test and nothing else.
 
     Returns ``(name, outcome)`` per skill so the caller can say what it did:
     a re-run after upgrading foregent should be legible, and an operator whose
     edits were replaced should be told rather than left to discover it.
     """
-    root = root if root is not None else skills_root()
+    root = root if root is not None else skills_root(provider)
     return [(skill.name, _install(skill, root)) for skill in packaged()]
 
 

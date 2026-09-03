@@ -26,16 +26,66 @@ class DefinitionTests(unittest.TestCase):
     """The server definitions themselves."""
 
     def test_no_credential_is_ever_written_to_disk(self) -> None:
-        # The stored header holds `${VAR}`, expanded per session by Claude
-        # Code. A definition carrying a real token would put it in a
+        # A server names the variable holding its token; each harness expands
+        # it per session. A definition carrying a real token would put it in a
         # world-readable config file that gets copied around.
-        for name, definition in mcp_servers.SERVERS.items():
-            for value in definition.get("headers", {}).values():
-                self.assertRegex(value, r"\$\{\w+\}", f"{name} inlines a secret")
+        for name, server in mcp_servers.SERVERS.items():
+            self.assertRegex(
+                server.token_env or "", r"^\w+$", f"{name} inlines a secret"
+            )
+            self.assertNotIn("Bearer ", server.url, f"{name} inlines a secret")
+
+    def test_neither_harnesss_add_command_carries_a_token(self) -> None:
+        for provider in mcp_servers.Provider:
+            for name, server in mcp_servers.SERVERS.items():
+                argv = mcp_servers._add_argv(provider, name, server)
+                with self.subTest(provider=provider, server=name):
+                    self.assertIn(server.token_env or "", " ".join(argv))
+                    self.assertNotIn("Bearer LINEAR", " ".join(argv))
 
     def test_every_server_names_the_credential_it_needs(self) -> None:
         self.assertEqual(mcp_servers.credentials("linear"), ["LINEAR_API_KEY"])
         self.assertEqual(mcp_servers.credentials("github"), ["GITHUB_TOKEN"])
+
+
+class CodexConfigTests(unittest.TestCase):
+    """Codex keeps one TOML file, relocated by CODEX_HOME, and has no scopes."""
+
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(self.home)})
+        )
+
+    def test_codex_home_relocates_the_config(self) -> None:
+        self.assertEqual(
+            mcp_servers.config_file(mcp_servers.Provider.CODEX),
+            self.home / "config.toml",
+        )
+
+    def test_the_configured_servers_are_read_out_of_the_toml(self) -> None:
+        (self.home / "config.toml").write_text(
+            '[mcp_servers.linear]\nurl = "https://mcp.linear.app/mcp"\n'
+        )
+        self.assertEqual(
+            mcp_servers.configured(mcp_servers.Provider.CODEX), {"linear"}
+        )
+
+    def test_an_unreadable_config_is_treated_as_empty(self) -> None:
+        # A fresh box has no config at all; half-written TOML should not stop
+        # setup, because the add that follows reports the real failure.
+        (self.home / "config.toml").write_text("[not toml")
+        self.assertEqual(mcp_servers.configured(mcp_servers.Provider.CODEX), set())
+
+    def test_a_server_is_added_through_codexs_own_cli(self) -> None:
+        argv = mcp_servers._add_argv(
+            mcp_servers.Provider.CODEX, "linear", mcp_servers.SERVERS["linear"]
+        )
+        self.assertEqual(argv[:4], ["codex", "mcp", "add", "linear"])
+        self.assertEqual(argv[argv.index("--url") + 1], "https://mcp.linear.app/mcp")
+        self.assertEqual(
+            argv[argv.index("--bearer-token-env-var") + 1], "LINEAR_API_KEY"
+        )
 
 
 class ConfigFileTests(unittest.TestCase):
@@ -84,7 +134,21 @@ class InstallTests(unittest.TestCase):
 
     def test_a_fresh_box_gets_every_server(self) -> None:
         outcomes = mcp_servers.install()
-        self.assertEqual(self.added(), dict(mcp_servers.SERVERS))
+        self.assertEqual(
+            self.added(),
+            {
+                "linear": {
+                    "type": "http",
+                    "url": "https://mcp.linear.app/mcp",
+                    "headers": {"Authorization": "Bearer ${LINEAR_API_KEY}"},
+                },
+                "github": {
+                    "type": "http",
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "headers": {"Authorization": "Bearer ${GITHUB_TOKEN}"},
+                },
+            },
+        )
         self.assertTrue(all(installed for _, installed in outcomes))
 
     def test_an_existing_server_is_left_alone(self) -> None:

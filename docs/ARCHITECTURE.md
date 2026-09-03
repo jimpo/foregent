@@ -147,8 +147,8 @@ the bridge through the foregent MCP server.
 | `agents/harness.py` | Which herdr agent kind a provider names, and which module renders its argv. |
 | `agents/claude.py` | Claude Code's own half: the agent kind, the flags a `LaunchSpec` renders to, and the brief. |
 | `agents/codex.py` | The same for Codex. |
-| `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for Claude Code. |
-| `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's user-level Claude Code config. |
+| `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for the harness that will run there. |
+| `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's config, once per harness. |
 | `skills/` | The packaged `foregent-worker` skill and its installer. |
 | `cli.py` | `status`, `queue`, `setup`, `serve`. A thin HTTP client of the bridge, except `setup`. |
 | `config.py` | Environment-overridable settings. |
@@ -544,10 +544,16 @@ pull-request` slash command in Claude Code, and in Codex a sentence naming the
 skill, since Codex has no slash form for one and instead lists every skill it
 found by name and description in the model's own prompt.
 
+**Both harnesses read the same file.** A skill is `<name>/SKILL.md` with
+name-and-description front matter, in a user-level directory that applies to
+every project: `~/.claude/skills` and `$CODEX_HOME/skills`. So foregent ships
+one skill and installs it twice, rather than one per harness.
+
 Skills ship inside the installed package, so they travel with a
-`uv tool install`. Two paths put them on disk, `foregent setup` and the server
-before a launch, and both call the one installer in `skills/__init__.py`: what
-an agent is briefed from is what foregent ships. Dispatch overwrites because
+`uv tool install`. Two paths put them on disk, `foregent setup` for every
+harness and the server for the one an issue is about to be worked on, and both
+call the one installer in `skills/__init__.py`: what an agent is briefed from
+is what foregent ships. Dispatch overwrites because
 the drift is otherwise silent in both directions — a skill left over from an
 older foregent can name a file that no longer exists, and neither the agent
 nor the log has any way to say so (JIM-143). The cost is a hand-edited skill
@@ -558,21 +564,33 @@ loads a half-written `SKILL.md`.
 ### 6.3 MCP servers are split by lifetime
 
 **Foregent's own server is per-run.** Its URL is this bridge's, so the launch
-spec declares it with `--mcp-config`.
+spec declares it — `--mcp-config` for Claude Code, `-c mcp_servers.…` for
+Codex, which merges over the machine's own table.
 
 **Linear and GitHub are per-machine.** `foregent setup` writes them at Claude
-Code's *user* scope — the only scope that applies in a fresh workspace — and
-every agent inherits them. They go in through `claude mcp add-json -s user`
-rather than by editing the config file, because every running session
-rewrites that file.
+Code's *user* scope — the only scope that applies in a fresh workspace, and
+the only kind Codex has — and every agent inherits them. They go in through
+`claude mcp add-json -s user` and `codex mcp add --url` rather than by editing
+either config file, because a harness rewrites its own.
 
-`--strict-mcp-config` stays off, so one configuration serves agents and the
-operator's own sessions alike. The machine is already the isolation boundary
-(§1.1).
+Nothing restricts an agent to what foregent declares, so one configuration
+serves agents and the operator's own sessions alike. The machine is already
+the isolation boundary (§1.1). It is also not expressible in Codex, whose
+`-c` overrides merge rather than replace (§6.1).
 
-Credentials never reach disk: the stored header is the literal
-`${LINEAR_API_KEY}` or `${GITHUB_TOKEN}`, expanded per session from the herdr
-server's environment.
+**A server is declared once, in foregent's own spelling** — a URL and the
+*name* of the variable holding its token — and each harness renders it. That
+is what keeps one list of servers from becoming two that can disagree.
+
+Credentials never reach disk. Claude Code stores the literal
+`${LINEAR_API_KEY}` or `${GITHUB_TOKEN}` in a header; Codex stores the
+variable's name as `bearer_token_env_var`. Both expand it per session from
+the herdr server's environment.
+
+**Each harness is provisioned separately**, and every one on the box is,
+whether or not it will be used: the files are small, and a harness provisioned
+only when it is first needed is one whose first dispatch is where the operator
+finds out it was not.
 
 ### 6.4 Project modes
 
@@ -803,16 +821,25 @@ installed.
   server started from inside another Claude Code session leaks `CLAUDECODE=1`
   into its agents, which silently disables transcript saving and breaks
   resume. The systemd unit sets an explicit environment.
-- **Pre-accepted workspace trust.** A fresh directory makes Claude Code open
-  its trust dialog before accepting input, and herdr's detection reads that
-  dialog as `blocked` — so the agent never reaches idle and the launch fails.
-  Every workspace is a fresh directory, so trust the workspace *root* once and
-  every workspace under it inherits it (§7.1). Foregent writes the entry
-  itself for any workspace it finds untrusted, so this is a should, not a
-  must; doing it by hand keeps foregent out of `~/.claude.json`, which every
-  running Claude Code session rewrites.
-- **The herdr Claude integration** (`herdr integration install claude`), so
-  session identity is reported back to herdr.
+- **Pre-accepted workspace trust.** A fresh directory makes a harness open its
+  trust dialog before accepting input, and herdr's detection reads that dialog
+  as `blocked` — so the agent never reaches idle and the launch fails. Every
+  workspace is a fresh directory, so trust the workspace *root* once and every
+  workspace under it inherits it (§7.1). Foregent writes the entry itself for
+  any workspace it finds untrusted, so this is a should, not a must; doing it
+  by hand keeps foregent out of `~/.claude.json`, which every running Claude
+  Code session rewrites.
+
+  **Codex inherits nothing**, because it resolves trust to a git repository's
+  root and a secondary jj workspace has no `.git`. Foregent writes the exact
+  workspace path there, appended to `$CODEX_HOME/config.toml` so an operator's
+  own comments and layout survive, and that file grows an entry per issue.
+- **The herdr integration for each harness** (`herdr integration install
+  claude`, `herdr integration install codex`), so session identity is reported
+  back to herdr.
+- **A logged-in harness.** `claude` and `codex login` each hold their own
+  credentials, and an unauthenticated one opens a sign-in screen that herdr
+  reads exactly as it reads a trust dialog.
 - **`LINEAR_API_KEY` and `GITHUB_TOKEN` in the herdr server's environment.**
   The MCP configuration stores the variable name, not the token, so a server
   missing the variable looks installed and fails to authenticate once an
@@ -834,3 +861,5 @@ installed.
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
 | `GITHUB_TOKEN` | bridge, agents | GitHub MCP authentication, and the bridge's lookup of a pull request's head branch (§4.2). |
 | `GITHUB_WEBHOOK_SECRET` | bridge | GitHub webhook signature verification. |
+| `CLAUDE_CONFIG_DIR` | bridge | Claude Code's own: where its skills and trusted projects are read and written. Default `~/.claude`. |
+| `CODEX_HOME` | bridge | Codex's own: the same, plus its MCP servers. Default `~/.codex`. |
