@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import Body, FastAPI, HTTPException, Request
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from starlette.concurrency import run_in_threadpool
 
 from foregent import config, github, herdr, linear, mcp_servers, skills, workspaces
@@ -59,9 +59,7 @@ from foregent.store import IN_FLIGHT, IssueStore
 
 logger = logging.getLogger(__name__)
 
-# stateless_http: these tools are fire-and-forget, so session-id bookkeeping
-# would be pure overhead.
-mcp = FastMCP("foregent", stateless_http=True)
+mcp = MCPServer("foregent")
 
 
 @asynccontextmanager
@@ -1013,9 +1011,8 @@ async def complete_task(issue_key: str) -> str:
     if landed is not None:
         return landed
     # complete_issue's dispatch() call can block on the harness for a minute
-    # or more; FastMCP runs sync tools inline on the event loop (no
-    # auto-offload like Starlette gives sync FastAPI routes), so this must be
-    # threadpooled to avoid stalling the whole server.
+    # or more, and this tool handler is a coroutine on the event loop, so it
+    # must be threadpooled to avoid stalling the whole server.
     try:
         await run_in_threadpool(complete_issue, issue_key)
         result = f"Marked {issue_key} complete."
@@ -1133,4 +1130,6 @@ async def report_blocked(issue_key: str, blocker: str) -> str:
 # precedence and this catch-all doesn't shadow them. Calling
 # streamable_http_app() here (import time) is also what creates
 # `mcp.session_manager` lazily, which `lifespan` above depends on.
-app.mount("/", mcp.streamable_http_app())
+# stateless_http: these tools are fire-and-forget, so session-id bookkeeping
+# would be pure overhead.
+app.mount("/", mcp.streamable_http_app(stateless_http=True))

@@ -1260,21 +1260,23 @@ class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issue.status, IssueStatus.DONE)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class McpDependencyTest(unittest.TestCase):
-    """The mcp requirement must not admit a major that renames what we import.
+    """The mcp requirement must admit the 2.x line and nothing else.
 
-    ``server.py`` imports ``mcp.server.fastmcp``. mcp 2.x renamed FastMCP to
-    MCPServer, so an unbounded requirement resolves an install that cannot
-    import the bridge at all (JIM-202).
+    ``server.py`` imports ``mcp.server.mcpserver``, which only 2.x has: 1.x
+    called it ``mcp.server.fastmcp``, and a later major is free to rename it
+    again. A requirement open at either end resolves an install that cannot
+    import the bridge at all (JIM-202, JIM-203).
     """
 
-    def test_mcp_requirement_excludes_v2(self):
+    def test_mcp_requirement_is_the_v2_line(self) -> None:
         pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
         with pyproject.open("rb") as fh:
             deps = tomllib.load(fh)["project"]["dependencies"]
         (requirement,) = [d for d in deps if d.startswith("mcp")]
-        self.assertIn("<2", requirement)
+        self.assertIn(">=2", requirement)
+        self.assertIn("<3", requirement)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -8,8 +8,8 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "watchfiles>=0.24",
-    # server.py imports mcp.server.fastmcp; mcp 2.x renamed FastMCP to MCPServer.
-    "mcp>=1.2,<2",
+    # server.py imports mcp.server.mcpserver, which is mcp 2.x only.
+    "mcp>=2,<3",
     "gql[requests]>=3.5",
 ]
 
