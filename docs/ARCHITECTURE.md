@@ -530,9 +530,13 @@ server's environment.
 
 - **bootstrap** — no GitHub surface. The agent rebases onto `main` and commits
   there; the bridge moves the bookmark when the issue completes (§4.3).
-- **pull request** — the agent fetches, rebases onto `main`, pushes a branch
-  and opens a pull request through the GitHub MCP, then reports blocked on the
-  review. This is how foregent develops itself.
+- **pull request** — the agent fetches, rebases onto `main`, pushes the branch
+  Linear names on the issue as `gitBranchName` and opens a pull request through
+  the GitHub MCP, then reports blocked on the review. That name is what makes
+  the pull request findable from the issue and the issue readable out of the
+  head branch (§4.2), so the skill states the field and the two jj commands
+  rather than leaving the agent to name a branch. This is how foregent develops
+  itself.
 
   The fetch and the rebase are the agent's, on every push rather than only the
   first. A workspace is built from the box's local `main` (§6.5) and the agent
