@@ -1303,6 +1303,13 @@ class McpEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issue.status, IssueStatus.BLOCKED)
         self.assertEqual(issue.blocker, "a review")
 
+    def test_the_declared_host_is_the_one_agents_call(self) -> None:
+        # A bridge published under a name of its own still has to answer the
+        # agents it dispatched: mcp rejects a Host it was not told about with
+        # 421, and the URL in the launch spec is where that Host comes from.
+        with mock.patch.dict(os.environ, {"FOREGENT_API_URL": "http://box:9000"}):
+            self.assertEqual(server.mcp_host(), "box")
+
 
 class McpDependencyTest(unittest.TestCase):
     """The mcp requirement must admit the 2.x line and nothing else.

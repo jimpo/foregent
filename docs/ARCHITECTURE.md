@@ -377,6 +377,13 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
 The tools are mounted in the bridge's own process, so they mutate the store
 directly instead of looping back over HTTP.
 
+**They answer to the host `FOREGENT_API_URL` names, and no other.** mcp guards
+the transport against DNS rebinding by matching the `Host` header of every
+request against what the mount declared, and answers a mismatch with 421. The
+bridge declares the host out of that same URL, which is the one dispatch hands
+each agent, so a bridge published under a name of its own stays reachable by
+the agents it launched.
+
 **The bridge writes to Linear twice per issue: the claim and the close.** They
 are the two ends of the same record — the issue foregent moved to In Progress
 is the issue foregent moves out of it — and the close is the bridge's because

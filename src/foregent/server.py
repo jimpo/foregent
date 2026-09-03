@@ -35,6 +35,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from mcp.server.mcpserver import MCPServer
@@ -1124,6 +1125,19 @@ async def report_blocked(issue_key: str, blocker: str) -> str:
     return f"Recorded blocker {blocker!r} on {issue_key}."
 
 
+def mcp_host() -> str:
+    """The host an agent's MCP client will name in its ``Host`` header.
+
+    mcp answers a request whose ``Host`` it does not expect with 421, as DNS
+    rebinding protection, and the allowlist it builds is derived from this.
+    Agents reach the bridge at :func:`config.api_url`, so that URL's host is
+    the one to declare: on the default loopback URL that keeps the protection
+    on, and a bridge published under any other name is reachable rather than
+    rejecting every agent that calls it.
+    """
+    return urlparse(config.api_url()).hostname or "127.0.0.1"
+
+
 # Mounted at "/" (not "/mcp") because streamable_http_app() already routes at
 # its own streamable_http_path (default "/mcp") — mounting it at "/mcp" would
 # yield "/mcp/mcp". Mounted last so the explicit REST routes above take
@@ -1132,4 +1146,4 @@ async def report_blocked(issue_key: str, blocker: str) -> str:
 # `mcp.session_manager` lazily, which `lifespan` above depends on.
 # stateless_http: these tools are fire-and-forget, so session-id bookkeeping
 # would be pure overhead.
-app.mount("/", mcp.streamable_http_app(stateless_http=True))
+app.mount("/", mcp.streamable_http_app(stateless_http=True, host=mcp_host()))
