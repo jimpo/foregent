@@ -53,7 +53,7 @@ from foregent.agents import (
     issue_key_from_label,
     label_for,
 )
-from foregent.agents.herdr_claude import HerdrClaudeManager
+from foregent.agents.herdr_manager import HerdrManager
 from foregent.events import Event, EventKind, delivery_message, wakes
 from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
@@ -91,7 +91,7 @@ store = IssueStore()
 
 # The harness foregent runs agents on. One process-wide manager, swapped
 # wholesale to change harness.
-manager: AgentManager = HerdrClaudeManager(session=config.herdr_session())
+manager: AgentManager = HerdrManager(session=config.herdr_session())
 
 # Events waiting for the agent they are for, one queue per issue key, oldest
 # first. Each has a drainer of its own, so two events for one agent reach it

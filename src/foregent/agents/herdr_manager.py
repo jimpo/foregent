@@ -1,14 +1,18 @@
-"""Claude Code agents, run in herdr panes.
+"""Agents run in herdr panes, whichever harness they run.
 
-The manager owns every herdr and Claude Code detail: the socket calls that
-open a workspace and start a process, the CLI flags a `LaunchSpec` renders
-to, and the mapping from herdr's agent status onto :class:`AgentStatus`.
-Nothing above it knows either name.
+The manager owns every herdr detail: the socket calls that open a workspace
+and start a process, and the mapping from herdr's agent status onto
+:class:`AgentStatus`. Nothing above it knows either name.
+
+**One manager serves every harness**, because herdr is what normalizes them.
+Which harness an agent runs decides the agent kind and the argv of one call,
+:meth:`HerdrManager.launch`, and both are looked up in
+:mod:`foregent.agents.harness`; every other call here names a pane, a
+workspace or an agent label and would read the same whatever is running in it.
 """
 
 from __future__ import annotations
 
-import json
 import time
 import uuid
 from collections.abc import Collection, Generator, Iterator
@@ -25,14 +29,7 @@ from foregent.agents.base import (
     LaunchSpec,
     issue_key_from_label,
 )
-
-# herdr's name for the Claude Code integration, and the detection manifest
-# it loads to read that agent's state off the screen.
-KIND = "claude"
-
-# Full permissions on a dedicated box. Not a LaunchSpec field: it is a property
-# of how foregent runs agents at all, not of any one agent.
-PERMISSION_MODE = "bypassPermissions"
+from foregent.agents.harness import harness_for, provider_for_kind
 
 # herdr's own budget for getting a process up and detected. Generous: a cold
 # Claude Code start on a loaded box is slow, and the cost of being wrong is a
@@ -107,47 +104,8 @@ _STATUS = {
 }
 
 
-def render_args(spec: LaunchSpec) -> list[str]:
-    """The ``claude`` flags a ``LaunchSpec`` asks for.
-
-    The binary itself is herdr's to supply — ``agent.start`` prepends it
-    from the agent kind's manifest.
-    """
-    argv: list[str] = []
-    if spec.conversation_id:
-        # --resume continues the recorded conversation; --session-id names a
-        # new one. Passing both is a contradiction, so they are exclusive.
-        argv += (
-            ["--resume", spec.conversation_id]
-            if spec.resume
-            else ["--session-id", spec.conversation_id]
-        )
-    if spec.model:
-        argv += ["--model", spec.model]
-    if spec.effort:
-        argv += ["--effort", spec.effort]
-    argv += ["--permission-mode", PERMISSION_MODE]
-    if spec.system_prompt:
-        argv += ["--append-system-prompt", spec.system_prompt]
-    if spec.tools_allow:
-        argv += ["--allowedTools", *spec.tools_allow]
-    if spec.tools_deny:
-        argv += ["--disallowedTools", *spec.tools_deny]
-    if spec.mcp_servers:
-        argv += ["--mcp-config", json.dumps({"mcpServers": dict(spec.mcp_servers)})]
-    if spec.strict_mcp:
-        # Independent of the declaration above: this one says to ignore
-        # whatever MCP config the machine already has, so what foregent
-        # declares is exactly what the agent gets.
-        argv += ["--strict-mcp-config"]
-    # Display name in the TUI, /resume picker and terminal title — what an
-    # attached operator reads to tell agents apart.
-    argv += ["-n", spec.label]
-    return argv
-
-
-class HerdrClaudeManager:
-    """Runs Claude Code agents through one herdr server."""
+class HerdrManager:
+    """Runs agents through one herdr server, whatever harness they run."""
 
     def __init__(
         self,
@@ -183,14 +141,15 @@ class HerdrClaudeManager:
         )
         pane_id = workspace["root_pane"]["pane_id"]
         workspace_id = workspace["workspace"]["workspace_id"]
+        harness = harness_for(spec.provider)
         try:
             self._call(
                 "agent.start",
                 {
                     "name": spec.label,
-                    "kind": KIND,
+                    "kind": harness.kind,
                     "pane_id": pane_id,
-                    "args": render_args(spec),
+                    "args": harness.render_args(spec),
                     "timeout_ms": START_MS,
                 },
                 timeout=herdr.timeout_for_wait(START_MS),
@@ -299,6 +258,11 @@ class HerdrClaudeManager:
         Agents herdr knows about but foregent did not launch — an operator's
         own pane in the same session — are skipped: they have no foregent
         label, so they are not ours to reconcile.
+
+        **Which harness each one runs comes back with it**, out of the agent
+        kind herdr detected. That is what makes the provider recoverable after
+        a restart without foregent persisting it, the same way the issue key
+        comes back out of the label (docs/ARCHITECTURE.md §5.3).
         """
         records = []
         for agent in self._call("agent.list").get("agents", []):
@@ -310,6 +274,7 @@ class HerdrClaudeManager:
                     ref=AgentRef(label, _conversation_id_of(agent)),
                     status=_status_of(agent),
                     cwd=agent.get("cwd") or "",
+                    provider=provider_for_kind(agent.get("agent") or ""),
                 )
             )
         return records

@@ -51,6 +51,17 @@ only one possible. Everything harness-specific — the argv, the status
 mapping, the socket calls — sits behind `AgentManager` (§7). Nothing above
 that seam knows what an agent is running.
 
+**Which harness runs an agent is a `Provider`**, carried on the launch spec
+and reported back on every live agent. It is not derived the way a project's
+mode is (§6.4): which harness works an issue is not a property of the
+repository, so there is nothing in it to read the answer off.
+
+**One manager serves every harness**, because herdr is what normalizes them.
+herdr owns the detection manifest that reads each agent's state off its
+screen, so a pane is prompted, read, waited on and closed by the same call
+whatever runs in it. Only starting one differs, in the agent kind and the
+argv, and both are looked up from the provider.
+
 ### 1.4 Linear and herdr hold the state
 
 The bridge keeps no persistent store. Linear holds issue truth and ownership;
@@ -131,8 +142,10 @@ the bridge through the foregent MCP server.
 | `linear.py` | Linear GraphQL client: claim an issue, close it, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
 | `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server; the bridge's own reach is one GET, for the one delivery that names no branch. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
-| `agents/base.py` | The `AgentManager` protocol and its types. Harness-agnostic. |
-| `agents/herdr_claude.py` | The one implementation: renders a `LaunchSpec` to `claude` flags, drives `workspace.create` → `agent.start` → `agent.prompt`, translates herdr's events. |
+| `agents/base.py` | The `AgentManager` protocol and its types, `Provider` among them. Harness-agnostic. |
+| `agents/herdr_manager.py` | The one implementation: drives `workspace.create` → `agent.start` → `agent.prompt` and translates herdr's events, for every harness. |
+| `agents/harness.py` | Which herdr agent kind a provider names, and which module renders its argv. |
+| `agents/claude.py` | Claude Code's own half: the agent kind, and the flags a `LaunchSpec` renders to. |
 | `workspaces.py` | Per-issue jj workspaces: create at dispatch, carry the `.worktreeinclude` files in, remove at completion, and record the path as trusted for Claude Code. |
 | `mcp_servers.py` | Installs Linear and GitHub MCP into the machine's user-level Claude Code config. |
 | `skills/` | The packaged `foregent-worker` skill and its installer. |
