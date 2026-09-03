@@ -157,25 +157,35 @@ the bridge through the foregent MCP server.
 
 ### 4.1 Dispatch
 
-`foregent queue JIM-42 --directory <path>` records the issue as Queued, then:
+`foregent queue JIM-42 --directory <path> [--provider <harness>]` records the
+issue as Queued against that repo and that harness, then:
 
 1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
    time in bootstrap mode, up to `FOREGENT_MAX_AGENTS` in pull request mode.
    Every in-flight issue holds a slot; anything else waits.
-2. **Skills.** Every packaged skill is written first, over whatever is there.
-   Claude Code picks up live edits to a skill directory, but only one that
-   existed when the session started, so this must finish before launch.
+2. **Skills.** Every packaged skill is written first, over whatever is there,
+   into the skill directory of the harness this issue names. Claude Code picks
+   up live edits to a skill directory, but only one that existed when the
+   session started, so this must finish before launch.
 3. **Claim.** Assignee and In Progress are set in Linear in one step. Nothing
    is dispatched without a durable ownership record.
 4. **Workspace.** A fresh jj workspace is built from the queued repo, named
    for the issue key, and the repo's `.worktreeinclude` files are copied into
    it (§6.5). Before the launch, because it is the agent's cwd.
-5. **Launch.** A herdr workspace opens at that directory and Claude Code
-   starts in it, with a conversation id foregent generates rather than
-   scrapes.
-6. **Brief.** The agent is prompted with `/foregent-worker JIM-42 bootstrap`
-   or `… pull-request`, so the lifecycle has one definition — the skill — and
-   the mode is told to the agent rather than looked up by it (§6.4).
+5. **Launch.** A herdr workspace opens at that directory and the named
+   harness starts in it, with a conversation id foregent generates rather than
+   scrapes — for Claude Code, which takes one; Codex records its own, which
+   herdr reports back (§6.1).
+6. **Brief.** The agent is prompted with the skill, the issue and the mode —
+   `/foregent-worker JIM-42 bootstrap` for Claude Code, a sentence naming the
+   same three for Codex (§6.2) — so the lifecycle has one definition, the
+   skill, and the mode is told to the agent rather than looked up by it
+   (§6.4).
+
+**The harness is the operator's answer and the mode is the repository's.**
+Which harness works an issue is not a property of the repo, so there is
+nothing in it to derive one from; how work lands there is, so `--provider` is
+a flag and the mode is not (§1.3, §6.4).
 
 One call launches until the queue is empty or the next issue does not fit, so
 a completion can start more than one agent where the queue has been waiting on
@@ -461,10 +471,17 @@ in a workspace labeled with the uppercase key. The name is the binding: it is
 unique among live agents and the issue key parses back out of it, so nothing
 about a running agent needs persisting to find it again.
 
+The harness is not in the name and does not need to be: herdr reports the
+agent kind it detected, and `Provider`'s values are those kinds.
+
 ### 5.4 What a restart recovers
 
 One `agent.list` against herdr rebuilds the issue-to-agent map from the
-labels, finding every live agent including parked ones.
+labels, finding every live agent including parked ones. **Which harness each
+one runs comes back with it**, from the agent kind in that same listing; an
+agent of a kind foregent does not know reads as the default, which costs
+nothing, because the provider decides a brief, a skill directory and a
+workspace's trust and this issue was dispatched already.
 
 **Whether an agent was parked comes back with it**, from the status in that
 same listing rather than from the label, which does not record it: an agent

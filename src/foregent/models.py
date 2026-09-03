@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
-from foregent.agents import AgentRef
+from foregent.agents import DEFAULT_PROVIDER, AgentRef, Provider
 
 
 class Mode(StrEnum):
@@ -64,6 +64,10 @@ class Issue:
     status: IssueStatus = IssueStatus.TODO
     repo: str = ""
     directory: str = ""
+    # The harness the agent works this issue on, named by the operator at
+    # `foregent queue`. Recovered after a restart from the agent kind herdr
+    # reports, so nothing about it has to be persisted.
+    provider: Provider = DEFAULT_PROVIDER
     blocker: str = ""
     # The agent working this issue: where it runs, and the conversation it
     # holds. None until dispatch. The conversation id is the half that outlives

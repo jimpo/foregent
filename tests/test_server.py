@@ -27,6 +27,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from foregent import config, herdr, server
 from foregent.agents import (
+    DEFAULT_PROVIDER,
     AgentError,
     AgentEvent,
     AgentEventKind,
@@ -34,6 +35,7 @@ from foregent.agents import (
     AgentRef,
     AgentStatus,
     LaunchSpec,
+    Provider,
 )
 from foregent.models import Issue, IssueStatus, Mode
 from foregent.store import IN_FLIGHT, IssueStore
@@ -158,8 +160,13 @@ class DispatchTests(unittest.TestCase):
         )
         self.skill = self.config / "skills" / "foregent-worker" / "SKILL.md"
 
-    def queue(self, key: str = "JIM-88", directory: str = "/ws/JIM-88") -> None:
-        server.store.queue(key, directory)
+    def queue(
+        self,
+        key: str = "JIM-88",
+        directory: str = "/ws/JIM-88",
+        provider: Provider = Provider.CLAUDE,
+    ) -> None:
+        server.store.queue(key, directory, provider)
 
     def test_dispatch_claims_before_launching(self) -> None:
         # Nothing runs without a durable ownership record in Linear .
@@ -217,6 +224,41 @@ class DispatchTests(unittest.TestCase):
         # agent's assignment, and landing it mid-turn would interrupt work
         # it cannot have been given yet.
         self.assertEqual(self.manager.idle_gated, [True])
+
+    def test_the_queued_harness_is_what_is_launched(self) -> None:
+        # Which harness works an issue is the operator's answer, carried from
+        # `foregent queue` to the launch unchanged.
+        self.enterContext(
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(self.config / "codex")})
+        )
+        self.queue(provider=Provider.CODEX)
+        server.dispatch()
+        self.assertEqual(self.manager.launched[0].provider, Provider.CODEX)
+
+    def test_the_queued_harness_decides_the_brief(self) -> None:
+        # Codex has no slash form for a skill, so its brief names the skill in
+        # a sentence instead. An agent given the wrong one loads no skill.
+        self.enterContext(
+            mock.patch.dict(os.environ, {"CODEX_HOME": str(self.config / "codex")})
+        )
+        self.queue(provider=Provider.CODEX)
+        server.dispatch()
+        _, text = self.manager.sent[0]
+        self.assertNotIn("/foregent-worker", text)
+        self.assertIn("foregent-worker", text)
+        self.assertIn("JIM-88", text)
+        self.assertIn("bootstrap", text)
+
+    def test_the_queued_harness_is_the_one_provisioned(self) -> None:
+        # An agent is briefed from the skill on disk; writing it where the
+        # other harness reads would brief nobody.
+        codex_home = self.config / "codex"
+        self.enterContext(mock.patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}))
+        self.queue(provider=Provider.CODEX)
+        server.dispatch()
+        self.assertTrue(
+            (codex_home / "skills" / "foregent-worker" / "SKILL.md").is_file()
+        )
 
     def test_dispatch_installs_a_missing_skill_before_the_agent_starts(self) -> None:
         # Claude Code only watches skill directories that existed when the
@@ -812,6 +854,31 @@ class RebuildStoreTests(unittest.TestCase):
         for status in (AgentStatus.UNKNOWN, AgentStatus.BLOCKED):
             with self.subTest(status=status):
                 self.assertEqual(self.recover(status).status, IssueStatus.IN_PROGRESS)
+
+    def test_the_harness_an_agent_runs_comes_back_with_it(self) -> None:
+        # Off the agent kind herdr detected, so nothing about the provider has
+        # to be persisted to survive a restart.
+        self.rebuild(
+            FakeManager(
+                [
+                    AgentRecord(
+                        AgentRef("fg-jim-88", "abc"),
+                        AgentStatus.WORKING,
+                        "/ws",
+                        Provider.CODEX,
+                    )
+                ]
+            )
+        )
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.provider, Provider.CODEX)
+
+    def test_an_unattributable_agent_reads_as_the_default(self) -> None:
+        # A kind foregent does not know costs nothing here: the provider
+        # decides a brief, a skill directory and a workspace's trust, and this
+        # issue was dispatched already.
+        self.assertEqual(self.recover(AgentStatus.WORKING).provider, DEFAULT_PROVIDER)
 
     def test_agents_foregent_did_not_launch_are_ignored(self) -> None:
         self.rebuild(

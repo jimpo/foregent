@@ -217,6 +217,14 @@ def rebuild_store() -> None:
                 status=status,
                 repo=str(repo) if repo else "",
                 directory=record.cwd,
+                # Which harness the agent runs is the agent kind herdr
+                # detected, so this needs nothing persisted either. An agent
+                # of a kind foregent does not know reads as the default, which
+                # costs nothing: the provider decides a brief, a skill
+                # directory and a workspace's trust, and this issue has been
+                # dispatched already. What is left of its life — a prompt, a
+                # status, a stop — is the same call whatever it runs.
+                provider=record.provider or DEFAULT_PROVIDER,
                 blocker=RECOVERED_BLOCKER if status is IssueStatus.BLOCKED else "",
                 agent=record.ref,
             )
@@ -416,6 +424,7 @@ def _record(issue: Issue) -> dict[str, str]:
         "key": issue.key,
         "title": issue.title,
         "status": issue.status,
+        "provider": issue.provider,
         "blocker": issue.blocker,
     }
 
@@ -608,7 +617,7 @@ def _dispatch_one() -> bool:
         return False
     label = label_for(issue.key)
     repo = Path(issue.repo)
-    provider = DEFAULT_PROVIDER
+    provider = issue.provider
     ensure_skills(provider)
     try:
         linear.claim_issue(issue.key)
@@ -677,12 +686,21 @@ def list_issues() -> list[dict[str, str]]:
 
 
 @app.post("/issues/{key}/queue")
-def queue_issue(key: str, directory: Annotated[str, Body(embed=True)]) -> dict[str, str]:
+def queue_issue(
+    key: str,
+    directory: Annotated[str, Body(embed=True)],
+    provider: Annotated[Provider, Body(embed=True)] = DEFAULT_PROVIDER,
+) -> dict[str, str]:
     """Queue issue ``key`` against the repo at ``directory``, dispatching if free.
 
     ``directory`` is the project, not the agent's cwd: dispatch builds a
     per-issue workspace from it and runs the agent there
     (:mod:`foregent.workspaces`).
+
+    ``provider`` is which harness works it, and is the operator's to name
+    (§1.3) — unlike the mode, which is read off the repo. A harness foregent
+    does not run is refused here rather than at launch, where an issue would
+    already have been claimed.
     """
     existing = store.get(key)
     if existing is not None and existing.status in (
@@ -692,7 +710,7 @@ def queue_issue(key: str, directory: Annotated[str, Body(embed=True)]) -> dict[s
         raise HTTPException(
             status_code=409, detail=f"{key} is already {existing.status}"
         )
-    issue = store.queue(key, directory)
+    issue = store.queue(key, directory, provider)
     dispatch()
     return _record(store.get(key) or issue)
 

@@ -21,7 +21,7 @@ from typing import Any, cast
 from urllib.parse import quote, urlparse
 
 from foregent import __version__, mcp_servers, skills
-from foregent.agents import Provider
+from foregent.agents import DEFAULT_PROVIDER, Provider
 from foregent.config import LOG_LEVELS, api_url, log_level
 from foregent.models import Issue, IssueStatus
 
@@ -62,6 +62,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "The project repository (default: current directory). The agent "
             "runs in its own workspace built from it, not in it."
+        ),
+    )
+    queue.add_argument(
+        "-p",
+        "--provider",
+        default=DEFAULT_PROVIDER,
+        choices=[str(provider) for provider in Provider],
+        help=(
+            "The agent harness to work the issue on (default: %(default)s). "
+            "Unlike the mode, which foregent reads off the repository, this "
+            "is yours to choose."
         ),
     )
     queue.set_defaults(func=cmd_queue)
@@ -112,6 +123,7 @@ def fetch_issues() -> list[Issue]:
             key=r["key"],
             title=r["title"],
             status=IssueStatus(r["status"]),
+            provider=Provider(r.get("provider", DEFAULT_PROVIDER)),
             blocker=r.get("blocker", ""),
         )
         for r in records
@@ -148,7 +160,13 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     key_width = max(len("ISSUE"), *(len(issue.key) for issue in issues))
     status_width = max(len("STATUS"), *(len(issue.status) for issue in issues))
-    print(f"{'ISSUE':<{key_width}}  {'STATUS':<{status_width}}  TITLE")
+    # Which harness an issue runs on is worth a column of its own on a fleet
+    # running two: nothing else on the row says it.
+    provider_width = max(len("HARNESS"), *(len(issue.provider) for issue in issues))
+    print(
+        f"{'ISSUE':<{key_width}}  {'STATUS':<{status_width}}  "
+        f"{'HARNESS':<{provider_width}}  TITLE"
+    )
     for issue in issues:
         title = issue.title
         if issue.blocker:
@@ -156,6 +174,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(
             f"{issue.key:<{key_width}}  "
             f"{issue.status:<{status_width}}  "
+            f"{issue.provider:<{provider_width}}  "
             f"{title}"
         )
     return 0
@@ -165,7 +184,12 @@ def cmd_queue(args: argparse.Namespace) -> int:
     """Queue an issue on the server and print its resulting status."""
     request = urllib.request.Request(
         f"{api_url()}/issues/{quote(args.issue_id, safe='')}/queue",
-        data=json.dumps({"directory": os.path.abspath(args.directory)}).encode(),
+        data=json.dumps(
+            {
+                "directory": os.path.abspath(args.directory),
+                "provider": args.provider,
+            }
+        ).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
