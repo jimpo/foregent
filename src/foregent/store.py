@@ -1,18 +1,37 @@
-"""In-memory store of the issues foregent is tracking.
+"""The store of the issues foregent is tracking, and the file it lives in.
 
-The bridge is stateless: the authoritative record of
-live work lives in the agent harness and in Linear, and this store is only an
-in-memory cache rebuilt from those backends on startup.
+Three parties hold state, and the split is by what each can vouch for. Linear
+holds issue truth: ownership and status as the world sees them. The agent
+harness holds liveness: which agents exist and what each is doing. This store
+holds **foregent's own intent** — queue order, which agent was bound to which
+issue, what a parked agent said it was waiting for — which nothing else can
+rebuild, because nothing else was told. It is snapshotted to one JSON file on
+every write and read back at boot, where it is reconciled against the harness
+before anything trusts it (:func:`foregent.server.rebuild_store`).
 """
 
 from __future__ import annotations
 
+import json
+import logging
+import os
+import tempfile
 import threading
 from collections.abc import Iterator
 from dataclasses import replace
+from pathlib import Path
+from typing import Any
 
-from foregent.agents import DEFAULT_PROVIDER, Provider
+from foregent.agents import DEFAULT_PROVIDER, AgentRef, Provider
 from foregent.models import Issue, IssueStatus
+
+logger = logging.getLogger(__name__)
+
+# The shape of the state file. A file of any other version is not read: there
+# is no migration until there is a second version to migrate from, and
+# starting empty is exactly the position the bridge was in before it had a
+# file at all.
+STATE_VERSION = 1
 
 # An issue with a live agent working it, whether or not that agent is busy.
 # These are the states an event can be delivered into and the ones an issue can
@@ -21,12 +40,17 @@ IN_FLIGHT = (IssueStatus.IN_PROGRESS, IssueStatus.IN_REVIEW, IssueStatus.BLOCKED
 
 
 class IssueStore:
-    """A mutable, in-memory collection of issues keyed by issue key.
+    """A mutable collection of issues keyed by issue key, mirrored to a file.
 
-    Starts empty. **Each method is atomic**, because the bridge reaches this
-    store from several threads at once — the delivery drainers, the harness
-    event watcher, the MCP tools and the HTTP routes — and a read-modify-write
-    split across two of them loses one of the writes.
+    Given a ``path``, the store loads it on construction and rewrites it on
+    every change; given none, it is in memory only, which is what tests want.
+    Insertion order is the queue order, and the file keeps it.
+
+    **Each method is atomic**, because the bridge reaches this store from
+    several threads at once — the delivery drainers, the harness event
+    watcher, the MCP tools and the HTTP routes — and a read-modify-write split
+    across two of them loses one of the writes. The save runs under the same
+    lock, so the file is always some complete state the store was in.
 
     A sequence of calls is not atomic, and this lock does not pretend
     otherwise: a caller that reads the store and then writes what it read owns
@@ -36,14 +60,62 @@ class IssueStore:
     Reentrant, because the methods here call each other.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, path: Path | None = None) -> None:
         self._issues: dict[str, Issue] = {}
         self._lock = threading.RLock()
+        self._path = path
+        if path is not None:
+            self._issues = _load(path)
+
+    @property
+    def path(self) -> Path | None:
+        """The file this store is mirrored to, or ``None`` for in memory only."""
+        return self._path
 
     def add(self, issue: Issue) -> None:
-        """Insert or replace an issue by its key."""
+        """Insert or replace an issue by its key, and save.
+
+        **The one write point.** Every mutation below ends here, so the file
+        is rewritten exactly once per change and nothing can change the store
+        without changing the file.
+        """
         with self._lock:
             self._issues[issue.key] = issue
+            self._save()
+
+    def _save(self) -> None:
+        """Rewrite the state file atomically, if there is one.
+
+        The whole snapshot goes to a sibling temporary file, is fsynced, and
+        is renamed over the old one, so a reader — the next boot — sees either
+        the previous state or this one and never a torn file. A save that
+        fails is logged rather than raised: the store in memory is still
+        right, and the file is what a *restart* will read, so failing the
+        completion or the webhook that caused the write would trade a stale
+        snapshot for a stuck agent.
+        """
+        if self._path is None:
+            return
+        snapshot = {
+            "version": STATE_VERSION,
+            "issues": [_encode(issue) for issue in self._issues.values()],
+        }
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(
+                dir=self._path.parent, prefix=f".{self._path.name}."
+            )
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(snapshot, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self._path)
+            except BaseException:
+                os.unlink(tmp)
+                raise
+        except OSError as exc:
+            logger.error("could not save the issue store to %s: %s", self._path, exc)
 
     def get(self, key: str) -> Issue | None:
         """Return the issue with ``key``, or ``None`` if absent."""
@@ -77,7 +149,7 @@ class IssueStore:
                 provider=provider,
                 model=model,
             )
-            self._issues[key] = issue
+            self.add(issue)
             return issue
 
     def next_queued(self) -> Issue | None:
@@ -101,7 +173,7 @@ class IssueStore:
                 if existing is not None
                 else Issue(key=key, title="", status=IssueStatus.DONE)
             )
-            self._issues[key] = issue
+            self.add(issue)
             return issue
 
     def block(self, key: str, blocker: str) -> Issue:
@@ -119,7 +191,7 @@ class IssueStore:
                     key=key, title="", status=IssueStatus.BLOCKED, blocker=blocker
                 )
             )
-            self._issues[key] = issue
+            self.add(issue)
             return issue
 
     def unblock(self, key: str) -> Issue | None:
@@ -140,7 +212,7 @@ class IssueStore:
             if existing is None or existing.status is not IssueStatus.BLOCKED:
                 return None
             issue = replace(existing, status=IssueStatus.IN_PROGRESS, blocker="")
-            self._issues[key] = issue
+            self.add(issue)
             return issue
 
     def orphan(self, key: str) -> Issue | None:
@@ -161,7 +233,7 @@ class IssueStore:
             if existing is None or existing.status not in IN_FLIGHT:
                 return None
             issue = replace(existing, status=IssueStatus.ORPHANED, agent=None)
-            self._issues[key] = issue
+            self.add(issue)
             return issue
 
     def in_flight(self) -> list[Issue]:
@@ -187,3 +259,82 @@ class IssueStore:
     def __iter__(self) -> Iterator[Issue]:
         with self._lock:
             return iter(self.list_issues())
+
+
+def _encode(issue: Issue) -> dict[str, Any]:
+    """The JSON shape of one issue: every field, enums by value."""
+    return {
+        "key": issue.key,
+        "title": issue.title,
+        "status": issue.status.value,
+        "repo": issue.repo,
+        "directory": issue.directory,
+        "provider": issue.provider.value,
+        "model": issue.model,
+        "blocker": issue.blocker,
+        "agent": (
+            {
+                "label": issue.agent.label,
+                "conversation_id": issue.agent.conversation_id,
+            }
+            if issue.agent is not None
+            else None
+        ),
+    }
+
+
+def _decode(record: dict[str, Any]) -> Issue:
+    """The inverse of :func:`_encode`. Strict: a field it does not know how
+    to read raises, and the caller starts empty rather than guessing."""
+    agent = record["agent"]
+    return Issue(
+        key=record["key"],
+        title=record["title"],
+        status=IssueStatus(record["status"]),
+        repo=record["repo"],
+        directory=record["directory"],
+        provider=Provider(record["provider"]),
+        model=record["model"],
+        blocker=record["blocker"],
+        agent=(
+            AgentRef(agent["label"], agent["conversation_id"])
+            if agent is not None
+            else None
+        ),
+    )
+
+
+def _load(path: Path) -> dict[str, Issue]:
+    """The issues in ``path``, in file order, or none.
+
+    **Anything short of a readable file of the current version is an empty
+    store**, said in the log. A missing file is the ordinary first boot; a
+    file that does not parse, or names a version this code does not write, is
+    treated the same way rather than half-read, because a store built from a
+    guess about a record is worse than one built from the live agents alone —
+    which is exactly what the reconciliation that follows falls back to.
+    """
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        logger.info("no state file at %s; starting empty", path)
+        return {}
+    except OSError as exc:
+        logger.warning("could not read the state file %s: %s; starting empty", path, exc)
+        return {}
+    try:
+        data = json.loads(text)
+        version = data["version"]
+        if version != STATE_VERSION:
+            logger.warning(
+                "state file %s is version %r, not %d; starting empty",
+                path,
+                version,
+                STATE_VERSION,
+            )
+            return {}
+        issues = [_decode(record) for record in data["issues"]]
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        logger.warning("state file %s is unreadable: %r; starting empty", path, exc)
+        return {}
+    return {issue.key: issue for issue in issues}
