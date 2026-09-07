@@ -157,8 +157,9 @@ the bridge through the foregent MCP server.
 
 ### 4.1 Dispatch
 
-`foregent queue JIM-42 --directory <path> [--provider <harness>]` records the
-issue as Queued against that repo and that harness, then:
+`foregent queue JIM-42 --directory <path> [--provider <harness>] [--model
+<name>]` records the issue as Queued against that repo, that harness and, if
+one is named, that model, then:
 
 1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
    time in bootstrap mode, up to `FOREGENT_MAX_AGENTS` in pull request mode.
@@ -175,17 +176,22 @@ issue as Queued against that repo and that harness, then:
 5. **Launch.** A herdr workspace opens at that directory and the named
    harness starts in it, with a conversation id foregent generates rather than
    scrapes — for Claude Code, which takes one; Codex records its own, which
-   herdr reports back (§6.1).
+   herdr reports back (§6.1). A named model is passed as the harness's own
+   `--model`; an unnamed one is no flag at all, so the harness's default
+   applies rather than one foregent guessed.
 6. **Brief.** The agent is prompted with the skill, the issue and the mode —
    `/foregent-worker JIM-42 bootstrap` for Claude Code, a sentence naming the
    same three for Codex (§6.2) — so the lifecycle has one definition, the
    skill, and the mode is told to the agent rather than looked up by it
    (§6.4).
 
-**The harness is the operator's answer and the mode is the repository's.**
-Which harness works an issue is not a property of the repo, so there is
-nothing in it to derive one from; how work lands there is, so `--provider` is
-a flag and the mode is not (§1.3, §6.4).
+**The harness and the model are the operator's answers and the mode is the
+repository's.** Which harness works an issue, and which model it runs, are not
+properties of the repo, so there is nothing in it to derive them from; how
+work lands there is, so `--provider` and `--model` are flags and the mode is
+not (§1.3, §6.4). The model's name is not checked by foregent: each harness
+has its own vocabulary of them, and the harness is what refuses one it does
+not know.
 
 One call launches until the queue is empty or the next issue does not fit, so
 a completion can start more than one agent where the queue has been waiting on
@@ -481,7 +487,9 @@ labels, finding every live agent including parked ones. **Which harness each
 one runs comes back with it**, from the agent kind in that same listing; an
 agent of a kind foregent does not know reads as the default, which costs
 nothing, because the provider decides a brief, a skill directory and a
-workspace's trust and this issue was dispatched already.
+workspace's trust and this issue was dispatched already. Which model it runs
+does not come back, and need not: the model is used at launch only, and a
+recovered agent is already launched.
 
 **Whether an agent was parked comes back with it**, from the status in that
 same listing rather than from the label, which does not record it: an agent

@@ -75,6 +75,15 @@ def build_parser() -> argparse.ArgumentParser:
             "is yours to choose."
         ),
     )
+    queue.add_argument(
+        "-m",
+        "--model",
+        help=(
+            "The model the harness runs, in that harness's own naming "
+            "(default: the harness's own choice). Foregent does not check "
+            "the name; a model the harness does not know fails at launch."
+        ),
+    )
     queue.set_defaults(func=cmd_queue)
 
     setup = subparsers.add_parser(
@@ -188,6 +197,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             {
                 "directory": os.path.abspath(args.directory),
                 "provider": args.provider,
+                "model": args.model,
             }
         ).encode(),
         headers={"Content-Type": "application/json"},

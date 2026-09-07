@@ -54,6 +54,41 @@ class QueueProviderTests(unittest.TestCase):
         self.assertEqual(body["provider"], "codex")
 
 
+class QueueModelTests(unittest.TestCase):
+    """`queue --model`, the other thing about a dispatch the operator names."""
+
+    def parse(self, *argv: str) -> argparse.Namespace:
+        return cli.build_parser().parse_args(["queue", "JIM-42", *argv])
+
+    def post(self, *argv: str) -> dict:
+        """The request body `queue` sends for ``argv``."""
+        with mock.patch.object(cli.urllib.request, "urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = io.StringIO(
+                json.dumps({"key": "JIM-42", "status": "Queued"})
+            )
+            cli.main(["queue", "JIM-42", *argv])
+        return json.loads(urlopen.call_args.args[0].data)
+
+    def test_the_harness_chooses_by_default(self) -> None:
+        self.assertIsNone(self.parse().model)
+
+    def test_a_model_can_be_named(self) -> None:
+        self.assertEqual(self.parse("--model", "claude-opus-5").model, "claude-opus-5")
+
+    def test_any_name_is_accepted(self) -> None:
+        # Every harness has its own names for its models, and the harness is
+        # what refuses one it does not know; a list here would go stale.
+        self.assertEqual(self.parse("--model", "gpt-5.5").model, "gpt-5.5")
+
+    def test_the_request_names_the_model(self) -> None:
+        self.assertEqual(self.post("--model", "claude-opus-5")["model"], "claude-opus-5")
+
+    def test_an_unnamed_model_is_sent_as_none(self) -> None:
+        # The server reads a null as "let the harness choose", so nothing is
+        # guessed on the way through.
+        self.assertIsNone(self.post()["model"])
+
+
 class ServeLogLevelTests(unittest.TestCase):
     """`serve --log-level`, and the config dict it produces."""
 
