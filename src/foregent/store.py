@@ -55,6 +55,7 @@ class IssueStore:
         key: str,
         repo: str,
         provider: Provider = DEFAULT_PROVIDER,
+        model: str | None = None,
     ) -> Issue:
         """Mark issue ``key`` Queued against ``repo``, at the back of the queue.
 
@@ -62,9 +63,9 @@ class IssueStore:
         order, so :meth:`next_queued` needs no separate queue structure.
         Unknown keys are upserted, as in :meth:`complete`.
 
-        Only the repo and the harness are known here. The agent's own
-        directory is the workspace dispatch builds from them, so it is set
-        there.
+        Only the repo, the harness and the model are known here. The agent's
+        own directory is the workspace dispatch builds from them, so it is
+        set there.
         """
         with self._lock:
             existing = self._issues.pop(key, None) or Issue(key=key, title="")
@@ -74,6 +75,7 @@ class IssueStore:
                 repo=repo,
                 directory="",
                 provider=provider,
+                model=model,
             )
             self._issues[key] = issue
             return issue

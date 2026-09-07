@@ -21,7 +21,9 @@ Linear issue key and a directory; it claims the issue in Linear, opens a herdr
 workspace on that directory, starts an agent in it, and briefs it with the
 `foregent-worker` skill. The agent owns the issue end to end. Which harness it
 runs is yours to name — `--provider claude` or `--provider codex`, Claude Code
-by default — and nothing else about the dispatch changes with it.
+by default — and so is the model it runs, `--model`, which the harness chooses
+for itself when you name none. Nothing else about the dispatch changes with
+either.
 
 Linear pushes what happens next. A comment or a field change on an agent's own
 issue arrives at `POST /webhooks/linear`, is authenticated against the
@@ -254,6 +256,7 @@ server or credential the machine is missing.
 ```sh
 foregent queue JIM-42 -d ~/src/myrepo   # queue an issue against a repo
 foregent queue JIM-42 -d ~/src/myrepo --provider codex   # …on Codex instead
+foregent queue JIM-42 -d ~/src/myrepo --model claude-opus-5   # …on a named model
 foregent status                         # what is tracked, and its state
 ```
 
