@@ -32,8 +32,9 @@ whether it is working or parked on a blocker. Deliveries are queued, so the
 route answers Linear at once instead of waiting on a busy agent. GitHub pushes
 the other half: a review or a review comment on an agent's pull request arrives
 at `POST /webhooks/github` and reaches the same agent, matched by the issue its
-branch names. The agent reports back through two MCP tools the bridge serves:
-`report_blocked` and `complete_task`.
+branch names. The agent reports back through the MCP tools the bridge serves:
+`report_blocked`, `complete_task`, and `queue_sub_issues`, which hands its
+own sub-issues to the queue to be worked by agents of their own.
 
 The bridge keeps no database. Its issue → agent map is in memory and is rebuilt
 from the live herdr agents at startup.
@@ -271,7 +272,11 @@ agents run at once is the box's, not the project's**: up to
 at once, since a parked agent gives back the run slot it is not using. That
 holds in bootstrap mode too: agents there branch from the same `main`, and the
 bridge only ever advances it forward, so the second to finish is refused,
-rebases onto the `main` it can now see, and completes again. Dispatch assigns the
+rebases onto the `main` it can now see, and completes again. **A sub-issue is
+the exception**: an agent that queues its own sub-issues is about to park on
+them, holding a live slot the whole time, so its children need only a free run
+slot and `FOREGENT_MAX_AGENTS` binds what an operator queues rather than what
+a worker delegates. Dispatch assigns the
 issue to the foregent account in Linear and moves it to `In Progress`, and
 completion moves it to `Done` unless the agent already closed or cancelled it,
 so the team must have states with exactly those two names. A queued issue
@@ -318,6 +323,12 @@ git remotes and named in the brief — for foregent itself, as a pull request �
 then call `complete_task`.
 Completion tears the agent down and dispatches the next queued issue.
 
+An issue with sub-issues is not worked by one agent. The agent creates them
+in Linear, hands the keys to `queue_sub_issues`, and parks on them: each is
+dispatched to an agent, a workspace and a pull request of its own, and the
+parent is woken with one line per child that lands, so it can queue the next
+wave or finish.
+
 An agent that hits an external dependency calls `report_blocked` and **stays
 alive** in its workspace with its context intact. It keeps holding its live
 slot, so `FOREGENT_MAX_AGENTS` is in practice how many pull requests may be
@@ -363,7 +374,7 @@ state.
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
 | `FOREGENT_LOG_LEVEL` | What level `serve` logs at (default `info`), for uvicorn's loggers and foregent's own. `--log-level` overrides it. |
-| `FOREGENT_MAX_AGENTS` | How many agents hold a live slot at once — in flight, working or parked, in either mode (default 5). |
+| `FOREGENT_MAX_AGENTS` | How many agents hold a live slot at once — in flight, working or parked, in either mode (default 5). Operator-queued issues only: a sub-issue a worker delegates answers to the run limit alone. |
 | `FOREGENT_MAX_ACTIVE` | How many of those are actually worked at once (default 3, independent of `FOREGENT_MAX_AGENTS`). A parked agent gives back its run slot, so a fresh one can use it while others wait on review. |
 | `FOREGENT_STATE_FILE` | Where the bridge keeps the issues it is tracking (default `~/.local/state/foregent/state.json`). |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
@@ -372,7 +383,7 @@ state.
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 500 unit tests, ~9s
+uv run python -m unittest discover -s tests -t .   # 518 unit tests, ~9s
 uv run ty check                                    # type check
 ```
 

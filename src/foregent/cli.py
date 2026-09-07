@@ -134,6 +134,7 @@ def fetch_issues() -> list[Issue]:
             status=IssueStatus(r["status"]),
             provider=Provider(r.get("provider", DEFAULT_PROVIDER)),
             blocker=r.get("blocker", ""),
+            parent=r.get("parent") or None,
         )
         for r in records
     ]
@@ -178,6 +179,10 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     for issue in issues:
         title = issue.title
+        # Which parent delegated an issue is the only thing on the row that
+        # says why it is running while the live limit looks full.
+        if issue.parent:
+            title = f"{title}  (sub-issue of {issue.parent})"
         if issue.blocker:
             title = f"{title}  (blocked on {issue.blocker})"
         print(

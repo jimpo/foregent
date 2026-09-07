@@ -83,14 +83,31 @@ which it cannot: a label holds one issue key, so a Queued issue, with no
 agent, had nothing to survive in, and every feature that needed a field had
 to be designed to fit a name.
 
-### 1.5 One agent owns one issue, end to end
+### 1.5 One agent owns one issue, and hands its sub-issues to the queue
 
-There is no supervisor and no worker hierarchy. One agent reads the issue,
-drives its Linear status, writes the code, and closes it out. How it
-decomposes the work, including whether it spawns its own subagents, is its
-business. An issue that arrives already split into sub-issues is no different:
-the same agent does every child itself, as one pull request with at least one
-commit per sub-issue. Nothing dispatches a sub-issue on its own.
+One agent reads the issue, drives its Linear status, writes the code, and
+closes it out. How it decomposes the work inside its own workspace, including
+whether it spawns its own subagents, is its business.
+
+**Sub-issues are the exception, and they go to the queue** (JIM-250, design in
+JIM-198). The agent creates them in Linear, hands the keys to
+`queue_sub_issues`, and each is dispatched to an agent of its own with its own
+workspace and its own pull request. The parent writes no code for them: it
+parks with `report_blocked` and is told one line per child that lands, so it
+can queue the next wave, park again, or finish. That parked session, holding
+everything the parent worked out, is the supervisor — not a scheduler
+somewhere with a plan — and the queue is its executor.
+
+The alternative was one agent doing every child itself, as one pull request
+with a commit each. It runs a large feature at one-agent throughput however
+many slots are free, banks nothing until the last child is written, and
+produces the largest possible review, which is the worst shape for the thing
+that actually bounds throughput (§5.2).
+
+**The topology foregent keeps is one field**, `parent` on the issue record.
+Nothing reads the Linear tree, in either direction: the caller is trusted to
+have made the link, and the wake hangs off the stored parent rather than off
+what Linear says.
 
 ### 1.6 The blocker is a note, not a key
 
@@ -110,6 +127,13 @@ into them — but its CPU sits idle the whole time it waits on a review, and
 that is what the run slot measures. Waking is therefore two things where
 launching a fresh agent is one: the prompt, and first taking back a run slot,
 which a wake gets ahead of any launch waiting on the same slot (§4.1).
+
+**This is also what makes delegation workable** (§1.5, JIM-250). A parent
+parks for as long as its children take, holding a live slot the whole time,
+so a sub-issue is admitted on the run limit alone (§5.2). Charging children
+the live limit their parent filled would leave every parent waiting on work
+that cannot start. What the exemption does not survive is the queue's FIFO
+rule, which is checked first: see the head-of-queue stall in §5.2.
 
 ### 1.8 Events are foregent's own shape
 
@@ -179,11 +203,12 @@ the bridge through the foregent MCP server.
 <name>]` records the issue as Queued against that repo, that harness and, if
 one is named, that model, then:
 
-1. **Capacity.** Whether there is room for another agent (§5.2): up to
+1. **Capacity.** Whether there is room for this issue (§5.2): up to
    `FOREGENT_MAX_AGENTS` live and `FOREGENT_MAX_ACTIVE` working at once
    (JIM-248), in either mode. Every in-flight issue holds a live slot, and a
    working one holds a run slot too; a parked one gives its run slot back, and
-   a launch never takes one a wake is already waiting on (§1.7).
+   a launch never takes one a wake is already waiting on (§1.7). A sub-issue
+   answers to the run limit alone (JIM-250).
 2. **Skills.** Every packaged skill is written first, over whatever is there,
    into the skill directory of the harness this issue names. Claude Code picks
    up live edits to a skill directory, but only one that existed when the
@@ -218,6 +243,15 @@ a completion can start more than one agent where the queue has been waiting on
 capacity. The queue is strictly FIFO: an issue that does not fit stalls the
 ones behind it rather than being skipped, which keeps queue order from becoming
 a scheduling policy with a starvation question attached.
+
+**The queue has a second door.** `queue_sub_issues(issue_key, keys)`, an MCP
+tool a worker calls, queues each key at the back of the same queue against
+that worker's own repo, harness and model, records `issue_key` as its parent,
+and runs this same dispatch once. A key foregent is already running or has
+already queued is refused and left where it is, so a worker that calls twice
+with one wave changes nothing. What differs from an operator's `queue` is
+admission (§5.2) and that the child's completion is delivered to its parent
+(§4.3).
 
 Dispatch is not atomic. The deterministic agent label `fg-jim-42` is what
 makes that survivable: a retry after a failed brief adopts the running agent
@@ -387,8 +421,12 @@ says so, and that sentence is what the Blocked filter rests on.
 
 ### 4.3 Completion and blocking
 
-The agent calls one of two MCP tools the bridge serves at `/mcp`:
+The agent calls the MCP tools the bridge serves at `/mcp`:
 
+- **`queue_sub_issues(issue_key, keys)`** puts the caller's sub-issues on the
+  queue and dispatches (§4.1). The caller neither lands nor closes anything
+  by it; it is what a delegating parent does instead of writing the code
+  (§1.5).
 - **`report_blocked(issue_key, blocker)`** records the note and marks the
   issue Blocked. Nothing is terminated and the live slot does not change; the
   run slot does — it is given back, and dispatched against, the same call
@@ -426,6 +464,17 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
   would take them with it. The issue stays in flight, the workspace stays on
   disk, and the tool tells the agent to rebase onto `main`, resolve any
   conflicts, and call it again.
+
+**A completion tells the issue's parent, if it has one** (§1.5, JIM-250):
+`<key> is Done` is delivered to the parent agent in whatever state it is in —
+a working parent reads it as its next prompt, a parked one is woken by it. It
+is on the completion route rather than the tool, so an operator closing a
+child by hand wakes the parent too, and it is best-effort like the Linear
+close beside it. The child's own run slot is given back after the delivery is
+enqueued, which gives the parent's drainer a head start on that slot over the
+dispatch that follows — a head start and not a guarantee, since nothing
+orders the two, so a queued sibling may take it first and the parent waits
+for the next (§5.2).
 
 The tools are mounted in the bridge's own process, so they mutate the store
 directly instead of looping back over HTTP.
@@ -513,6 +562,26 @@ compile and test at once rather than by review latency, and only the memory
 and disk of a pull request left open bounds how many may be waiting at a
 time.
 
+**A sub-issue is gated on the run limit alone** (§1.5, JIM-250). It was
+queued by a worker that is about to park on it, and that parent holds a live
+slot for as long as its children take, so charging them the live limit their
+parent filled would leave it waiting on work that cannot start.
+`FOREGENT_MAX_AGENTS` is therefore enforced on operator-queued issues only,
+and the live count can exceed it by the number of agents delegation spawned.
+That is the trade: nothing here bounds a parent's children, so the parent
+bounds what it queues and the operator bounds how many parents run.
+
+**The exemption is reached only at the head of the queue, and that is a real
+stall** (JIM-198's accepted gap, restated because delegation sharpens it).
+`admits` is asked about the oldest queued issue and nothing else: a head that
+does not fit stops the loop rather than being skipped (§4.1). So an operator
+issue stuck at the head with the live limit full holds every sub-issue behind
+it, however many run slots are free — and since the parent of those
+sub-issues is parked *on* them, neither side moves until an operator
+intervenes. Skipping the head would fix it and would make queue order a
+scheduling policy with a starvation question attached, which is the trade
+§4.1 declines. Worth revisiting if it is ever hit in practice.
+
 **Waking a parked agent needs a run slot back, the same as a launch does, and
 it is served first** ("wake before fork"): a parked agent already holds the
 memory and disk a fresh launch would need built, so finishing its work is
@@ -545,7 +614,9 @@ writes a sibling temporary file, fsyncs it and renames it over the old one.
 The next boot therefore reads either the previous state or this one, never a
 torn file. The file is `FOREGENT_STATE_FILE`,
 `~/.local/state/foregent/state.json` by default, and carries a `version`
-beside the issues; the issues are a list, so queue order is file order. A
+beside the issues; the issues are a list, so queue order is file order. The
+version is bumped whenever a record gains a field, since the reader is strict
+about the ones it knows. A
 save that fails is logged at error level and the store in memory carries on:
 the file is what the *next* run reads, and failing the completion or the
 webhook that caused the write would trade a stale snapshot for a stuck agent.
@@ -554,16 +625,19 @@ webhook that caused the write would trade a stale snapshot for a stuck agent.
 file that will not parse, or names a version this code does not write, is
 logged and read as empty rather than half-read. Either way the bridge is
 where it stood before it had a file, and the reconciliation below rebuilds it
-from the live agents alone. There is no migration until there is a second
-version to migrate from. Then one `agent.list` against herdr, and each stored
+from the live agents alone; what a version bump actually costs is the queue.
+There is no migration, on the grounds that starting from the live agents is
+already the answer for a file that is not there. Then one `agent.list`
+against herdr, and each stored
 in-flight issue is checked against it:
 
 - **Its agent is gone → Orphaned.** The bridge was down when the agent
   exited, so nobody freed the slot; this does. Deciding what happens next —
   re-dispatch, defer, escalate — stays the scheduler's, as it is for an
   agent that dies while the bridge is up (§4.3).
-- **Its agent is live → the stored record stands**, title, repo, conversation
-  id and blocker text included, with whether it is parked taken from herdr's
+- **Its agent is live → the stored record stands**, title, repo, parent,
+  conversation id and blocker text included, with whether it is parked taken
+  from herdr's
   status: an agent that is not mid-turn has finished one and is waiting, which
   in this system means it parked. A stored working issue whose agent has
   since parked carries a placeholder blocker, because the words it chose
@@ -579,7 +653,9 @@ in-flight issue is checked against it:
   dispatched already — and parked or working from its status as above. The
   title is empty and the blocker a placeholder saying it is unknown, which is
   affordable because the blocker is a note and never a key (§1.6). This is
-  the whole of a boot with no file.
+  the whole of a boot with no file. It has no parent, so a sub-issue adopted
+  this way lands without telling the issue that delegated it (§4.3) — the
+  parent is parked and reachable, so an operator's comment is the repair.
 
 Queued, Done and Orphaned issues have no agent to check and come back as
 written. Getting the parked ones right matters beyond the operator's table: a
@@ -633,8 +709,8 @@ asymmetry costs nothing today, because resuming a conversation is unbuilt
 ### 6.2 The workflow lives in a skill
 
 `foregent-worker` tells the agent its lifecycle: reading its assignment, the
-mode rules, when to report blocked, when to call `complete_task`, and the
-rebase requirement. The brief is one line, so the lifecycle has one
+mode rules, when to delegate its sub-issues, when to report blocked, when to
+call `complete_task`, and the rebase requirement. The brief is one line, so the lifecycle has one
 definition. It names the issue and the mode (§6.4), which are the two things
 about the lifecycle the skill cannot work out for itself.
 

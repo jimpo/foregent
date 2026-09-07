@@ -529,6 +529,59 @@ class DispatchTests(unittest.TestCase):
         assert blocked is not None
         self.assertEqual(blocked.status, IssueStatus.BLOCKED)
 
+    def test_a_sub_issue_launches_on_a_run_slot_the_live_limit_denies(self) -> None:
+        # A parent parks on its children, holding a live slot and giving back
+        # its run slot (JIM-250). Charging the children the live limit their
+        # parent filled would leave the parent waiting on work that cannot
+        # start, so a sub-issue is gated on the run limit alone.
+        self.enterContext(
+            mock.patch.dict(
+                os.environ, {"FOREGENT_MAX_AGENTS": "1", "FOREGENT_MAX_ACTIVE": "2"}
+            )
+        )
+        self.queue("JIM-88", "/ws/repo")
+        server.dispatch()
+        server.block_issue("JIM-88", "waiting on JIM-89")
+
+        server.store.queue("JIM-89", "/ws/repo", parent="JIM-88")
+        server.dispatch()
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
+        )
+
+    def test_an_operator_issue_still_waits_for_a_live_slot(self) -> None:
+        # The same box, the same free run slot, and nothing to do with a
+        # parent: the live limit is what an operator queues against.
+        self.enterContext(
+            mock.patch.dict(
+                os.environ, {"FOREGENT_MAX_AGENTS": "1", "FOREGENT_MAX_ACTIVE": "2"}
+            )
+        )
+        self.queue("JIM-88", "/ws/repo")
+        server.dispatch()
+        server.block_issue("JIM-88", "a review of the PR")
+
+        self.queue("JIM-89", "/ws/repo")
+        server.dispatch()
+
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+    def test_a_sub_issue_still_waits_for_a_run_slot(self) -> None:
+        # The run limit is the one gate a sub-issue does answer to.
+        self.enterContext(
+            mock.patch.dict(
+                os.environ, {"FOREGENT_MAX_AGENTS": "5", "FOREGENT_MAX_ACTIVE": "1"}
+            )
+        )
+        self.queue("JIM-88", "/ws/repo")
+        server.dispatch()
+
+        server.store.queue("JIM-89", "/ws/repo", parent="JIM-88")
+        server.dispatch()
+
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
     def test_a_pending_wake_holds_back_a_fresh_dispatch(self) -> None:
         # "Wake before fork" (JIM-248): a parked agent's own drainer, already
         # waiting on a run slot, is served ahead of a fresh launch that would
@@ -1712,6 +1765,277 @@ class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issue.status, IssueStatus.DONE)
 
 
+class DelegationTests(unittest.TestCase):
+    """Handing sub-issues to the queue and hearing back (JIM-250).
+
+    A parent queues its children with ``queue_sub_issues``, parks on them,
+    and is told one line per child that lands. Both halves hang off the
+    ``parent`` on the issue record and nothing else: no Linear call is made
+    here, in either direction.
+    """
+
+    def setUp(self) -> None:
+        server.store = IssueStore()
+        self.manager = FakeManager()
+        self.enterContext(mock.patch.object(server, "manager", self.manager))
+        self.enterContext(mock.patch.object(server, "deliveries", {}))
+        self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
+        self.enterContext(mock.patch.object(server, "_waking", set()))
+        self.enterContext(mock.patch.object(server, "_claimed", set()))
+        self.enterContext(mock.patch.object(server.linear, "claim_issue"))
+        self.enterContext(mock.patch.object(server.linear, "close_issue"))
+        self.enterContext(
+            mock.patch.object(
+                server.workspaces, "mode_for", return_value=Mode.PULL_REQUEST
+            )
+        )
+        self.config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config)})
+        )
+        # A drainer outlives the dict it was started from, and is named for
+        # its issue key, so one left running here is one a later test looking
+        # for a drainer by name would find instead of its own. Registered
+        # after the patch above, so it runs before the dict is restored.
+        self.addCleanup(self.stop_drainers)
+        self.ref = AgentRef("fg-jim-88", "conversation-1")
+
+    @staticmethod
+    def stop_drainers() -> None:
+        for key in list(server.deliveries):
+            server.stop_deliveries(key)
+
+    def parent(self, status: IssueStatus = IssueStatus.IN_PROGRESS) -> None:
+        """A parent agent working ``/ws/repo`` on Codex, at ``status``."""
+        server.store.add(
+            Issue(
+                key="JIM-88",
+                title="",
+                status=status,
+                repo="/ws/repo",
+                directory="/ws/JIM-88",
+                provider=Provider.CODEX,
+                model="gpt-5",
+                blocker="waiting on JIM-89" if status is IssueStatus.BLOCKED else "",
+                agent=self.ref,
+            )
+        )
+
+    def child(self, key: str = "JIM-89") -> Issue:
+        issue = server.store.get(key)
+        assert issue is not None
+        return issue
+
+    def test_a_sub_issue_inherits_the_repo_harness_and_model_of_its_parent(
+        self,
+    ) -> None:
+        # The caller names keys and nothing else: a child works the same
+        # project on the same box, so the only sensible answers are its
+        # parent's.
+        self.parent()
+
+        server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertEqual(self.child().repo, "/ws/repo")
+        self.assertEqual(self.child().provider, Provider.CODEX)
+        self.assertEqual(self.child().model, "gpt-5")
+        self.assertEqual(self.child().parent, "JIM-88")
+
+    def test_queueing_sub_issues_dispatches_them(self) -> None:
+        self.parent()
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89", "JIM-90"])
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-89", "fg-jim-90"]
+        )
+        self.assertIn("JIM-89, JIM-90", answer)
+        self.assertIn("report_blocked", answer)
+
+    def test_a_key_already_running_is_refused_and_left_alone(self) -> None:
+        # The caller is trusted about the Linear tree but not about what
+        # foregent is already doing: re-queueing a live issue would strand
+        # its agent.
+        self.parent()
+        server.store.add(
+            Issue(
+                key="JIM-89",
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                agent=self.ref,
+            )
+        )
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89", "JIM-90"])
+
+        self.assertIsNone(self.child().parent)
+        self.assertEqual(self.child().status, IssueStatus.IN_PROGRESS)
+        self.assertIn("JIM-89 (In Progress)", answer)
+        self.assertEqual(self.child("JIM-90").parent, "JIM-88")
+
+    def test_a_key_already_queued_is_refused_and_keeps_its_place(self) -> None:
+        self.parent()
+        server.store.queue("JIM-89", "/other/repo")
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertEqual(self.child().repo, "/other/repo")
+        self.assertIsNone(self.child().parent)
+        self.assertIn("JIM-89 (Queued)", answer)
+
+    def test_a_child_that_already_landed_is_refused(self) -> None:
+        # A parent told to queue the next wave is one turn away from
+        # re-sending its whole list, and re-queueing a Done child re-claims it
+        # in Linear and does its work a second time.
+        self.parent()
+        server.store.add(
+            Issue(key="JIM-89", title="", status=IssueStatus.DONE, parent="JIM-88")
+        )
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertEqual(self.child().status, IssueStatus.DONE)
+        self.assertIn("JIM-89 (Done)", answer)
+        self.assertEqual(self.manager.launched, [])
+
+    def test_an_orphaned_child_can_be_queued_again(self) -> None:
+        # The counterpart: an agent that died is exactly what a parent should
+        # be able to retry.
+        self.parent()
+        server.store.add(
+            Issue(key="JIM-89", title="", status=IssueStatus.ORPHANED, parent="JIM-88")
+        )
+
+        server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-89"])
+
+    def test_a_parent_with_no_repo_queues_nothing(self) -> None:
+        # An adopted agent whose cwd was not a workspace comes back with no
+        # repo, and `Path("")` is the bridge's own checkout — dispatch would
+        # build the child's workspace inside foregent itself.
+        server.store.add(
+            Issue(
+                key="JIM-88",
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                repo="",
+                agent=self.ref,
+            )
+        )
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertIsNone(server.store.get("JIM-89"))
+        self.assertIn("no repo recorded", answer)
+
+    def test_a_call_that_queued_nothing_does_not_tell_the_caller_to_park(self) -> None:
+        # A refused key keeps the parent it already had, so its completion
+        # wakes that one. A caller told to park on it would wait forever.
+        self.parent()
+        server.store.add(
+            Issue(key="JIM-89", title="", status=IssueStatus.DONE, parent="JIM-77")
+        )
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertNotIn("report_blocked", answer)
+
+    def test_a_caller_foregent_is_not_tracking_queues_nothing(self) -> None:
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertIsNone(server.store.get("JIM-89"))
+        self.assertIn("not an issue foregent is tracking", answer)
+
+    def test_a_failed_dispatch_leaves_the_children_queued(self) -> None:
+        # The queue is the part that matters; the launch retries on the next
+        # queue or completion.
+        self.parent()
+        self.manager.fail_launch = AgentError("herdr is down")
+
+        answer = server._queue_sub_issues("JIM-88", ["JIM-89"])
+
+        self.assertEqual(self.child().status, IssueStatus.QUEUED)
+        self.assertIn("herdr is down", answer)
+
+    def test_a_landed_child_wakes_its_parked_parent(self) -> None:
+        self.parent(IssueStatus.BLOCKED)
+        server.store.add(
+            Issue(
+                key="JIM-89",
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                parent="JIM-88",
+                agent=AgentRef("fg-jim-89", "conversation-2"),
+            )
+        )
+
+        server.complete_issue("JIM-89")
+        drain_deliveries()
+
+        self.assertEqual(self.manager.sent, [(self.ref, "JIM-89 is Done.")])
+        parent = server.store.get("JIM-88")
+        assert parent is not None
+        self.assertEqual(parent.status, IssueStatus.IN_PROGRESS)
+
+    def test_a_landed_child_reaches_a_parent_that_is_still_working(self) -> None:
+        # A parent that queued a second wave and is busy on something else is
+        # told the same line, and stays as it was.
+        self.parent()
+        server.store.add(
+            Issue(
+                key="JIM-89",
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                parent="JIM-88",
+            )
+        )
+
+        server.complete_issue("JIM-89")
+        drain_deliveries()
+
+        self.assertEqual(self.manager.sent, [(self.ref, "JIM-89 is Done.")])
+        parent = server.store.get("JIM-88")
+        assert parent is not None
+        self.assertEqual(parent.status, IssueStatus.IN_PROGRESS)
+
+    def test_an_operator_issue_landing_tells_nobody(self) -> None:
+        self.parent()
+        server.store.add(Issue(key="JIM-89", title="", status=IssueStatus.IN_PROGRESS))
+
+        server.complete_issue("JIM-89")
+        drain_deliveries()
+
+        self.assertEqual(self.manager.sent, [])
+
+    def test_a_parent_foregent_is_no_longer_running_is_not_an_error(self) -> None:
+        # Best-effort, like the Linear close beside it: the child's work is
+        # landed whatever became of the parent.
+        server.store.add(
+            Issue(
+                key="JIM-89",
+                title="",
+                status=IssueStatus.IN_PROGRESS,
+                parent="JIM-88",
+            )
+        )
+
+        record = server.complete_issue("JIM-89")
+        drain_deliveries()
+
+        self.assertEqual(record["status"], IssueStatus.DONE)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_the_status_record_says_who_delegated_an_issue(self) -> None:
+        self.parent()
+        server.store.queue("JIM-89", "/ws/repo", parent="JIM-88")
+
+        records = {record["key"]: record for record in server.list_issues()}
+
+        self.assertEqual(records["JIM-89"]["parent"], "JIM-88")
+        self.assertEqual(records["JIM-88"]["parent"], "")
+
+
 class McpEndpointTest(unittest.IsolatedAsyncioTestCase):
     """The lifecycle tools answer over the transport an agent reaches them by.
 
@@ -1743,7 +2067,8 @@ class McpEndpointTest(unittest.IsolatedAsyncioTestCase):
                             {"issue_key": "JIM-1", "blocker": "a review"},
                         )
         self.assertEqual(
-            {tool.name for tool in tools.tools}, {"complete_task", "report_blocked"}
+            {tool.name for tool in tools.tools},
+            {"complete_task", "report_blocked", "queue_sub_issues"},
         )
         self.assertFalse(result.is_error)
         issue = server.store.get("JIM-1")
