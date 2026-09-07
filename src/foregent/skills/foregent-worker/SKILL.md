@@ -74,9 +74,14 @@ when you call `complete_task`, at the repo root where jj exports it to git.
 **Rebase onto `main` right before you complete.** Other bootstrap agents run
 beside you, and each one that lands moves `main` forward under you. Foregent
 only ever moves it forward, so it refuses a completion whose work is not
-descended from what `main` reached: `jj rebase -d main`, resolve any conflicts,
-and call `complete_task` again. You keep your workspace and your commits
-through a refusal, so a retry costs nothing but the rebase.
+descended from what `main` reached: `jj rebase -d main`, resolve every
+conflict, and call `complete_task` again. You keep your workspace and your
+commits through a refusal, so a retry costs nothing but the rebase.
+
+**Resolve every conflict before you complete.** jj keeps a conflicted commit
+as a commit, so nothing stops you committing one, and foregent refuses to
+publish work that carries one. Check with `jj log -r 'main..@-'` — a commit
+marked `(conflict)` is one to fix with `jj resolve` before you call the tool.
 
 **`pull-request`**: push a branch and open a PR through the GitHub MCP, then
 report yourself blocked on the review rather than waiting.

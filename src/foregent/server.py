@@ -783,12 +783,12 @@ def admits() -> bool:
     active by what it is told it can run at once
     (:func:`foregent.config.max_active`); nothing in the repository narrows
     either. In Pull Request mode each agent pushes its own branch and ``main``
-    is the reviewer's to move. In bootstrap mode two agents do branch from the
-    same ``main``, and jj is what makes that safe: completion moves the
-    bookmark fast-forward only, inside one operation under the repo lock
-    (§4.3), so the second agent to finish is refused rather than clobbering
-    the first, and rebasing onto the ``main`` it now sees is what lands it
-    (JIM-252).
+    is the reviewer's to move. In bootstrap mode two agents branch from the
+    same ``main``, and what makes that safe is the landing path rather than
+    anything here: completions are serialised and the bookmark only moves
+    fast-forward (:func:`foregent.workspaces.advance`), so the second agent to
+    finish is refused, and rebasing onto the ``main`` it can now see is what
+    lands it (JIM-252).
 
     **A wake waiting on a run slot is served before a fresh launch takes
     one** ("wake before fork"): while :data:`_waking` holds any key, this
@@ -1370,11 +1370,11 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
         logger.error("could not advance %s for %s: %s", workspaces.TRUNK, issue_key, exc)
         return (
             f"{issue_key} was not completed: {workspaces.TRUNK} could not be "
-            f"moved onto its work ({exc}). {workspaces.TRUNK} has moved on "
-            f"since this work was last rebased — another agent landed — and "
-            f"it only ever moves forward. The workspace is still there, and "
-            f"the commits are only in it. Rebase onto {workspaces.TRUNK}, "
-            f"resolve any conflicts, and call complete_task again."
+            f"moved onto its work ({exc}). The workspace is still there, and "
+            f"the commits are only in it. If {workspaces.TRUNK} moved on "
+            f"after this work was last rebased, or the rebase left conflicts, "
+            f"that is the cause: rebase onto {workspaces.TRUNK}, resolve every "
+            f"conflict, and call complete_task again."
         )
     return None
 

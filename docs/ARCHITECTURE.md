@@ -486,13 +486,23 @@ also raise how many run.
 counts against the live one. In pull request mode nothing in the repo
 constrains them: each agent pushes its own branch and `main` is the
 reviewer's to move. In bootstrap mode agents branch from the same `main`, and
-jj is what keeps that safe. Completion runs `jj bookmark move main --to
-<KEY>@-` (§4.3), which is fast-forward only and runs inside one jj operation
-under the repo lock, so two agents completing at once serialise there: the
-second sees a `main` that moved and is refused, with its issue still in flight
-and its workspace still on disk. Workspaces share one op log, so rebasing onto
-the new `main` and completing again lands it. Foregent holds no lock of its
-own for this, and rebases for nobody: a conflict needs the agent.
+the landing path is what keeps that safe (§6.5). Completion runs `jj bookmark
+move main --to <KEY>@-` under a lock the bridge holds, one advance at a time,
+and the move is fast-forward only: the second agent to complete is refused,
+with its issue still in flight and its workspace still on disk. Workspaces
+share one repo, so rebasing onto the `main` the first agent landed and
+completing again is what lands the second. The bridge rebases for nobody — a
+conflict needs the agent — and refuses work that carries one rather than
+publishing it.
+
+**The lock is not a formality, and jj alone is not enough.** jj is
+optimistically concurrent: two `bookmark move` commands that load the same
+operation both exit zero, and merging their divergent operation heads leaves
+`main` *conflicted*, naming both tips with git exported to whichever won. Both
+completions would then report success, both issues would close, and both
+workspaces would be destroyed with one agent's work reachable from nothing.
+The fast-forward refusal only answers the second agent if the second agent
+reads the first one's move, which is what the lock guarantees and jj does not.
 
 **A parked agent holds its live slot for the whole block, but gives back its
 run slot** (§1.7). This is what keeps a box busy while several agents wait on
@@ -764,10 +774,19 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   **`bookmark move` is fast-forward-only** without `--allow-backwards`, so jj
   refuses work that is not descended from `main` and leaves the bookmark where
   it was. The rebase requirement the worker skill states is enforced by jj for
-  free, with no ancestry revset of foregent's own to get wrong (§4.3). The move
-  also runs inside one jj operation under the repo lock, so it is what
-  serialises two bootstrap agents completing at once — foregent holds no lock
-  of its own for it (§5.2).
+  free, with no ancestry revset of foregent's own to get wrong (§4.3).
+
+  **The bridge holds a lock across the whole advance**, because that refusal
+  is only reached by an advance that has read the previous one (§5.2). One
+  process performs every advance on a box, so a process-wide lock is the whole
+  of it.
+
+  **A conflicted commit is refused before the bookmark moves.** jj publishes
+  one happily — the move exits zero, and the file git ends up with is one side
+  of the conflict under a commit message claiming the other — so the range
+  about to be published is checked for conflicts and the agent is sent back to
+  resolve them. Rebasing onto a `main` another agent just landed on is the
+  ordinary way to acquire one.
 - **A secondary workspace names the repo it belongs to.** Its `.jj/repo` is a
   file holding the path of the shared repo directory, so the repo a teardown
   has to run `forget` in can be read back out of the agent's cwd. That is how

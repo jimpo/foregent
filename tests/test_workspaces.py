@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import tomllib
 import unittest
 from pathlib import Path
@@ -188,6 +189,67 @@ class WorkspaceTest(unittest.TestCase):
             workspaces.advance(self.repo, "JIM-1")
 
         self.assertIn("backwards or sideways", str(caught.exception))
+        self.assertEqual(_git_head(self.repo), "another issue landed")
+
+    def test_two_agents_landing_at_once_land_one_at_a_time(self) -> None:
+        """Concurrent bootstrap completions must not both move ``main`` (JIM-252).
+
+        jj is optimistically concurrent: two ``bookmark move`` commands that
+        loaded the same operation both exit zero, and merging their divergent
+        heads leaves ``main`` conflicted — naming both tips, with git on
+        whichever won. Both issues would then complete and both workspaces be
+        destroyed with one agent's work reachable from nothing. Serialising is
+        what turns the second one into the refusal the agent can act on.
+        """
+        first = workspaces.create(self.repo, "JIM-1")
+        second = workspaces.create(self.repo, "JIM-2")
+        self.commit(first, "the first agent's work", "b.txt")
+        self.commit(second, "the second agent's work", "c.txt")
+
+        failures: list[Exception] = []
+
+        def land(key: str) -> None:
+            try:
+                workspaces.advance(self.repo, key)
+            except workspaces.WorkspaceError as exc:
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=land, args=(key,)) for key in ("JIM-1", "JIM-2")
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("backwards or sideways", str(failures[0]))
+        self.assertNotIn("conflict", jj(self.repo, "bookmark", "list").lower())
+        self.assertIn(
+            _git_head(self.repo),
+            ("the first agent's work", "the second agent's work"),
+        )
+
+    def test_advance_refuses_work_that_still_holds_a_conflict(self) -> None:
+        """A rebase onto a moved ``main`` can conflict, and jj will publish it.
+
+        ``bookmark move`` exits zero on a conflicted commit, and what git ends
+        up holding is one side of the conflict under a commit message claiming
+        the other — after which the issue completes and the workspace is
+        removed. The agent has to be sent back instead.
+        """
+        path = workspaces.create(self.repo, "JIM-1")
+        # Another agent lands a change to the file this one is editing.
+        (self.repo / "a.txt").write_text("landed elsewhere\n")
+        jj(self.repo, "commit", "-m", "another issue landed")
+        jj(self.repo, "bookmark", "set", "main", "-r", "@-")
+        self.commit(path, "the agent's work", "a.txt")
+        jj(path, "rebase", "-d", "main")
+
+        with self.assertRaises(workspaces.WorkspaceError) as caught:
+            workspaces.advance(self.repo, "JIM-1")
+
+        self.assertIn("conflict", str(caught.exception))
         self.assertEqual(_git_head(self.repo), "another issue landed")
 
     def test_advance_leaves_a_plain_directory_alone(self) -> None:
