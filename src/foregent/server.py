@@ -75,8 +75,12 @@ async def lifespan(_app: FastAPI):
     logger.info("running agents in %s", manager.describe())
     await run_in_threadpool(check_herdr_protocol)
     await run_in_threadpool(check_agent_mcp)
+    await run_in_threadpool(open_store)
     await run_in_threadpool(rebuild_store)
     watch_agents()
+    # Whatever came back Queued has been waiting since before the restart,
+    # and nothing else dispatches until the next queue or completion.
+    await run_in_threadpool(dispatch_at_boot)
     # mounting the streamable-HTTP sub-app below does not run *its* lifespan,
     # so the session manager has to be driven from here instead. By the time
     # this runs (server startup), `mcp.streamable_http_app()` has already
@@ -88,9 +92,10 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="foregent", lifespan=lifespan)
 
-# The single, process-wide issue store this server serves. Empty until
-# rebuild_store() runs at startup (JIM-52); Linear-side rebuild (titles etc.)
-# lands with the rest of the bridge.
+# The single, process-wide issue store this server serves. In memory only
+# until open_store() swaps in the persisted one at startup, so importing this
+# module reads nothing off the box; rebuild_store() then reconciles what the
+# file held against the live agents (JIM-249).
 store = IssueStore()
 
 # The harness foregent runs agents on. One process-wide manager, swapped
@@ -173,62 +178,132 @@ _RECOVERED = {
 RECOVERED_BLOCKER = "unknown — recovered at restart"
 
 
+def open_store() -> None:
+    """Replace the store with the one persisted at :func:`config.state_file`.
+
+    Everything the file holds is foregent's own intent — queue order, agent
+    bindings, blockers — and none of it is trusted about the world until
+    :func:`rebuild_store` has checked it against the harness.
+    """
+    global store
+    store = IssueStore(config.state_file())
+    logger.info("issue store at %s: %d issues", store.path, len(store))
+
+
 def rebuild_store() -> None:
-    """Reconstruct the issue<->agent map from live agents (JIM-52).
+    """Reconcile the loaded store against the live agents (JIM-52, JIM-249).
 
-    The store is a volatile in-memory cache; on startup
-    every dispatched agent is recovered by parsing the issue key out of its
-    label. Best-effort: a harness hiccup logs and leaves the store empty
-    rather than blocking startup.
+    Linear holds issue truth, the harness holds liveness, and the store holds
+    what foregent meant to do; one ``agent.list`` is where the last two meet.
+    Every stored in-flight issue is checked against it:
 
-    **Whether an agent was parked is recovered too**, from the harness's own
-    status rather than from the label, which does not record it
-    (``_RECOVERED``). Getting it back matters beyond the operator's table: a
-    push to ``main`` wakes the issues that are Blocked
-    (:func:`wake_on_push`), and in Pull Request mode the steady state is a
-    fleet of agents all waiting on review, so a restart that returned them all
-    as working left that wake with nobody to find.
+    - **Its agent is gone → Orphaned.** The slot is freed, as it would have
+      been had the bridge been up to see the agent exit.
+    - **Its agent is live → the stored record stands**, title, blocker text
+      and conversation id included, with whether it is parked taken from the
+      harness (``_RECOVERED``). A status that says nothing — the state could
+      not be read, or the agent is waiting on input rather than on the world
+      — leaves the stored status as it was: the record is evidence, and the
+      guess it used to fall back to was only ever for having none.
+    - **A live agent the store does not know is adopted**, as a restart with
+      no file at all recovers it: the issue key out of its label, the repo
+      out of its cwd, the harness out of its kind, and a placeholder for the
+      blocker whose words died with the old process.
+
+    Queued issues need no reconciling; they have no agent to check and come
+    back in the order they were queued.
+
+    Best-effort: a harness that cannot be reached logs and leaves the store
+    as the file had it, rather than blocking startup or forgetting what was
+    written. The drainers already cope with an agent that cannot be reached.
     """
     try:
         agents = manager.list_agents()
     except AgentError as exc:
         logger.warning("rebuild_store: agent harness unreachable: %s", exc)
         return
+    live: dict[str, AgentRecord] = {}
     for record in agents:
         key = issue_key_from_label(record.ref.label)
-        if key is None:
+        if key is not None:
+            live[key] = record
+    for issue in store.in_flight():
+        record = live.pop(issue.key, None)
+        if record is None:
+            logger.warning("agent for %s is gone since the last run; issue orphaned", issue.key)
+            store.orphan(issue.key)
             continue
-        # Either status holds the capacity slot and prevents a double launch;
-        # which one it is decides whether a push to `main` reaches the agent.
-        # Full orphan reconciliation stays out of scope here.
-        status = _RECOVERED.get(record.status, IssueStatus.IN_PROGRESS)
-        # `repo` is read back out of the workspace the agent is sitting in,
-        # not remembered: a restart between dispatch and completion is the
-        # ordinary case — the operator merges an agent's pull request and
-        # picks the change up — and teardown needs the repo to forget the
-        # workspace, so recovering an issue without it leaked a workspace
-        # every time (JIM-150). Empty for an agent whose cwd is not a
-        # workspace, which is the answer teardown wants there too.
-        repo = workspaces.repo_for(Path(record.cwd)) if record.cwd else None
-        store.add(
-            Issue(
-                key=key,
-                title="",
-                status=status,
-                repo=str(repo) if repo else "",
-                directory=record.cwd,
-                # Which harness the agent runs is the agent kind herdr
-                # detected, so this needs nothing persisted either. An agent
-                # of a kind foregent does not know reads as the default, which
-                # costs nothing: the provider decides a brief, a skill
-                # directory and a workspace's trust, and this issue has been
-                # dispatched already. What is left of its life — a prompt, a
-                # status, a stop — is the same call whatever it runs.
-                provider=record.provider or DEFAULT_PROVIDER,
-                blocker=RECOVERED_BLOCKER if status is IssueStatus.BLOCKED else "",
-                agent=record.ref,
-            )
-        )
+        store.add(_reconciled(issue, record))
+    for key, record in live.items():
+        store.add(_adopted(key, record))
+
+
+def _reconciled(issue: Issue, record: AgentRecord) -> Issue:
+    """``issue`` as stored, with what the harness says about its agent.
+
+    Only the status moves, and only where the harness's own says which way.
+    A blocker survives where the issue stays parked; one the store never had
+    — the bridge went down while the agent worked, and it parked since — is
+    the same placeholder an adopted agent gets.
+    """
+    status = _RECOVERED.get(record.status)
+    if record.status is AgentStatus.WORKING:
+        status = IssueStatus.IN_PROGRESS
+    if status is None or status is issue.status:
+        return issue
+    blocker = (issue.blocker or RECOVERED_BLOCKER) if status is IssueStatus.BLOCKED else ""
+    return replace(issue, status=status, blocker=blocker)
+
+
+def _adopted(key: str, record: AgentRecord) -> Issue:
+    """An issue for a live agent the store did not know.
+
+    Whether it was parked comes from the harness's own status rather than from
+    the label, which does not record it. Getting it back matters beyond the
+    operator's table: a push to ``main`` wakes the issues that are Blocked
+    (:func:`wake_on_push`), and in Pull Request mode the steady state is a
+    fleet of agents all waiting on review, so a restart that returned them all
+    as working left that wake with nobody to find.
+    """
+    # Either status holds the capacity slot and prevents a double launch;
+    # which one it is decides whether a push to `main` reaches the agent.
+    status = _RECOVERED.get(record.status, IssueStatus.IN_PROGRESS)
+    # `repo` is read back out of the workspace the agent is sitting in: a
+    # secondary workspace names the repo it belongs to, and teardown needs it
+    # to forget the workspace (JIM-150). Empty for an agent whose cwd is not a
+    # workspace, which is the answer teardown wants there too.
+    repo = workspaces.repo_for(Path(record.cwd)) if record.cwd else None
+    return Issue(
+        key=key,
+        title="",
+        status=status,
+        repo=str(repo) if repo else "",
+        directory=record.cwd,
+        # Which harness the agent runs is the agent kind herdr detected. An
+        # agent of a kind foregent does not know reads as the default, which
+        # costs nothing: the provider decides a brief, a skill directory and
+        # a workspace's trust, and this issue has been dispatched already.
+        # What is left of its life — a prompt, a status, a stop — is the same
+        # call whatever it runs.
+        provider=record.provider or DEFAULT_PROVIDER,
+        blocker=RECOVERED_BLOCKER if status is IssueStatus.BLOCKED else "",
+        agent=record.ref,
+    )
+
+
+def dispatch_at_boot() -> None:
+    """Dispatch what the store came back with, without failing the boot.
+
+    A queued issue survives a restart now, and dispatch otherwise runs only on
+    a queue or a completion, so a bridge that came up with a queue and no
+    agents would sit until the operator queued something else. A failure here
+    is what it would be at the CLI, a 502 with a reason, and is logged as
+    such: the issue stays Queued and the next queue or completion retries.
+    """
+    try:
+        dispatch()
+    except HTTPException as exc:
+        logger.error("dispatch at boot failed: %s", exc.detail)
 
 
 def watch_agents() -> None:
