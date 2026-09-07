@@ -20,10 +20,17 @@ DEFAULT_API_URL = "http://127.0.0.1:8577"
 # no business living inside the checkout it was made from.
 DEFAULT_WORKSPACE_ROOT = "~/.foregent/workspaces"
 
-# How many agents may work at once in Pull Request mode (JIM-151). Bootstrap
-# mode is one whatever this says, because it is the repo's trunk that
-# serialises it rather than a policy anyone can raise.
-DEFAULT_MAX_AGENTS = 3
+# How many agents may hold a live slot at once in Pull Request mode (JIM-151):
+# in flight, working or parked. Bootstrap mode is one whatever this says,
+# because it is the repo's trunk that serialises it rather than a policy
+# anyone can raise.
+DEFAULT_MAX_AGENTS = 5
+
+# How many of those are actually worked at once (JIM-248), independent of the
+# live limit above: a smaller number here is what lets the live limit hold
+# more pull requests open for review than the box works at once, out of the
+# box, with nothing for an operator to set.
+DEFAULT_MAX_ACTIVE = 3
 
 # Where the bridge keeps its own record of the issues it is tracking
 # (JIM-249): queue order, agent bindings, blockers. Under the XDG state
@@ -66,12 +73,12 @@ def state_file() -> Path:
 
 
 def max_agents() -> int:
-    """How many agents may run at once (``FOREGENT_MAX_AGENTS``).
+    """How many agents may hold a live slot at once (``FOREGENT_MAX_AGENTS``).
 
-    The lever an operator has over a box: every parked agent goes on holding
-    its slot, so in Pull Request mode this is really the number of pull
-    requests that may be open and waiting for review at once, and what one box
-    and one reviewer can carry is the thing being tuned.
+    The lever an operator has over a box's memory and disk: every in-flight
+    issue holds one of these, working or parked, so in Pull Request mode this
+    is really the number of pull requests that may be open at once, and what
+    one box can carry is the thing being tuned (JIM-248).
 
     **Never less than one.** A value that cannot be read, or reads as zero,
     would otherwise stop dispatch on the whole box with nothing to say why.
@@ -88,6 +95,38 @@ def max_agents() -> int:
             DEFAULT_MAX_AGENTS,
         )
         return DEFAULT_MAX_AGENTS
+
+
+def max_active() -> int:
+    """How many agents may work at once (``FOREGENT_MAX_ACTIVE``), JIM-248.
+
+    The lever an operator has over a box's cores, as :func:`max_agents` is
+    over its memory and disk: a parked agent keeps its live slot but gives
+    this one back (docs/ARCHITECTURE.md §1.7), so in Pull Request mode this
+    is what bounds how many agents compile or run tests at once rather than
+    how many pull requests may be open.
+
+    **Defaults to :data:`DEFAULT_MAX_ACTIVE`, not to** :func:`max_agents`:
+    the two are tuned separately, so raising ``FOREGENT_MAX_AGENTS`` to hold
+    more pull requests open for review does not, on its own, also raise how
+    many run at once.
+
+    **Never less than one**, for the reason :func:`max_agents` is: a value
+    that cannot be read, or reads as zero, would otherwise stop every wake on
+    the whole box with nothing to say why.
+    """
+    setting = os.environ.get("FOREGENT_MAX_ACTIVE")
+    if not setting:
+        return DEFAULT_MAX_ACTIVE
+    try:
+        return max(1, int(setting))
+    except ValueError:
+        logger.warning(
+            "FOREGENT_MAX_ACTIVE is %r, which is not a number; running %d at once",
+            setting,
+            DEFAULT_MAX_ACTIVE,
+        )
+        return DEFAULT_MAX_ACTIVE
 
 
 def herdr_session() -> str | None:

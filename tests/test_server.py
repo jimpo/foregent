@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from collections.abc import Callable, Collection, Iterator
@@ -160,6 +161,10 @@ class DispatchTests(unittest.TestCase):
             mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config)})
         )
         self.skill = self.config / "skills" / "foregent-worker" / "SKILL.md"
+        # A fresh run-slot state per test, so a wake left waiting by an
+        # earlier test cannot hold a later one back (JIM-248).
+        self.enterContext(mock.patch.object(server, "_waking", set()))
+        self.enterContext(mock.patch.object(server, "_claimed", set()))
 
     def queue(
         self,
@@ -495,6 +500,111 @@ class DispatchTests(unittest.TestCase):
             [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
         )
 
+    def test_max_active_stops_launches_before_max_agents_does(self) -> None:
+        # The two limits are independent (JIM-248): a live limit wide enough
+        # to hold every issue still leaves the run limit to bind first.
+        self.pull_request()
+        self.enterContext(
+            mock.patch.dict(
+                os.environ, {"FOREGENT_MAX_AGENTS": "5", "FOREGENT_MAX_ACTIVE": "2"}
+            )
+        )
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, "/ws/repo")
+
+        server.dispatch()
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
+        )
+
+    def test_blocking_frees_a_run_slot_for_a_queued_issue(self) -> None:
+        # Block is sleep (JIM-248): the agent keeps its live slot but gives
+        # back its run slot, so a queued issue can start on it even though
+        # nothing frees the wider live limit.
+        self.pull_request()
+        self.enterContext(
+            mock.patch.dict(
+                os.environ, {"FOREGENT_MAX_AGENTS": "5", "FOREGENT_MAX_ACTIVE": "1"}
+            )
+        )
+        self.queue("JIM-88", "/ws/repo")
+        self.queue("JIM-89", "/ws/repo")
+        server.dispatch()
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+        server.block_issue("JIM-88", "a review of the PR")
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
+        )
+        blocked = server.store.get("JIM-88")
+        assert blocked is not None
+        self.assertEqual(blocked.status, IssueStatus.BLOCKED)
+
+    def test_a_pending_wake_holds_back_a_fresh_dispatch(self) -> None:
+        # "Wake before fork" (JIM-248): a parked agent's own drainer, already
+        # waiting on a run slot, is served ahead of a fresh launch that would
+        # otherwise take the same slot the moment it looks free.
+        self.pull_request()
+        self.queue("JIM-89")
+
+        with mock.patch.object(server, "_waking", {"JIM-88"}):
+            server.dispatch()
+        self.assertEqual(self.manager.launched, [])
+
+        # Nothing is waiting any more, so the same queued issue goes through.
+        server.dispatch()
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-89"])
+
+    def test_a_slow_launch_holds_its_run_slot_for_the_whole_launch(self) -> None:
+        # `_dispatch_one` claims a run slot for the span of the launch
+        # (JIM-248): `admits` passing and the store write that lands it are
+        # several harness calls apart, and a wake reading that gap as a free
+        # slot would overshoot the limit.
+        self.pull_request()
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_ACTIVE": "1"}))
+        self.queue("JIM-88")
+        launching = threading.Event()
+        proceed = threading.Event()
+
+        def slow_launch() -> None:
+            launching.set()
+            proceed.wait(5)
+
+        self.manager.at_launch = slow_launch
+        dispatched = threading.Thread(target=server.dispatch, daemon=True)
+        dispatched.start()
+        self.assertTrue(launching.wait(5))
+
+        other = AgentRef("fg-jim-99", "conversation-2")
+        server.store.add(
+            Issue(key="JIM-99", title="", status=IssueStatus.BLOCKED, agent=other)
+        )
+        granted = threading.Event()
+        waiter = threading.Thread(
+            target=lambda: granted.set()
+            if server._await_run_slot("JIM-99")
+            else None,
+            daemon=True,
+        )
+        waiter.start()
+
+        # JIM-88's launch is mid-flight and holds the one run slot; a wake
+        # for a different issue must wait rather than take it.
+        self.assertFalse(granted.wait(0.2))
+
+        proceed.set()
+        dispatched.join(5)
+        self.assertFalse(dispatched.is_alive())
+        # JIM-88 landed and now holds the slot on its own account, so the
+        # wake still waits.
+        self.assertFalse(granted.wait(0.2))
+
+        server.block_issue("JIM-88", "a review of the PR")
+        self.assertTrue(granted.wait(5))
+        waiter.join(5)
+
 
 class ModeTests(unittest.TestCase):
     """The mode an issue is briefed in and completed in (JIM-151)."""
@@ -533,6 +643,10 @@ class DeliverTests(unittest.TestCase):
         # The drainer paces its retries against a real agent's turn; nothing
         # here is really busy.
         self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
+        # A fresh run-slot state per test (JIM-248), for the reason the
+        # queues above get one.
+        self.enterContext(mock.patch.object(server, "_waking", set()))
+        self.enterContext(mock.patch.object(server, "_claimed", set()))
         self.ref = AgentRef("fg-jim-88", "conversation-1")
 
     def park(self, blocker: str = "a review of the PR") -> None:
@@ -576,6 +690,33 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
         self.assertEqual(self.issue().status, IssueStatus.IN_PROGRESS)
         self.assertEqual(self.issue().blocker, "")
+
+    def test_waking_a_parked_agent_waits_for_a_free_run_slot(self) -> None:
+        # Block is sleep and wake needs a run slot back (JIM-248): with none
+        # free, the drainer waits rather than sending, and takes the slot
+        # only once one is.
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_ACTIVE": "1"}))
+        busy = AgentRef("fg-jim-87", "conversation-2")
+        server.store.add(
+            Issue(key="JIM-87", title="", status=IssueStatus.IN_PROGRESS, agent=busy)
+        )
+        self.park()
+
+        server.deliver_issue("JIM-88", "AJ commented: ship it")
+
+        # The drainer has started waiting, since JIM-87 holds the one slot.
+        for _ in range(50):
+            if "JIM-88" in server._waking:
+                break
+            time.sleep(0.02)
+        self.assertIn("JIM-88", server._waking)
+        self.assertEqual(self.manager.sent, [])
+
+        server.block_issue("JIM-87", "something else")
+        drain_deliveries()
+
+        self.assertEqual(self.manager.sent, [(self.ref, "AJ commented: ship it")])
+        self.assertEqual(self.issue().status, IssueStatus.IN_PROGRESS)
 
     def test_a_working_agent_is_sent_to_and_left_as_it_was(self) -> None:
         # A worker sees activity on its own issue as it happens; it was never

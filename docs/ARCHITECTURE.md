@@ -101,8 +101,15 @@ issue: an event reaches the agent that owns the issue the event is about.
 ### 1.7 A blocked agent parks alive
 
 Nothing is terminated when an agent blocks. The process stays up and idle in
-its workspace, holding its context and its capacity slot, until the event it
+its workspace, holding its context and its live slot, until the event it
 needs arrives. Waking it is a prompt, not a relaunch.
+
+**Blocking is sleep, and it gives back the run slot** (§5.2, JIM-248). Memory
+and disk stay committed to the parked agent — nothing else can be launched
+into them — but its CPU sits idle the whole time it waits on a review, and
+that is what the run slot measures. Waking is therefore two things where
+launching a fresh agent is one: the prompt, and first taking back a run slot,
+which a wake gets ahead of any launch waiting on the same slot (§4.1).
 
 ### 1.8 Events are foregent's own shape
 
@@ -173,8 +180,11 @@ the bridge through the foregent MCP server.
 one is named, that model, then:
 
 1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
-   time in bootstrap mode, up to `FOREGENT_MAX_AGENTS` in pull request mode.
-   Every in-flight issue holds a slot; anything else waits.
+   time in bootstrap mode; in pull request mode, up to `FOREGENT_MAX_AGENTS`
+   live and `FOREGENT_MAX_ACTIVE` working at once (JIM-248). Every in-flight
+   issue holds a live slot, and a working one holds a run slot too; a parked
+   one gives its run slot back, and a launch never takes one a wake is
+   already waiting on (§1.7).
 2. **Skills.** Every packaged skill is written first, over whatever is there,
    into the skill directory of the harness this issue names. Claude Code picks
    up live edits to a skill directory, but only one that existed when the
@@ -381,7 +391,9 @@ says so, and that sentence is what the Blocked filter rests on.
 The agent calls one of two MCP tools the bridge serves at `/mcp`:
 
 - **`report_blocked(issue_key, blocker)`** records the note and marks the
-  issue Blocked. Nothing is terminated and capacity does not change.
+  issue Blocked. Nothing is terminated and the live slot does not change; the
+  run slot does — it is given back, and dispatched against, the same call
+  (§5.2, JIM-248).
 - **`complete_task(issue_key)`** advances `main` onto the issue's work in
   bootstrap mode, marks the issue Done here and in Linear, dispatches the next
   queued issue, stops the calling agent, and removes its jj workspace — in
@@ -452,34 +464,61 @@ queue or completion; a failure there is logged and leaves the issue Queued.
 with `Orphaned` for an in-flight issue whose agent is gone.
 
 In Progress, In Review and Blocked are the in-flight set: each means a live
-agent holds the capacity slot. `Queued` and `Orphaned` are foregent's own;
-the rest mirror Linear states.
+agent holds a live slot. `Queued` and `Orphaned` are foregent's own; the rest
+mirror Linear states. In Progress is also the only one of the three that
+holds a run slot (§5.2) — the other two are a live agent not currently being
+worked, whether it is under review or parked on one.
 
 ### 5.2 Capacity
 
-**How many agents run at once is the project's mode, not a number.**
+**How many agents run at once is the project's mode, not a number** — and,
+in pull request mode, two numbers rather than one (JIM-248). Capacity models
+the process scheduler: `FOREGENT_MAX_AGENTS` is RAM, bounding every live
+process and workspace; `FOREGENT_MAX_ACTIVE` is cores, bounding only the
+agents actually being worked right now. **The two are tuned separately and
+ship at different defaults on purpose** — 5 and 3 — so a box already holds
+more pull requests open for review than it works at once with nothing for an
+operator to set; raising `FOREGENT_MAX_AGENTS` to hold still more open does
+not, on its own, also raise how many run.
 
 - **Bootstrap: one at a time**, and the repo rather than policy is what says
   so. A workspace is built at `main` and completion fast-forwards `main` onto
   the agent's tip (§4.3), so two bootstrap agents branch from the same commit
   and the second cannot land what it wrote. Advancing before the next dispatch
-  is precisely what gives each agent a base holding the last one's work.
-- **Pull request: up to `FOREGENT_MAX_AGENTS`** (default 3). The agent pushes
-  its own branch and `main` is the reviewer's to move, so nothing in the repo
-  serialises it and the limit is only what one box and one reviewer can carry.
+  is precisely what gives each agent a base holding the last one's work. The
+  live limit of one already bounds the run limit too, so bootstrap mode has no
+  separate use for `FOREGENT_MAX_ACTIVE`.
+- **Pull request: up to `FOREGENT_MAX_AGENTS`** (default 5) **live, and up to
+  `FOREGENT_MAX_ACTIVE`** (default 3) **working**. The agent pushes its own
+  branch and `main` is the reviewer's to move, so nothing in the repo
+  serialises either limit, and what one box can carry is the thing being
+  tuned in both.
 
-The limit is set by the mode of the issue at the head of the queue, and every
-in-flight issue counts against it. A queued bootstrap issue therefore waits
-behind agents on any repo — over-strict only on a box hosting two projects,
-which §1.1 rules out, and the safe answer everywhere else. The mode is derived
-per call from the repo (§6.4), so it is never stored; an issue whose repo is
-unknown reads bootstrap, the serial answer.
+The live limit is set by the mode of the issue at the head of the queue, and
+every in-flight issue counts against it. A queued bootstrap issue therefore
+waits behind agents on any repo — over-strict only on a box hosting two
+projects, which §1.1 rules out, and the safe answer everywhere else. The mode
+is derived per call from the repo (§6.4), so it is never stored; an issue
+whose repo is unknown reads bootstrap, the serial answer.
 
-**A parked agent holds its slot for the whole block** (§1.7). In pull request
-mode the steady state is therefore N agents all waiting on review, so
-`FOREGENT_MAX_AGENTS` is in practice the number of pull requests that may be
-open at once, and throughput is bounded by review latency rather than by the
-box.
+**A parked agent holds its live slot for the whole block, but gives back its
+run slot** (§1.7). This is what keeps a box busy while several agents wait on
+review, by default and not only when an operator raises `FOREGENT_MAX_AGENTS`
+past `FOREGENT_MAX_ACTIVE` further: a fresh agent can be launched into the
+run slot a parked one gave up, so throughput is bounded by what the box can
+compile and test at once rather than by review latency, and only the memory
+and disk of a pull request left open bounds how many may be waiting at a
+time.
+
+**Waking a parked agent needs a run slot back, the same as a launch does, and
+it is served first** ("wake before fork"): a parked agent already holds the
+memory and disk a fresh launch would need built, so finishing its work is
+what actually frees the scarce resource, and it is the older work besides. A
+dispatch takes a run slot only when no wake is waiting on one, so a burst of
+comments across several parked agents cannot starve a review that already has
+a slot coming to it. Starvation the other way is theoretical: pending wakes
+are bounded by the number of parked agents, and each either lands and frees
+its slot back to the pool or re-parks having changed nothing.
 
 ### 5.3 The agent binding
 
@@ -934,7 +973,8 @@ installed.
 | `FOREGENT_API_URL` | CLI, agents | Where the bridge is. Default `http://127.0.0.1:8577`. |
 | `FOREGENT_HERDR_SESSION` | bridge | Which herdr session agents run in. |
 | `FOREGENT_WORKSPACE_ROOT` | bridge | Where per-issue workspaces are built. Default `~/.foregent/workspaces`. |
-| `FOREGENT_MAX_AGENTS` | bridge | Agents at once in pull request mode. Default 3; bootstrap is always one. |
+| `FOREGENT_MAX_AGENTS` | bridge | Live agents at once in pull request mode. Default 5; bootstrap is always one. |
+| `FOREGENT_MAX_ACTIVE` | bridge | Of those, how many actually work at once (§5.2). Default 3, independent of `FOREGENT_MAX_AGENTS`. |
 | `FOREGENT_STATE_FILE` | bridge | Where the issue store is persisted (§5.4). Default `~/.local/state/foregent/state.json`. |
 | `FOREGENT_LOG_LEVEL` | CLI | Default of `serve --log-level`. Default `info`. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |

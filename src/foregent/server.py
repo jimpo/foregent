@@ -122,6 +122,25 @@ _deliveries_lock = threading.Lock()
 # ponytail: one lock for the fleet; per-repo locks if launch latency matters.
 _dispatching = threading.Lock()
 
+# Run slots (JIM-248): In Progress, not the wider In Flight `admits` also
+# checks. A parked agent keeps its live slot but gives this one back, so
+# waking it needs one the same as a fresh launch does. `_run_slots` guards
+# both sets below and is notified whenever a run slot might have freed.
+_run_slots = threading.Condition()
+
+# Issue keys a drainer is currently trying to wake, granted a run slot or
+# still waiting for one. Non-empty, this is what makes `admits` refuse a
+# fresh launch: a parked agent already holds the memory and disk a new agent
+# would need built, finishing it is what frees them, and it is the older
+# work, so it is served first ("wake before fork").
+_waking: set[str] = set()
+
+# The subset of `_waking` granted a run slot and mid-send: what `_active`
+# adds to the store's own In Progress count, because sending happens before
+# unblocking (`send_queued`), so the store does not show the slot as taken
+# until the send lands.
+_claimed: set[str] = set()
+
 # How many recent Linear deliveries are remembered, newest last, to answer a
 # repeat of one already acted on. Linear retries a delivery it believes
 # failed, and a retried comment must not prompt a worker twice. The signature
@@ -393,6 +412,77 @@ def drain(key: str, pending: queue.Queue[str | None]) -> None:
             pending.task_done()
 
 
+def _active() -> int:
+    """Run slots taken right now: In Progress in the store, plus a wake
+    granted one and mid-send (:data:`_claimed`), JIM-248.
+
+    Caller holds :data:`_run_slots`.
+    """
+    working = sum(1 for tracked in store if tracked.status is IssueStatus.IN_PROGRESS)
+    return working + len(_claimed)
+
+
+def _await_run_slot(key: str) -> bool:
+    """Block the calling drainer until waking issue ``key`` can take a run slot.
+
+    Entering :data:`_waking` is what makes :func:`admits` hold a fresh launch
+    back while this call waits: a parked agent already holds the memory and
+    disk a new one would need built, so finishing it is what frees the
+    scarce resource, and it is the older work (JIM-248, "wake before fork").
+
+    Returns ``False`` if ``key`` stopped being worth waking while this
+    waited — its agent died, or something else already unblocked it — so the
+    caller drops the message instead of sending to whatever holds the key
+    next.
+    """
+    with _run_slots:
+        _waking.add(key)
+        try:
+            while True:
+                issue = store.get(key)
+                if issue is None or issue.status is not IssueStatus.BLOCKED:
+                    return False
+                if _active() < config.max_active():
+                    _claimed.add(key)
+                    return True
+                _run_slots.wait()
+        finally:
+            _waking.discard(key)
+
+
+def _give_back_run_slot(key: str | None = None) -> None:
+    """Notify anyone waiting on a run slot that one might have freed.
+
+    ``key`` is a claim in :data:`_claimed` to give up along with it — a
+    wake's own, or a fresh launch's own reservation for the span of its call
+    (:func:`_dispatch_one`) — since neither is reflected in the store's own
+    In Progress count until it lands; ``None`` for a slot freed by a plain
+    block or completion, which claimed nothing there.
+    """
+    with _run_slots:
+        if key is not None:
+            _claimed.discard(key)
+        _run_slots.notify_all()
+
+
+def _release_run_slot(key: str | None = None) -> None:
+    """Give back a run slot (:func:`_give_back_run_slot`), then dispatch
+    what is queued.
+
+    Notifying first is what gives a drainer already waiting in
+    :func:`_await_run_slot` first claim on the slot ahead of a fresh
+    dispatch (JIM-248, "wake before fork") — :func:`dispatch` reads the
+    store fresh regardless, so calling it too early only costs a queued
+    issue one more cycle of waiting.
+
+    Not for :func:`_dispatch_one` to call on its own claim: it already runs
+    inside :func:`dispatch`'s loop, and :data:`_dispatching` is not
+    reentrant.
+    """
+    _give_back_run_slot(key)
+    dispatch()
+
+
 def send_queued(key: str, message: str) -> None:
     """Deliver one queued ``message`` to issue ``key``'s agent, then unblock it.
 
@@ -401,9 +491,17 @@ def send_queued(key: str, message: str) -> None:
     there is dropped and logged rather than delivered to whatever holds the
     key next.
 
+    **Waking a parked agent needs a run slot** (JIM-248): if none is free,
+    this call blocks in :func:`_await_run_slot` until the issue's own wake is
+    granted one, rather than sending. A working or reviewing agent needs
+    nothing of the kind — it already holds its run slot, or (In Review)
+    never took one — so this only applies to a Blocked issue.
+
     **Sends first, unblocks second**: an agent that has
     not received the message is not awake yet, and a send that failed leaves
-    the issue BLOCKED, with no rollback path to get wrong.
+    the issue BLOCKED, with no rollback path to get wrong. The run slot is
+    given back either way, once the send has had its chance
+    (:func:`_release_run_slot`).
     """
     issue = store.get(key)
     if issue is None or issue.status not in IN_FLIGHT or issue.agent is None:
@@ -412,10 +510,24 @@ def send_queued(key: str, message: str) -> None:
             "dropped a message for %s: no agent to deliver to (%s)", key, status
         )
         return
-    if not send_now(issue.agent, message):
-        return
-    if issue.status is IssueStatus.BLOCKED:
-        store.unblock(key)
+    waking = issue.status is IssueStatus.BLOCKED
+    if waking:
+        if not _await_run_slot(key):
+            logger.warning(
+                "dropped a message for %s: no longer blocked while waiting for"
+                " a run slot",
+                key,
+            )
+            return
+        issue = store.get(key)
+        if issue is None or issue.agent is None:
+            _release_run_slot(key)
+            return
+    sent = send_now(issue.agent, message)
+    if waking:
+        if sent:
+            store.unblock(key)
+        _release_run_slot(key)
 
 
 def send_now(ref: AgentRef, message: str) -> bool:
@@ -657,29 +769,44 @@ def dispatch() -> None:
 
 
 def admits(issue: Issue) -> bool:
-    """Whether there is room to launch ``issue`` now.
+    """Whether there is room to launch ``issue`` now (JIM-248).
+
+    Two counts, not one. **Live** is memory and disk: every in-flight issue
+    holds one, parked ones included (§1.7) — a blocked agent is a live process
+    holding a workspace and a pane, and freeing its slot would launch a second
+    agent onto the same machine's back. **Active** is cores: only an issue
+    actually being worked holds one, so a parked agent gives its own back
+    while it waits.
 
     **Bootstrap mode is one agent at a time, and that is the repo's rule
     rather than a policy.** A workspace is built at ``main`` and completion
     fast-forwards ``main`` onto the agent's tip (§4.3), so two bootstrap agents
     branch from the same commit and the second cannot land what it wrote.
     Advancing before the next dispatch is what gives each agent a base that
-    holds the last one's work; running them together throws that away.
+    holds the last one's work; running them together throws that away. A
+    queued bootstrap issue therefore waits behind agents on *any* repo. That
+    is over-strict only where a box hosts two projects, which §1.1 rules out,
+    and the safe answer everywhere else. The live limit of one already bounds
+    the active count too, so bootstrap mode checks nothing else.
 
     Pull Request mode has neither half — the agent pushes its own branch and
-    ``main`` is the reviewer's to move — so it is limited only by what the box
-    is told it can carry (:func:`foregent.config.max_agents`).
+    ``main`` is the reviewer's to move — so live is limited only by what the
+    box is told it can carry (:func:`foregent.config.max_agents`), and active
+    by what it is told it can run at once (:func:`foregent.config.max_active`).
 
-    Every in-flight issue counts, parked ones included (§1.7): a blocked agent
-    is a live process holding a workspace and a pane, and freeing its slot
-    would launch a second agent onto the same machine's back.
-
-    A queued bootstrap issue therefore waits behind agents on *any* repo. That
-    is over-strict only where a box hosts two projects, which §1.1 rules out,
-    and the safe answer everywhere else.
+    **A wake waiting on a run slot is served before a fresh launch takes
+    one** ("wake before fork"): while :data:`_waking` holds any key, this
+    refuses rather than race a drainer already waiting in
+    :func:`_await_run_slot` for the same slot — a parked agent already holds
+    the scarce resource, and finishing it is what frees it.
     """
-    limit = 1 if mode_of(issue) is Mode.BOOTSTRAP else config.max_agents()
-    return sum(1 for tracked in store if tracked.status in IN_FLIGHT) < limit
+    live = sum(1 for tracked in store if tracked.status in IN_FLIGHT)
+    if mode_of(issue) is Mode.BOOTSTRAP:
+        return live < 1
+    if live >= config.max_agents():
+        return False
+    with _run_slots:
+        return not _waking and _active() < config.max_active()
 
 
 def _dispatch_one() -> bool:
@@ -690,10 +817,25 @@ def _dispatch_one() -> bool:
     issue = store.next_queued()
     if issue is None or not admits(issue):
         return False
+    # The mode is read off the repo rather than the workspace: a secondary
+    # workspace shares the repo's remotes, and an adopted agent's dispatch
+    # never built one to read.
+    mode = mode_of(issue)
     label = label_for(issue.key)
     repo = Path(issue.repo)
     provider = issue.provider
     ensure_skills(provider)
+    # Claimed for the whole launch, in Pull Request mode (JIM-248): `admits`
+    # and the store write below, which is what makes this issue count toward
+    # `_active` on its own, are several harness calls apart, and a wake
+    # reading that gap as a free run slot would overshoot the limit. Given
+    # back either way, once the write has had its chance or the launch has
+    # failed. Bootstrap mode never checks `_active`, and its live limit of
+    # one rules out a wake existing to race against in the first place, so it
+    # claims nothing.
+    if mode is not Mode.BOOTSTRAP:
+        with _run_slots:
+            _claimed.add(issue.key)
     try:
         linear.claim_issue(issue.key)
         running = _adopt(label)
@@ -714,19 +856,19 @@ def _dispatch_one() -> bool:
                     mcp_servers=agent_mcp_servers(),
                 )
             )
-        # The mode is read off the repo rather than the workspace: a secondary
-        # workspace shares the repo's remotes, and an adopted agent's dispatch
-        # never built one to read.
-        manager.send(ref, brief_for(issue.key, mode_of(issue), provider))
+        manager.send(ref, brief_for(issue.key, mode, provider))
+        store.add(
+            replace(issue, status=IssueStatus.IN_PROGRESS, directory=cwd, agent=ref)
+        )
     except linear.LinearError as exc:
         raise HTTPException(status_code=502, detail=f"Linear claim: {exc}") from exc
     except workspaces.WorkspaceError as exc:
         raise HTTPException(status_code=502, detail=f"workspace: {exc}") from exc
     except AgentError as exc:
         raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
-    store.add(
-        replace(issue, status=IssueStatus.IN_PROGRESS, directory=cwd, agent=ref)
-    )
+    finally:
+        if mode is not Mode.BOOTSTRAP:
+            _give_back_run_slot(issue.key)
     return True
 
 
@@ -825,7 +967,9 @@ def complete_issue(key: str) -> dict[str, str]:
     # The completion above sticks even if dispatch 502s: the caller sees the
     # error, but the issue is Done and the next one stays Queued until a later
     # queue/complete triggers dispatch again. Retrying complete is safe.
-    dispatch()
+    # `_release_run_slot` is what gives a wake already waiting first look at
+    # the run slot this frees, ahead of a fresh launch (JIM-248).
+    _release_run_slot()
     return _record(issue)
 
 
@@ -833,11 +977,14 @@ def complete_issue(key: str) -> dict[str, str]:
 def block_issue(key: str, blocker: Annotated[str, Body(embed=True)]) -> dict[str, str]:
     """Mark issue ``key`` Blocked with ``blocker`` and return the record.
 
-    Does not dispatch: a blocked agent parks alive in its workspace and keeps
-    holding its capacity slot, so blocking must not free
-    capacity or launch another agent.
+    **Block is sleep** (JIM-248): the agent keeps its live slot, parked alive
+    in its workspace, but gives back its run slot — so, unlike the live slot,
+    blocking can free room for a queued issue to launch.
+    ``_release_run_slot`` is what dispatches, after giving a wake already
+    waiting on the freed slot first look at it, ahead of a fresh launch.
     """
     issue = store.block(key, blocker)
+    _release_run_slot()
     return _record(issue)
 
 
@@ -863,8 +1010,11 @@ def deliver_issue(
     ``block()`` upserts an unknown key, so an issue can carry a blocker with
     nothing behind it.
 
-    Capacity does not change and nothing is dispatched, whatever the status:
-    the agent has been holding its slot the whole time.
+    The live slot does not change here, whatever the status: the agent has
+    been holding it the whole time. Waking a Blocked one is a different
+    matter for the run slot it gave up (JIM-248) — this route only enqueues,
+    and it is :func:`send_queued`, on the drainer thread, that waits for one
+    and dispatches once it has it.
     """
     issue = store.get(key)
     if issue is None or issue.status not in IN_FLIGHT or issue.agent is None:
