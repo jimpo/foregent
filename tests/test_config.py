@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from foregent import config
@@ -40,6 +41,28 @@ class ApiUrlTests(unittest.TestCase):
     def test_the_default_is_used_when_unset(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(config.api_url(), config.DEFAULT_API_URL)
+
+
+class StateFileTests(unittest.TestCase):
+    """Where the issue store is persisted (JIM-249)."""
+
+    def test_the_environment_overrides_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_STATE_FILE": "/var/lib/fg.json"}):
+            self.assertEqual(config.state_file(), Path("/var/lib/fg.json"))
+
+    def test_the_default_is_under_the_home_state_directory(self) -> None:
+        with mock.patch.dict(os.environ, {"HOME": "/home/box"}, clear=True):
+            self.assertEqual(
+                config.state_file(),
+                Path("/home/box/.local/state/foregent/state.json"),
+            )
+
+    def test_an_empty_variable_is_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_STATE_FILE": "", "HOME": "/home/box"}):
+            self.assertEqual(
+                config.state_file(),
+                Path("/home/box/.local/state/foregent/state.json"),
+            )
 
 
 class MaxAgentsTests(unittest.TestCase):
