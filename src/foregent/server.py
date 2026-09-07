@@ -768,8 +768,8 @@ def dispatch() -> None:
             pass
 
 
-def admits(issue: Issue) -> bool:
-    """Whether there is room to launch ``issue`` now (JIM-248).
+def admits() -> bool:
+    """Whether there is room to launch another agent now (JIM-248).
 
     Two counts, not one. **Live** is memory and disk: every in-flight issue
     holds one, parked ones included (§1.7) — a blocked agent is a live process
@@ -778,21 +778,17 @@ def admits(issue: Issue) -> bool:
     actually being worked holds one, so a parked agent gives its own back
     while it waits.
 
-    **Bootstrap mode is one agent at a time, and that is the repo's rule
-    rather than a policy.** A workspace is built at ``main`` and completion
-    fast-forwards ``main`` onto the agent's tip (§4.3), so two bootstrap agents
-    branch from the same commit and the second cannot land what it wrote.
-    Advancing before the next dispatch is what gives each agent a base that
-    holds the last one's work; running them together throws that away. A
-    queued bootstrap issue therefore waits behind agents on *any* repo. That
-    is over-strict only where a box hosts two projects, which §1.1 rules out,
-    and the safe answer everywhere else. The live limit of one already bounds
-    the active count too, so bootstrap mode checks nothing else.
-
-    Pull Request mode has neither half — the agent pushes its own branch and
-    ``main`` is the reviewer's to move — so live is limited only by what the
-    box is told it can carry (:func:`foregent.config.max_agents`), and active
-    by what it is told it can run at once (:func:`foregent.config.max_active`).
+    **Both limits are the box's, whatever the mode.** Live is bounded by what
+    the box is told it can carry (:func:`foregent.config.max_agents`) and
+    active by what it is told it can run at once
+    (:func:`foregent.config.max_active`); nothing in the repository narrows
+    either. In Pull Request mode each agent pushes its own branch and ``main``
+    is the reviewer's to move. In bootstrap mode two agents do branch from the
+    same ``main``, and jj is what makes that safe: completion moves the
+    bookmark fast-forward only, inside one operation under the repo lock
+    (§4.3), so the second agent to finish is refused rather than clobbering
+    the first, and rebasing onto the ``main`` it now sees is what lands it
+    (JIM-252).
 
     **A wake waiting on a run slot is served before a fresh launch takes
     one** ("wake before fork"): while :data:`_waking` holds any key, this
@@ -801,8 +797,6 @@ def admits(issue: Issue) -> bool:
     the scarce resource, and finishing it is what frees it.
     """
     live = sum(1 for tracked in store if tracked.status in IN_FLIGHT)
-    if mode_of(issue) is Mode.BOOTSTRAP:
-        return live < 1
     if live >= config.max_agents():
         return False
     with _run_slots:
@@ -815,7 +809,7 @@ def _dispatch_one() -> bool:
     The caller holds :data:`_dispatching`.
     """
     issue = store.next_queued()
-    if issue is None or not admits(issue):
+    if issue is None or not admits():
         return False
     # The mode is read off the repo rather than the workspace: a secondary
     # workspace shares the repo's remotes, and an adopted agent's dispatch
@@ -825,17 +819,13 @@ def _dispatch_one() -> bool:
     repo = Path(issue.repo)
     provider = issue.provider
     ensure_skills(provider)
-    # Claimed for the whole launch, in Pull Request mode (JIM-248): `admits`
-    # and the store write below, which is what makes this issue count toward
-    # `_active` on its own, are several harness calls apart, and a wake
-    # reading that gap as a free run slot would overshoot the limit. Given
-    # back either way, once the write has had its chance or the launch has
-    # failed. Bootstrap mode never checks `_active`, and its live limit of
-    # one rules out a wake existing to race against in the first place, so it
-    # claims nothing.
-    if mode is not Mode.BOOTSTRAP:
-        with _run_slots:
-            _claimed.add(issue.key)
+    # Claimed for the whole launch (JIM-248): `admits` and the store write
+    # below, which is what makes this issue count toward `_active` on its own,
+    # are several harness calls apart, and a wake reading that gap as a free
+    # run slot would overshoot the limit. Given back either way, once the
+    # write has had its chance or the launch has failed.
+    with _run_slots:
+        _claimed.add(issue.key)
     try:
         linear.claim_issue(issue.key)
         running = _adopt(label)
@@ -867,8 +857,7 @@ def _dispatch_one() -> bool:
     except AgentError as exc:
         raise HTTPException(status_code=502, detail=f"agent harness: {exc}") from exc
     finally:
-        if mode is not Mode.BOOTSTRAP:
-            _give_back_run_slot(issue.key)
+        _give_back_run_slot(issue.key)
     return True
 
 
@@ -1357,11 +1346,15 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
 
     **A refusal stops the completion short**, and is the one thing in this
     path that does. jj declines to move ``main`` onto work that is not
-    descended from it, which means an agent that never rebased: its commits
-    exist only in the workspace, and going on would tear that workspace down
-    and take them with it. Returning the message leaves the issue in flight
-    and the workspace on disk for the operator, which is the recoverable half
-    of a bad outcome.
+    descended from it, and with bootstrap agents running concurrently
+    (JIM-252) that is the ordinary race rather than an agent that never
+    rebased: ``main`` moves whenever another agent lands, which can be after
+    this one's last rebase. The refused agent is still alive, so the message
+    tells it what to do — rebase onto ``main``, resolve any conflicts, and
+    call ``complete_task`` again. Returning it leaves the issue in flight and
+    the workspace on disk, which is what makes the retry possible: the
+    commits exist only in that workspace, and going on would tear it down and
+    take them with it.
 
     Only an in-flight issue is landed, which is what keeps completing twice
     safe. The second call has no workspace left to name a revision in, and jj
@@ -1378,9 +1371,11 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
         logger.error("could not advance %s for %s: %s", workspaces.TRUNK, issue_key, exc)
         return (
             f"{issue_key} was not completed: {workspaces.TRUNK} could not be "
-            f"moved onto its work ({exc}). The workspace is still there, and "
-            f"the commits are only in it. Rebase onto {workspaces.TRUNK} and "
-            f"call complete_task again."
+            f"moved onto its work ({exc}). {workspaces.TRUNK} has moved on "
+            f"since this work was last rebased — another agent landed — and "
+            f"it only ever moves forward. The workspace is still there, and "
+            f"the commits are only in it. Rebase onto {workspaces.TRUNK}, "
+            f"resolve any conflicts, and call complete_task again."
         )
     return None
 

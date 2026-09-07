@@ -20,10 +20,8 @@ DEFAULT_API_URL = "http://127.0.0.1:8577"
 # no business living inside the checkout it was made from.
 DEFAULT_WORKSPACE_ROOT = "~/.foregent/workspaces"
 
-# How many agents may hold a live slot at once in Pull Request mode (JIM-151):
-# in flight, working or parked. Bootstrap mode is one whatever this says,
-# because it is the repo's trunk that serialises it rather than a policy
-# anyone can raise.
+# How many agents may hold a live slot at once (JIM-151): in flight, working
+# or parked, in either mode.
 DEFAULT_MAX_AGENTS = 5
 
 # How many of those are actually worked at once (JIM-248), independent of the

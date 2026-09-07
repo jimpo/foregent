@@ -379,16 +379,20 @@ class DispatchTests(unittest.TestCase):
             )
         )
 
-    def test_bootstrap_mode_runs_one_agent_at_a_time(self) -> None:
-        # `main` is the bridge's to advance and every workspace is built on it,
-        # so a second bootstrap agent would branch from a commit the first is
-        # about to move past. The directories here are not jj repos, which is
-        # bootstrap (JIM-151).
-        self.queue("JIM-88", "/ws/JIM-88")
+    def test_bootstrap_mode_runs_up_to_the_limit(self) -> None:
+        # Capacity is the box's in either mode (JIM-252). Two agents branching
+        # from the same `main` is safe because completion moves the bookmark
+        # fast-forward only, so the second to finish is refused and rebases.
+        # The directories here are not jj repos, which is bootstrap.
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
+        for key in ("JIM-88", "JIM-89", "JIM-90"):
+            self.queue(key, f"/ws/{key}")
+
         server.dispatch()
-        self.queue("JIM-89", "/ws/JIM-89")
-        server.dispatch()
-        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+        self.assertEqual(
+            [spec.label for spec in self.manager.launched], ["fg-jim-88", "fg-jim-89"]
+        )
 
     def test_pull_request_mode_runs_several_agents_at_once(self) -> None:
         # Nothing in the repo serialises them: each pushes its own branch and
@@ -430,24 +434,6 @@ class DispatchTests(unittest.TestCase):
 
         self.assertEqual(len(self.manager.launched), 2)
 
-    def test_a_queued_bootstrap_issue_stalls_the_queue_behind_it(self) -> None:
-        # Strictly FIFO: the head is never skipped, so the pull-request issue
-        # behind it waits too rather than queue order becoming policy.
-        modes = {"/bs/repo": Mode.BOOTSTRAP, "/pr/repo": Mode.PULL_REQUEST}
-        self.enterContext(
-            mock.patch.object(
-                server.workspaces, "mode_for", lambda repo: modes[str(repo)]
-            )
-        )
-        self.queue("JIM-88", "/pr/repo")
-        server.dispatch()
-
-        self.queue("JIM-89", "/bs/repo")
-        self.queue("JIM-90", "/pr/repo")
-        server.dispatch()
-
-        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
-
     def test_one_completion_starts_everything_the_queue_was_waiting_on(self) -> None:
         self.pull_request()
         self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "2"}))
@@ -465,6 +451,7 @@ class DispatchTests(unittest.TestCase):
     def test_a_parked_agent_still_holds_its_slot(self) -> None:
         # A blocked agent is alive in its workspace, so it must keep occupying
         # capacity.
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "1"}))
         self.queue()
         server.dispatch()
         server.store.block("JIM-88", "a review of the PR")
@@ -882,6 +869,7 @@ class DeliverTests(unittest.TestCase):
     def test_delivering_does_not_dispatch_anything_else(self) -> None:
         # The agent held its capacity slot the whole time, parked or not , so
         # prompting it frees nothing.
+        self.enterContext(mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "1"}))
         self.park()
         server.store.queue("JIM-89", "/ws/JIM-89")
         server.deliver_issue("JIM-88", "go on")
@@ -1670,6 +1658,32 @@ class WorkspaceDispatchTests(unittest.IsolatedAsyncioTestCase):
         issue = server.store.get("JIM-88")
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+
+    async def test_a_refused_bootstrap_agent_lands_once_it_rebases(self) -> None:
+        # The whole of concurrent bootstrap (JIM-252): two agents branch from
+        # the same `main`, the first lands, and the second is refused because
+        # the bookmark only moves forward. Rebasing onto the `main` it can now
+        # see is what makes the retry land, and nothing serialises the two.
+        server.store.queue("JIM-88", str(self.repo))
+        server.store.queue("JIM-89", str(self.repo))
+        server.dispatch()
+        first, second = (Path(spec.cwd) for spec in self.manager.launched)
+        (first / "b.txt").write_text("the first agent's work\n")
+        self.jj(first, "commit", "-m", "the first agent's work")
+        (second / "c.txt").write_text("the second agent's work\n")
+        self.jj(second, "commit", "-m", "the second agent's work")
+
+        await server.complete_task("JIM-88")
+        refused = await server.complete_task("JIM-89")
+
+        self.assertIn("not completed", refused)
+        self.assertEqual(self.git_head(), "the first agent's work")
+
+        self.jj(second, "rebase", "-d", "main")
+        landed = await server.complete_task("JIM-89")
+
+        self.assertNotIn("not completed", landed)
+        self.assertEqual(self.git_head(), "the second agent's work")
 
 
 class CompleteTaskTests(unittest.IsolatedAsyncioTestCase):
