@@ -16,8 +16,8 @@ branch names. Both routes account for every delivery at debug level: one line
 as it arrives, and one where it is delivered, filtered out, or not understood.
 ``/health`` reports when Linear last delivered, because push is
 the only thing that wakes an agent and a hook that has stopped looks like quiet.
-Also mounts the foregent MCP server (``complete_task``,
-``report_blocked``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
+Also mounts the foregent MCP server (``complete_task``, ``report_blocked``,
+``queue_sub_issues``) as streamable HTTP at ``/mcp``, so an agent's lifecycle
 tools mutate this same in-process store directly instead of looping back over
 HTTP.
 """
@@ -613,6 +613,9 @@ def _record(issue: Issue) -> dict[str, str]:
         "status": issue.status,
         "provider": issue.provider,
         "blocker": issue.blocker,
+        # Empty rather than null for an operator's issue: the record is a flat
+        # map of strings the CLI prints, and "no parent" prints as nothing.
+        "parent": issue.parent or "",
     }
 
 
@@ -768,8 +771,8 @@ def dispatch() -> None:
             pass
 
 
-def admits() -> bool:
-    """Whether there is room to launch another agent now (JIM-248).
+def admits(issue: Issue) -> bool:
+    """Whether there is room to launch ``issue`` now (JIM-248, JIM-250).
 
     Two counts, not one. **Live** is memory and disk: every in-flight issue
     holds one, parked ones included (§1.7) — a blocked agent is a live process
@@ -790,15 +793,24 @@ def admits() -> bool:
     finish is refused, and rebasing onto the ``main`` it can now see is what
     lands it (JIM-252).
 
+    **A sub-issue skips the live limit and is gated on the run limit alone**
+    (§5.2, JIM-250). It was queued by a worker that is about to park on it,
+    and a parked parent holds a live slot while giving back its run slot — so
+    charging its children the live limit too would let a parent wait forever
+    on children the limit it filled cannot admit. Bounding what a parent
+    queues is the parent's job; bounding how many parents run is the
+    operator's.
+
     **A wake waiting on a run slot is served before a fresh launch takes
     one** ("wake before fork"): while :data:`_waking` holds any key, this
     refuses rather than race a drainer already waiting in
     :func:`_await_run_slot` for the same slot — a parked agent already holds
     the scarce resource, and finishing it is what frees it.
     """
-    live = sum(1 for tracked in store if tracked.status in IN_FLIGHT)
-    if live >= config.max_agents():
-        return False
+    if issue.parent is None:
+        live = sum(1 for tracked in store if tracked.status in IN_FLIGHT)
+        if live >= config.max_agents():
+            return False
     with _run_slots:
         return not _waking and _active() < config.max_active()
 
@@ -809,7 +821,7 @@ def _dispatch_one() -> bool:
     The caller holds :data:`_dispatching`.
     """
     issue = store.next_queued()
-    if issue is None or not admits():
+    if issue is None or not admits(issue):
         return False
     # The mode is read off the repo rather than the workspace: a secondary
     # workspace shares the repo's remotes, and an adopted agent's dispatch
@@ -953,6 +965,7 @@ def complete_issue(key: str) -> dict[str, str]:
         linear.close_issue(key)
     except linear.LinearError as exc:
         logger.error("could not close %s in Linear: %s", key, exc)
+    tell_parent(issue)
     # The completion above sticks even if dispatch 502s: the caller sees the
     # error, but the issue is Done and the next one stays Queued until a later
     # queue/complete triggers dispatch again. Retrying complete is safe.
@@ -960,6 +973,36 @@ def complete_issue(key: str) -> dict[str, str]:
     # the run slot this frees, ahead of a fresh launch (JIM-248).
     _release_run_slot()
     return _record(issue)
+
+
+def tell_parent(issue: Issue) -> None:
+    """Tell the issue that delegated ``issue`` that it has landed (JIM-250).
+
+    A parent hands its sub-issues to the queue and parks on them, and this
+    line is the whole of what it is told: one child, Done. It goes to every
+    parent state a delivery reaches — a working parent reads it as its next
+    prompt, a parked one is woken by it — so the parent decides for itself
+    whether to queue the next wave, park again, or finish.
+
+    Enqueued before the run slot this completion frees is given back, which
+    gives the parent's drainer a head start on claiming it over the dispatch
+    that follows ("wake before fork", §5.2). A head start is all it is:
+    nothing orders the drainer thread against that dispatch, so a queued
+    sibling can still take the slot first and the parent waits for the next.
+
+    Best-effort, like the Linear close beside it: a parent foregent is not
+    running is nothing to correct, and the work is landed either way.
+    """
+    if issue.parent is None:
+        return
+    try:
+        deliver_issue(issue.parent, f"{issue.key} is Done.")
+    except Exception:
+        # Everything, not just the 409 for a parent with no agent: this runs
+        # before the run slot is given back and before the caller tears the
+        # agent down, so an exception escaping here would stall the queue and
+        # leave a completed agent running.
+        logger.exception("could not tell %s that %s landed", issue.parent, issue.key)
 
 
 @app.post("/issues/{key}/block")
@@ -1377,6 +1420,93 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
             f"conflict, and call complete_task again."
         )
     return None
+
+
+@mcp.tool()
+async def queue_sub_issues(issue_key: str, keys: list[str]) -> str:
+    """Hand the sub-issues ``keys`` of ``issue_key`` to foregent's queue.
+
+    Each key is queued at the back of the queue against the calling issue's
+    own repo, harness and model, recorded as a sub-issue of ``issue_key``, and
+    dispatched as capacity allows. A key foregent has already queued, is
+    already running, or has already finished is refused and left alone, so
+    calling this twice with the same wave costs nothing.
+
+    The sub-issue link itself is not checked: **the caller is trusted** to
+    have created these in Linear with ``parentId`` first. What is recorded
+    here is who to wake, not what the Linear tree says.
+
+    A sub-issue needs only a free run slot to launch, not one of the live
+    slots a parked parent is holding, so children queued this way always have
+    somewhere to run.
+    """
+    return await run_in_threadpool(_queue_sub_issues, issue_key, keys)
+
+
+def _queue_sub_issues(issue_key: str, keys: list[str]) -> str:
+    """Queue ``keys`` under ``issue_key`` and dispatch; what to tell the caller.
+
+    Blocking: :func:`dispatch` launches agents, which is minutes of harness
+    calls, so the tool above runs this on a thread rather than the event loop.
+    """
+    parent = store.get(issue_key)
+    if parent is None:
+        return f"Nothing was queued: {issue_key} is not an issue foregent is tracking."
+    # A child is queued against its parent's repo, and an empty one is not a
+    # repo: `Path("")` is the bridge's own working directory, so dispatch
+    # would build the workspace in foregent's checkout. An adopted agent
+    # whose cwd was not a workspace is recovered with no repo (`_adopted`),
+    # and this is the one path by which such an issue could reach the queue.
+    if not parent.repo:
+        return (
+            f"Nothing was queued: foregent has no repo recorded for {issue_key},"
+            " so it cannot build a workspace for a sub-issue. Ask the operator"
+            " to re-queue this issue against its repo."
+        )
+    queued: list[str] = []
+    refused: list[str] = []
+    for key in keys:
+        existing = store.get(key)
+        # Done as well as live: a child that has already landed is re-claimed
+        # in Linear and its work redone if it is queued again, and a parent
+        # told to "queue the next wave" is one turn away from re-sending its
+        # whole list. Orphaned is deliberately absent — re-queueing is what
+        # an agent that died deserves.
+        if existing is not None and (
+            existing.status
+            in (IssueStatus.QUEUED, IssueStatus.DONE)
+            or existing.status in IN_FLIGHT
+        ):
+            refused.append(f"{key} ({existing.status})")
+            continue
+        store.queue(key, parent.repo, parent.provider, parent.model, parent=issue_key)
+        queued.append(key)
+    lines = [
+        f"Queued as sub-issues of {issue_key}: {', '.join(queued)}."
+        if queued
+        else f"Queued nothing for {issue_key}."
+    ]
+    if refused:
+        lines.append(
+            f"Already queued, running or finished, so left alone and not yours"
+            f" to wait for: {', '.join(refused)}."
+        )
+    try:
+        dispatch()
+    except HTTPException as exc:
+        # The queue itself stands; only the launch failed, and the next queue
+        # or completion dispatches again.
+        lines.append(f"Dispatch failed, so they wait in the queue: {exc.detail}.")
+    if queued:
+        # Only what this call actually queued will wake this caller. A refused
+        # key keeps whatever parent it already had, so telling a caller that
+        # queued nothing to park on it would park it on a wake that goes
+        # somewhere else.
+        lines.append(
+            "Park with report_blocked naming them once you have nothing to do"
+            " until they land; each one that lands wakes you."
+        )
+    return " ".join(lines)
 
 
 @mcp.tool()
