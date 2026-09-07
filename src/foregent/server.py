@@ -783,11 +783,16 @@ def queue_issue(
     operator's. Unset, the harness chooses its own default. It is not checked
     here: every harness has its own names for its models, and the harness is
     what refuses one it does not know.
+
+    Refused while the issue already has a live agent — :data:`IN_FLIGHT`, plus
+    Queued itself — because dispatch finds that agent under the issue's
+    deterministic label and adopts it as-is (§4.1) rather than starting a new
+    one, so a provider or model named here would be silently discarded rather
+    than reaching an agent at all.
     """
     existing = store.get(key)
-    if existing is not None and existing.status in (
-        IssueStatus.QUEUED,
-        IssueStatus.IN_PROGRESS,
+    if existing is not None and (
+        existing.status is IssueStatus.QUEUED or existing.status in IN_FLIGHT
     ):
         raise HTTPException(
             status_code=409, detail=f"{key} is already {existing.status}"

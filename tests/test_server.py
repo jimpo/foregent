@@ -256,6 +256,21 @@ class DispatchTests(unittest.TestCase):
         server.queue_issue("JIM-88", directory="/ws/JIM-88", model="gpt-5.5")
         self.assertEqual(self.manager.launched[0].model, "gpt-5.5")
 
+    def test_requeuing_a_blocked_issue_is_a_conflict(self) -> None:
+        # A blocked issue still has a live agent under its deterministic
+        # label (§1.7): dispatch would find it and adopt it as-is rather than
+        # starting a new one, so a provider or model named on this call would
+        # never reach an agent (JIM-251).
+        self.queue()
+        server.dispatch()
+        server.store.block("JIM-88", "a review of the PR")
+        with self.assertRaises(server.HTTPException) as caught:
+            server.queue_issue(
+                "JIM-88", directory="/ws/JIM-88", model="claude-sonnet-5"
+            )
+        self.assertEqual(caught.exception.status_code, 409)
+        self.assertEqual(len(self.manager.launched), 1)
+
     def test_the_queued_harness_decides_the_brief(self) -> None:
         # Codex has no slash form for a skill, so its brief names the skill in
         # a sentence instead. An agent given the wrong one loads no skill.
