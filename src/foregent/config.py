@@ -25,6 +25,12 @@ DEFAULT_WORKSPACE_ROOT = "~/.foregent/workspaces"
 # serialises it rather than a policy anyone can raise.
 DEFAULT_MAX_AGENTS = 3
 
+# Where the bridge keeps its own record of the issues it is tracking
+# (JIM-249): queue order, agent bindings, blockers. Under the XDG state
+# directory rather than beside the workspaces, because a workspace is
+# disposable and this is what makes a restart not lose the queue.
+DEFAULT_STATE_FILE = "~/.local/state/foregent/state.json"
+
 # The levels `foregent serve` accepts (JIM-149). uvicorn also knows `trace`,
 # which is left out because Python's `logging` has no such level and
 # `dictConfig` rejects it.
@@ -46,6 +52,17 @@ def workspace_root() -> Path:
     """
     root = os.environ.get("FOREGENT_WORKSPACE_ROOT") or DEFAULT_WORKSPACE_ROOT
     return Path(root).expanduser()
+
+
+def state_file() -> Path:
+    """The file the issue store is persisted to (``FOREGENT_STATE_FILE``).
+
+    Rewritten on every change to the store and read back at boot
+    (:class:`foregent.store.IssueStore`). Deleting it puts the bridge where
+    it would be with no file at all: rebuilt from the live agents alone.
+    """
+    setting = os.environ.get("FOREGENT_STATE_FILE") or DEFAULT_STATE_FILE
+    return Path(setting).expanduser()
 
 
 def max_agents() -> int:

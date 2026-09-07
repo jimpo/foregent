@@ -18,6 +18,7 @@ import threading
 import tomllib
 import unittest
 from collections.abc import Callable, Collection, Iterator
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -828,7 +829,22 @@ class CheckAgentMCPTests(unittest.TestCase):
 
 
 class RebuildStoreTests(unittest.TestCase):
-    """Recovering the issue<->agent map from the harness."""
+    """Reconciling the issue<->agent map against the harness (JIM-52, JIM-249).
+
+    A store that starts empty is a bridge with no state file, which is where
+    every agent is adopted off its label; a store with issues in it is one
+    the file was read into, which is checked against the harness.
+    """
+
+    STORED = Issue(
+        key="JIM-88",
+        title="Persist the store",
+        status=IssueStatus.IN_PROGRESS,
+        repo="/src/repo",
+        directory="/ws",
+        provider=Provider.CODEX,
+        agent=AgentRef("fg-jim-88", "abc"),
+    )
 
     def setUp(self) -> None:
         server.store = IssueStore()
@@ -911,6 +927,181 @@ class RebuildStoreTests(unittest.TestCase):
         manager.list_agents = mock.Mock(side_effect=AgentError("socket missing"))
         self.rebuild(manager)
         self.assertEqual(len(server.store), 0)
+
+    def test_an_unreachable_harness_leaves_the_stored_issues_as_they_were(
+        self,
+    ) -> None:
+        # With a file, what was written is the honest answer when the harness
+        # cannot say otherwise; forgetting it would be a guess in the
+        # direction that loses the queue.
+        server.store.add(self.STORED)
+        manager = FakeManager()
+        manager.list_agents = mock.Mock(side_effect=AgentError("socket missing"))
+        self.rebuild(manager)
+        self.assertEqual(server.store.get("JIM-88"), self.STORED)
+
+    def reconcile(self, stored: Issue, status: AgentStatus | None) -> Issue:
+        """``stored`` after a rebuild against an agent in ``status``, or none."""
+        server.store.add(stored)
+        agents = (
+            [AgentRecord(AgentRef("fg-jim-88", "abc"), status, "/elsewhere")]
+            if status is not None
+            else []
+        )
+        self.rebuild(FakeManager(agents))
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        return issue
+
+    def test_a_stored_issue_whose_agent_is_gone_is_orphaned(self) -> None:
+        # The orphan reconciliation §5.4 promised: the bridge was down when
+        # the agent exited, so nobody freed the slot.
+        with self.assertLogs(server.logger, "WARNING"):
+            issue = self.reconcile(self.STORED, None)
+        self.assertEqual(issue.status, IssueStatus.ORPHANED)
+        self.assertIsNone(issue.agent)
+        # Everything else about it is kept, for the operator and for whatever
+        # re-dispatches it.
+        self.assertEqual(issue.title, "Persist the store")
+        self.assertEqual(issue.repo, "/src/repo")
+
+    def test_a_stored_issue_whose_agent_is_live_keeps_its_record(self) -> None:
+        # The file knows what the label never did: the title, the repo it was
+        # queued against, the conversation id. None of it is re-derived.
+        issue = self.reconcile(self.STORED, AgentStatus.WORKING)
+        self.assertEqual(issue, self.STORED)
+
+    def test_a_stored_working_issue_whose_agent_parked_is_blocked(self) -> None:
+        # It parked while the bridge was down, so the words it chose never
+        # reached the store; the placeholder says so.
+        issue = self.reconcile(self.STORED, AgentStatus.IDLE)
+        self.assertEqual(issue.status, IssueStatus.BLOCKED)
+        self.assertEqual(issue.blocker, server.RECOVERED_BLOCKER)
+
+    def test_a_stored_blocker_survives_where_the_agent_is_still_parked(self) -> None:
+        parked = replace(self.STORED, status=IssueStatus.BLOCKED, blocker="a review")
+        for status in (AgentStatus.IDLE, AgentStatus.DONE):
+            with self.subTest(status=status):
+                issue = self.reconcile(parked, status)
+                self.assertEqual(issue.status, IssueStatus.BLOCKED)
+                self.assertEqual(issue.blocker, "a review")
+
+    def test_a_stored_blocked_issue_whose_agent_is_working_is_in_progress(
+        self,
+    ) -> None:
+        # Somebody prompted it by hand while the bridge was down.
+        parked = replace(self.STORED, status=IssueStatus.BLOCKED, blocker="a review")
+        issue = self.reconcile(parked, AgentStatus.WORKING)
+        self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+        self.assertEqual(issue.blocker, "")
+
+    def test_a_status_that_says_nothing_leaves_the_stored_one(self) -> None:
+        # UNKNOWN means the state could not be read; herdr's own BLOCKED is an
+        # agent waiting on input. With no file either guessed In Progress;
+        # with one, the record is evidence and the guess is not needed.
+        parked = replace(self.STORED, status=IssueStatus.BLOCKED, blocker="a review")
+        for status in (AgentStatus.UNKNOWN, AgentStatus.BLOCKED):
+            with self.subTest(status=status):
+                self.assertEqual(self.reconcile(parked, status), parked)
+                self.assertEqual(
+                    self.reconcile(self.STORED, status).status,
+                    IssueStatus.IN_PROGRESS,
+                )
+
+    def test_issues_without_an_agent_are_left_alone(self) -> None:
+        # Queued, Done and Orphaned have no agent to check, and come back as
+        # they were — the queue in the order it was written.
+        server.store.add(Issue(key="JIM-1", title="", status=IssueStatus.DONE))
+        server.store.queue("JIM-3", "/src/repo")
+        server.store.queue("JIM-2", "/src/repo")
+        self.rebuild(FakeManager())
+        self.assertEqual(
+            [(i.key, i.status) for i in server.store],
+            [
+                ("JIM-1", IssueStatus.DONE),
+                ("JIM-2", IssueStatus.QUEUED),
+                ("JIM-3", IssueStatus.QUEUED),
+            ],
+        )
+        head = server.store.next_queued()
+        assert head is not None
+        self.assertEqual(head.key, "JIM-3")
+
+    def test_a_live_agent_the_store_does_not_know_is_adopted_beside_it(self) -> None:
+        server.store.add(self.STORED)
+        self.rebuild(
+            FakeManager(
+                [
+                    AgentRecord(AgentRef("fg-jim-88", "abc"), AgentStatus.WORKING, "/ws"),
+                    AgentRecord(AgentRef("fg-jim-89", "def"), AgentStatus.IDLE, "/ws2"),
+                ]
+            )
+        )
+        self.assertEqual(server.store.get("JIM-88"), self.STORED)
+        adopted = server.store.get("JIM-89")
+        assert adopted is not None
+        self.assertEqual(adopted.status, IssueStatus.BLOCKED)
+        self.assertEqual(adopted.directory, "/ws2")
+
+
+class OpenStoreTests(unittest.TestCase):
+    """The store the bridge boots with is the persisted one (JIM-249)."""
+
+    def setUp(self) -> None:
+        server.store = IssueStore()
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.path = self.tmp / "state.json"
+        self.enterContext(
+            mock.patch.dict(os.environ, {"FOREGENT_STATE_FILE": str(self.path)})
+        )
+
+    def test_the_queue_survives_a_restart(self) -> None:
+        # The whole point: a Queued issue has no agent, so nothing but the
+        # file can bring it back.
+        IssueStore(self.path).queue("JIM-88", "/src/repo", Provider.CODEX, "gpt-5")
+
+        server.open_store()
+
+        self.assertEqual(server.store.path, self.path)
+        issue = server.store.next_queued()
+        assert issue is not None
+        self.assertEqual(
+            (issue.key, issue.repo, issue.provider, issue.model),
+            ("JIM-88", "/src/repo", Provider.CODEX, "gpt-5"),
+        )
+
+    def test_the_opened_store_writes_through(self) -> None:
+        server.open_store()
+        server.store.queue("JIM-88", "/src/repo")
+        self.assertEqual([i.key for i in IssueStore(self.path)], ["JIM-88"])
+
+
+class DispatchAtBootTests(unittest.TestCase):
+    """What came back Queued is dispatched without failing the boot."""
+
+    def setUp(self) -> None:
+        server.store = IssueStore()
+        self.manager = FakeManager()
+        self.enterContext(mock.patch.object(server, "manager", self.manager))
+        self.enterContext(mock.patch.object(server.linear, "claim_issue"))
+        self.config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(
+            mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.config)})
+        )
+
+    def test_a_recovered_queue_is_dispatched(self) -> None:
+        server.store.queue("JIM-88", "/ws/JIM-88")
+        server.dispatch_at_boot()
+        self.assertEqual([spec.label for spec in self.manager.launched], ["fg-jim-88"])
+
+    def test_a_failed_dispatch_is_logged_and_the_issue_stays_queued(self) -> None:
+        server.store.queue("JIM-88", "/ws/JIM-88")
+        self.manager.fail_launch = AgentError("no session")
+        with self.assertLogs(server.logger, "ERROR"):
+            server.dispatch_at_boot()
+        issue = server.store.get("JIM-88")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.QUEUED)
 
 
 class WatchAgentsTests(unittest.TestCase):

@@ -272,7 +272,16 @@ workspace is built from it; Pull Request mode runs up to `FOREGENT_MAX_AGENTS`
 the issue to the foregent account in Linear and moves it to `In Progress`, and
 completion moves it to `Done` unless the agent already closed or cancelled it,
 so the team must have states with exactly those two names. A queued issue
-waits its turn, in the order it was queued.
+waits its turn, in the order it was queued, and the queue survives a restart
+of the bridge.
+
+The bridge keeps what it is tracking in one file,
+`~/.local/state/foregent/state.json` (`FOREGENT_STATE_FILE`), rewritten on
+every change. A restart reads it back and checks it against the agents herdr
+still has: an issue whose agent is gone shows as `Orphaned`, one whose agent
+is still running keeps its record, and the queue is dispatched. Delete the
+file to start clean; the bridge then adopts every running agent off its name
+and forgets the queue.
 
 `-d` is the **repository**, not the agent's working directory. Dispatch builds
 the agent a jj workspace of its own from it — `~/.foregent/workspaces/JIM-42`
@@ -348,13 +357,14 @@ state.
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
 | `FOREGENT_LOG_LEVEL` | What level `serve` logs at (default `info`), for uvicorn's loggers and foregent's own. `--log-level` overrides it. |
 | `FOREGENT_MAX_AGENTS` | How many agents run at once in Pull Request mode (default 3). Bootstrap mode is always one. |
+| `FOREGENT_STATE_FILE` | Where the bridge keeps the issues it is tracking (default `~/.local/state/foregent/state.json`). |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
 | `CODEX_HOME` | Relocates `~/.codex`, the same. |
 
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 358 unit tests, ~7s
+uv run python -m unittest discover -s tests -t .   # 479 unit tests, ~9s
 uv run ty check                                    # type check
 ```
 

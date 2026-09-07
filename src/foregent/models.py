@@ -1,8 +1,10 @@
 """Core domain types for foregent-managed issues.
 
 An issue is claimed, worked by an agent, possibly parked while blocked on an
-external event, reviewed, and completed. The per-issue metadata that must
-outlive a process will attach here as the durable Linear-side store lands.
+external event, reviewed, and completed. Every field here is written to the
+state file on each change and read back at boot
+(:class:`foregent.store.IssueStore`), so what outlives the process is what is
+on this record.
 """
 
 from __future__ import annotations
@@ -65,12 +67,12 @@ class Issue:
     repo: str = ""
     directory: str = ""
     # The harness the agent works this issue on, named by the operator at
-    # `foregent queue`. Recovered after a restart from the agent kind herdr
-    # reports, so nothing about it has to be persisted.
+    # `foregent queue`. herdr reports the agent kind too, which is what an
+    # agent the state file does not know is recovered with.
     provider: Provider = DEFAULT_PROVIDER
     # The model the agent runs, named by the operator at `foregent queue`, or
-    # None to let the harness choose. Used at launch only, so a restart, which
-    # recovers issues whose agents are already running, has no need of it.
+    # None to let the harness choose. Used at launch only, so a queued issue
+    # needs it across a restart and a running one does not.
     model: str | None = None
     blocker: str = ""
     # The agent working this issue: where it runs, and the conversation it
