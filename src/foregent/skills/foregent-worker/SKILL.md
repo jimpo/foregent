@@ -33,7 +33,7 @@ middle. Anything you meant to do afterwards will not happen.
 The one exception is a completion foregent refuses, which it tells you in the
 result: in `bootstrap` mode it cannot move `main` onto work that is not
 descended from it. You are still alive and your workspace is still there, so
-rebase onto `main` and call the tool again.
+rebase onto `main`, resolve any conflicts, and call the tool again.
 
 ## The lifecycle
 
@@ -70,6 +70,13 @@ by hand with no mode, assume `bootstrap`.
 **`bootstrap`**: there is no pull request. Rebase onto `main` and commit your
 work there. **Do not move the `main` bookmark** — foregent moves it for you
 when you call `complete_task`, at the repo root where jj exports it to git.
+
+**Rebase onto `main` right before you complete.** Other bootstrap agents run
+beside you, and each one that lands moves `main` forward under you. Foregent
+only ever moves it forward, so it refuses a completion whose work is not
+descended from what `main` reached: `jj rebase -d main`, resolve any conflicts,
+and call `complete_task` again. You keep your workspace and your commits
+through a refusal, so a retry costs nothing but the rebase.
 
 **`pull-request`**: push a branch and open a PR through the GitHub MCP, then
 report yourself blocked on the review rather than waiting.
