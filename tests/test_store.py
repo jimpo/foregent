@@ -51,11 +51,28 @@ class PersistenceTests(unittest.TestCase):
             provider=Provider.CODEX,
             model="gpt-5",
             blocker="a review of the PR",
+            parent="JIM-198",
             agent=AgentRef("fg-jim-88", "conversation-1"),
         )
         IssueStore(self.path).add(issue)
 
         self.assertEqual(self.reopen().get("JIM-88"), issue)
+
+    def test_a_delegated_issue_comes_back_a_sub_issue(self) -> None:
+        # The parent is what admits the issue and what its completion wakes
+        # (JIM-250), so a restart that forgot it would launch the child
+        # against the wrong limit and tell nobody when it landed.
+        IssueStore(self.path).queue("JIM-88", "/src/repo", parent="JIM-198")
+
+        self.assertEqual(self.reread("JIM-88").parent, "JIM-198")
+
+    def test_an_issue_the_operator_queues_has_no_parent(self) -> None:
+        store = IssueStore(self.path)
+        store.queue("JIM-88", "/src/repo", parent="JIM-198")
+
+        store.queue("JIM-88", "/src/repo")
+
+        self.assertIsNone(self.reread("JIM-88").parent)
 
     def test_the_queue_comes_back_in_order(self) -> None:
         # Insertion order is the queue order, and the file is a list so it

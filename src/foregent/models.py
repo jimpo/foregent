@@ -75,6 +75,12 @@ class Issue:
     # needs it across a restart and a running one does not.
     model: str | None = None
     blocker: str = ""
+    # The issue this one was delegated from, set when a worker hands its
+    # sub-issues to the queue (`queue_sub_issues`), None for an issue an
+    # operator queued. The only topology foregent keeps: it decides admission
+    # (a sub-issue is gated on the run limit alone) and it is who a completion
+    # tells that this issue landed.
+    parent: str | None = None
     # The agent working this issue: where it runs, and the conversation it
     # holds. None until dispatch. The conversation id is the half that outlives
     # the process.

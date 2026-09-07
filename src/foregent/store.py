@@ -28,10 +28,11 @@ from foregent.models import Issue, IssueStatus
 logger = logging.getLogger(__name__)
 
 # The shape of the state file. A file of any other version is not read: there
-# is no migration until there is a second version to migrate from, and
-# starting empty is exactly the position the bridge was in before it had a
-# file at all.
-STATE_VERSION = 1
+# is no migration, and starting empty is exactly the position the bridge was
+# in before it had a file at all — the boot reconciliation rebuilds every
+# live agent from the harness, so what a version bump costs is the queue.
+# Version 2 carries `parent` on each record (JIM-250).
+STATE_VERSION = 2
 
 # An issue with a live agent working it, whether or not that agent is busy.
 # These are the states an event can be delivered into and the ones an issue can
@@ -128,6 +129,7 @@ class IssueStore:
         repo: str,
         provider: Provider = DEFAULT_PROVIDER,
         model: str | None = None,
+        parent: str | None = None,
     ) -> Issue:
         """Mark issue ``key`` Queued against ``repo``, at the back of the queue.
 
@@ -135,9 +137,14 @@ class IssueStore:
         order, so :meth:`next_queued` needs no separate queue structure.
         Unknown keys are upserted, as in :meth:`complete`.
 
-        Only the repo, the harness and the model are known here. The agent's
-        own directory is the workspace dispatch builds from them, so it is
-        set there.
+        ``parent`` is the issue that delegated this one, and is what makes it
+        a sub-issue for admission and for the wake its completion sends
+        (JIM-250). It is written on every queue, so an issue an operator
+        queues by hand is an operator's issue again whatever it was before.
+
+        Only the repo, the harness, the model and the parent are known here.
+        The agent's own directory is the workspace dispatch builds from them,
+        so it is set there.
         """
         with self._lock:
             existing = self._issues.pop(key, None) or Issue(key=key, title="")
@@ -148,6 +155,7 @@ class IssueStore:
                 directory="",
                 provider=provider,
                 model=model,
+                parent=parent,
             )
             self.add(issue)
             return issue
@@ -272,6 +280,7 @@ def _encode(issue: Issue) -> dict[str, Any]:
         "provider": issue.provider.value,
         "model": issue.model,
         "blocker": issue.blocker,
+        "parent": issue.parent,
         "agent": (
             {
                 "label": issue.agent.label,
@@ -296,6 +305,7 @@ def _decode(record: dict[str, Any]) -> Issue:
         provider=Provider(record["provider"]),
         model=record["model"],
         blocker=record["blocker"],
+        parent=record["parent"],
         agent=(
             AgentRef(agent["label"], agent["conversation_id"])
             if agent is not None
