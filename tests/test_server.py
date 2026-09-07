@@ -165,8 +165,9 @@ class DispatchTests(unittest.TestCase):
         key: str = "JIM-88",
         directory: str = "/ws/JIM-88",
         provider: Provider = Provider.CLAUDE,
+        model: str | None = None,
     ) -> None:
-        server.store.queue(key, directory, provider)
+        server.store.queue(key, directory, provider, model)
 
     def test_dispatch_claims_before_launching(self) -> None:
         # Nothing runs without a durable ownership record in Linear .
@@ -234,6 +235,25 @@ class DispatchTests(unittest.TestCase):
         self.queue(provider=Provider.CODEX)
         server.dispatch()
         self.assertEqual(self.manager.launched[0].provider, Provider.CODEX)
+
+    def test_the_queued_model_is_what_is_launched(self) -> None:
+        # Which model the harness runs is the operator's answer too (JIM-245),
+        # carried from `foregent queue` to the launch unchanged.
+        self.queue(model="claude-opus-5")
+        server.dispatch()
+        self.assertEqual(self.manager.launched[0].model, "claude-opus-5")
+
+    def test_no_queued_model_leaves_the_choice_to_the_harness(self) -> None:
+        # Unset means no `--model` at launch at all, so the harness's own
+        # default applies rather than one foregent guessed.
+        self.queue()
+        server.dispatch()
+        self.assertIsNone(self.manager.launched[0].model)
+
+    def test_the_queue_route_carries_the_model(self) -> None:
+        # The operator names the model in the request body, beside the harness.
+        server.queue_issue("JIM-88", directory="/ws/JIM-88", model="gpt-5.5")
+        self.assertEqual(self.manager.launched[0].model, "gpt-5.5")
 
     def test_the_queued_harness_decides_the_brief(self) -> None:
         # Codex has no slash form for a skill, so its brief names the skill in

@@ -68,6 +68,10 @@ class Issue:
     # `foregent queue`. Recovered after a restart from the agent kind herdr
     # reports, so nothing about it has to be persisted.
     provider: Provider = DEFAULT_PROVIDER
+    # The model the agent runs, named by the operator at `foregent queue`, or
+    # None to let the harness choose. Used at launch only, so a restart, which
+    # recovers issues whose agents are already running, has no need of it.
+    model: str | None = None
     blocker: str = ""
     # The agent working this issue: where it runs, and the conversation it
     # holds. None until dispatch. The conversation id is the half that outlives

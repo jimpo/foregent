@@ -635,6 +635,7 @@ def _dispatch_one() -> bool:
                     label=label,
                     cwd=cwd,
                     provider=provider,
+                    model=issue.model,
                     mcp_servers=agent_mcp_servers(),
                 )
             )
@@ -690,6 +691,7 @@ def queue_issue(
     key: str,
     directory: Annotated[str, Body(embed=True)],
     provider: Annotated[Provider, Body(embed=True)] = DEFAULT_PROVIDER,
+    model: Annotated[str | None, Body(embed=True)] = None,
 ) -> dict[str, str]:
     """Queue issue ``key`` against the repo at ``directory``, dispatching if free.
 
@@ -701,6 +703,11 @@ def queue_issue(
     (§1.3) — unlike the mode, which is read off the repo. A harness foregent
     does not run is refused here rather than at launch, where an issue would
     already have been claimed.
+
+    ``model`` is which model that harness runs, and is likewise the
+    operator's. Unset, the harness chooses its own default. It is not checked
+    here: every harness has its own names for its models, and the harness is
+    what refuses one it does not know.
     """
     existing = store.get(key)
     if existing is not None and existing.status in (
@@ -710,7 +717,7 @@ def queue_issue(
         raise HTTPException(
             status_code=409, detail=f"{key} is already {existing.status}"
         )
-    issue = store.queue(key, directory, provider)
+    issue = store.queue(key, directory, provider, model)
     dispatch()
     return _record(store.get(key) or issue)
 
