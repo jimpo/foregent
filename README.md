@@ -265,13 +265,13 @@ webhook and nothing else, so a hook that has stopped looks exactly like a
 quiet morning; a timestamp hours old is what tells the two apart.
 
 `queue` records the issue and dispatches it if there is capacity. **How many
-agents run at once is the project's mode**: bootstrap mode is one at a time,
-because the bridge advances `main` onto each agent's work and the next
-workspace is built from it; Pull Request mode holds up to `FOREGENT_MAX_AGENTS`
-(default 5) live — each in its own workspace with its own branch — and works
-up to `FOREGENT_MAX_ACTIVE` (default 3, independent of `FOREGENT_MAX_AGENTS`)
-of them at once, since a parked agent gives back the run slot it is not
-using. Dispatch assigns the
+agents run at once is the box's, not the project's**: up to
+`FOREGENT_MAX_AGENTS` (default 5) live — each in its own workspace — and up to
+`FOREGENT_MAX_ACTIVE` (default 3, independent of `FOREGENT_MAX_AGENTS`) worked
+at once, since a parked agent gives back the run slot it is not using. That
+holds in bootstrap mode too: agents there branch from the same `main`, and the
+bridge only ever advances it forward, so the second to finish is refused,
+rebases onto the `main` it can now see, and completes again. Dispatch assigns the
 issue to the foregent account in Linear and moves it to `In Progress`, and
 completion moves it to `Done` unless the agent already closed or cancelled it,
 so the team must have states with exactly those two names. A queued issue
@@ -363,7 +363,7 @@ state.
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
 | `FOREGENT_LOG_LEVEL` | What level `serve` logs at (default `info`), for uvicorn's loggers and foregent's own. `--log-level` overrides it. |
-| `FOREGENT_MAX_AGENTS` | How many agents hold a live slot at once in Pull Request mode — in flight, working or parked (default 5). Bootstrap mode is always one. |
+| `FOREGENT_MAX_AGENTS` | How many agents hold a live slot at once — in flight, working or parked, in either mode (default 5). |
 | `FOREGENT_MAX_ACTIVE` | How many of those are actually worked at once (default 3, independent of `FOREGENT_MAX_AGENTS`). A parked agent gives back its run slot, so a fresh one can use it while others wait on review. |
 | `FOREGENT_STATE_FILE` | Where the bridge keeps the issues it is tracking (default `~/.local/state/foregent/state.json`). |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |

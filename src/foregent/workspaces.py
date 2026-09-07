@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import tomllib
 from pathlib import Path
 
@@ -78,6 +79,15 @@ _SLUG = re.compile(r"github\.com[:/](?P<slug>[^/\s]+/[^/\s]+?)(?:\.git)?$")
 # working copy, so this is generous; it exists to stop a wedged jj from
 # hanging dispatch forever, not to bound normal work.
 TIMEOUT = 300
+
+# Held for the whole of one `advance`, so bootstrap agents completing together
+# land one at a time (JIM-252). jj is optimistically concurrent: two moves that
+# loaded the same operation both succeed, and merging their divergent op heads
+# leaves `main` *conflicted* — pointing at both tips, with git exported to
+# whichever won the race — so the fast-forward refusal that is supposed to stop
+# the second agent never fires and both issues complete. One bridge process
+# performs every advance on a box, so a lock here is the whole of the fix.
+_advancing = threading.Lock()
 
 
 class WorkspaceError(Exception):
@@ -235,21 +245,60 @@ def advance(repo: Path, key: str) -> None:
       the workspace; its parent, rather than itself, because the working-copy
       commit is jj's scratch space and publishing it would put an empty commit
       at the head of ``main``. An agent that committed nothing leaves ``@-``
-      *on* ``main``, which jj answers with "No bookmarks to update" and a zero
-      exit.
+      *on* ``main`` and jj answers "No bookmarks to update" with a zero exit,
+      so long as ``main`` is still where that workspace was built; once
+      another agent has moved it, the empty-handed agent is behind it and is
+      refused like any other.
     - **``bookmark move`` is fast-forward-only** without ``--allow-backwards``,
       so jj refuses work that is not descended from ``main`` and leaves the
       bookmark where it was. The rebase requirement the worker skill states is
       enforced here for free, with no ancestry revset of foregent's own to get
       wrong.
 
+    **Serialised by :data:`_advancing`, and that lock is load-bearing.** The
+    fast-forward refusal only answers the second agent if the second agent
+    reads the first one's move, and jj gives no such guarantee to two commands
+    running at once (see the lock's own comment).
+
+    **Work carrying an unresolved conflict is refused before the move.** A
+    rebase onto a ``main`` another agent has landed on can conflict, and jj is
+    content to publish the conflicted commit: ``bookmark move`` succeeds, and
+    the file git then holds is one side of the conflict under a commit message
+    claiming the other. The issue would complete and the workspace be removed
+    on top of that, so the whole range this would publish is checked and the
+    agent is sent back to resolve it.
+
     Running at the colocated repo root is also what exports the bookmark to
     git: a mutating jj command there is what git's view of ``main`` waits for.
     """
     if not is_repo(repo):
         return
-    _jj(repo, "bookmark", "move", TRUNK, "--to", f"{key}@-")
+    with _advancing:
+        _refuse_conflicted(repo, key)
+        _jj(repo, "bookmark", "move", TRUNK, "--to", f"{key}@-")
     logger.info("advanced %s onto the work in the %s workspace", TRUNK, key)
+
+
+def _refuse_conflicted(repo: Path, key: str) -> None:
+    """Raise if anything ``key`` would publish holds an unresolved conflict.
+
+    The whole range rather than the tip: a conflict resolved in a later commit
+    still leaves the one that carries it on ``main``, where the merge markers
+    are what the next agent's workspace is built from.
+    """
+    marked = _jj(
+        repo,
+        "log",
+        "-r",
+        f"{TRUNK}..{key}@-",
+        "--no-graph",
+        "-T",
+        'if(conflict, "!")',
+    )
+    if marked.strip():
+        raise WorkspaceError(
+            f"the work in the {key} workspace has unresolved conflicts"
+        )
 
 
 def destroy(repo: Path, key: str, path: Path) -> None:

@@ -179,12 +179,11 @@ the bridge through the foregent MCP server.
 <name>]` records the issue as Queued against that repo, that harness and, if
 one is named, that model, then:
 
-1. **Capacity.** Whether there is room for this issue (§5.2). One agent at a
-   time in bootstrap mode; in pull request mode, up to `FOREGENT_MAX_AGENTS`
-   live and `FOREGENT_MAX_ACTIVE` working at once (JIM-248). Every in-flight
-   issue holds a live slot, and a working one holds a run slot too; a parked
-   one gives its run slot back, and a launch never takes one a wake is
-   already waiting on (§1.7).
+1. **Capacity.** Whether there is room for another agent (§5.2): up to
+   `FOREGENT_MAX_AGENTS` live and `FOREGENT_MAX_ACTIVE` working at once
+   (JIM-248), in either mode. Every in-flight issue holds a live slot, and a
+   working one holds a run slot too; a parked one gives its run slot back, and
+   a launch never takes one a wake is already waiting on (§1.7).
 2. **Skills.** Every packaged skill is written first, over whatever is there,
    into the skill directory of the harness this issue names. Claude Code picks
    up live edits to a skill directory, but only one that existed when the
@@ -421,10 +420,12 @@ The agent calls one of two MCP tools the bridge serves at `/mcp`:
 
   **A refusal to advance is the one thing that stops the completion**, before
   anything else has happened. jj declines to move `main` onto work that is not
-  descended from it (§6.5), which means an agent that never rebased: its
-  commits exist only in the workspace, so tearing that workspace down would
-  take them with it. The issue stays in flight, the workspace stays on disk,
-  and the tool says so.
+  descended from it (§6.5), which is the ordinary race between concurrent
+  bootstrap agents (§5.2): another agent landed since this one last rebased.
+  Its commits exist only in its workspace, so tearing that workspace down
+  would take them with it. The issue stays in flight, the workspace stays on
+  disk, and the tool tells the agent to rebase onto `main`, resolve any
+  conflicts, and call it again.
 
 The tools are mounted in the bridge's own process, so they mutate the store
 directly instead of looping back over HTTP.
@@ -471,35 +472,37 @@ worked, whether it is under review or parked on one.
 
 ### 5.2 Capacity
 
-**How many agents run at once is the project's mode, not a number** — and,
-in pull request mode, two numbers rather than one (JIM-248). Capacity models
-the process scheduler: `FOREGENT_MAX_AGENTS` is RAM, bounding every live
-process and workspace; `FOREGENT_MAX_ACTIVE` is cores, bounding only the
-agents actually being worked right now. **The two are tuned separately and
-ship at different defaults on purpose** — 5 and 3 — so a box already holds
-more pull requests open for review than it works at once with nothing for an
-operator to set; raising `FOREGENT_MAX_AGENTS` to hold still more open does
-not, on its own, also raise how many run.
+**How many agents run at once is the box's answer, and it is two numbers**
+(JIM-248). Capacity models the process scheduler:
+`FOREGENT_MAX_AGENTS` is RAM, bounding every live process and
+workspace; `FOREGENT_MAX_ACTIVE` is cores, bounding only the agents actually
+being worked right now. **The two are tuned separately and ship at different
+defaults on purpose** — 5 and 3 — so a box already holds more pull requests
+open for review than it works at once with nothing for an operator to set;
+raising `FOREGENT_MAX_AGENTS` to hold still more open does not, on its own,
+also raise how many run.
 
-- **Bootstrap: one at a time**, and the repo rather than policy is what says
-  so. A workspace is built at `main` and completion fast-forwards `main` onto
-  the agent's tip (§4.3), so two bootstrap agents branch from the same commit
-  and the second cannot land what it wrote. Advancing before the next dispatch
-  is precisely what gives each agent a base holding the last one's work. The
-  live limit of one already bounds the run limit too, so bootstrap mode has no
-  separate use for `FOREGENT_MAX_ACTIVE`.
-- **Pull request: up to `FOREGENT_MAX_AGENTS`** (default 5) **live, and up to
-  `FOREGENT_MAX_ACTIVE`** (default 3) **working**. The agent pushes its own
-  branch and `main` is the reviewer's to move, so nothing in the repo
-  serialises either limit, and what one box can carry is the thing being
-  tuned in both.
+**Both limits apply in both modes** (JIM-252), and every in-flight issue
+counts against the live one. In pull request mode nothing in the repo
+constrains them: each agent pushes its own branch and `main` is the
+reviewer's to move. In bootstrap mode agents branch from the same `main`, and
+the landing path is what keeps that safe (§6.5). Completion runs `jj bookmark
+move main --to <KEY>@-` under a lock the bridge holds, one advance at a time,
+and the move is fast-forward only: the second agent to complete is refused,
+with its issue still in flight and its workspace still on disk. Workspaces
+share one repo, so rebasing onto the `main` the first agent landed and
+completing again is what lands the second. The bridge rebases for nobody — a
+conflict needs the agent — and refuses work that carries one rather than
+publishing it.
 
-The live limit is set by the mode of the issue at the head of the queue, and
-every in-flight issue counts against it. A queued bootstrap issue therefore
-waits behind agents on any repo — over-strict only on a box hosting two
-projects, which §1.1 rules out, and the safe answer everywhere else. The mode
-is derived per call from the repo (§6.4), so it is never stored; an issue
-whose repo is unknown reads bootstrap, the serial answer.
+**The lock is not a formality, and jj alone is not enough.** jj is
+optimistically concurrent: two `bookmark move` commands that load the same
+operation both exit zero, and merging their divergent operation heads leaves
+`main` *conflicted*, naming both tips with git exported to whichever won. Both
+completions would then report success, both issues would close, and both
+workspaces would be destroyed with one agent's work reachable from nothing.
+The fast-forward refusal only answers the second agent if the second agent
+reads the first one's move, which is what the lock guarantees and jj does not.
 
 **A parked agent holds its live slot for the whole block, but gives back its
 run slot** (§1.7). This is what keeps a box busy while several agents wait on
@@ -772,6 +775,18 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   refuses work that is not descended from `main` and leaves the bookmark where
   it was. The rebase requirement the worker skill states is enforced by jj for
   free, with no ancestry revset of foregent's own to get wrong (§4.3).
+
+  **The bridge holds a lock across the whole advance**, because that refusal
+  is only reached by an advance that has read the previous one (§5.2). One
+  process performs every advance on a box, so a process-wide lock is the whole
+  of it.
+
+  **A conflicted commit is refused before the bookmark moves.** jj publishes
+  one happily — the move exits zero, and the file git ends up with is one side
+  of the conflict under a commit message claiming the other — so the range
+  about to be published is checked for conflicts and the agent is sent back to
+  resolve them. Rebasing onto a `main` another agent just landed on is the
+  ordinary way to acquire one.
 - **A secondary workspace names the repo it belongs to.** Its `.jj/repo` is a
   file holding the path of the shared repo directory, so the repo a teardown
   has to run `forget` in can be read back out of the agent's cwd. That is how
@@ -973,7 +988,7 @@ installed.
 | `FOREGENT_API_URL` | CLI, agents | Where the bridge is. Default `http://127.0.0.1:8577`. |
 | `FOREGENT_HERDR_SESSION` | bridge | Which herdr session agents run in. |
 | `FOREGENT_WORKSPACE_ROOT` | bridge | Where per-issue workspaces are built. Default `~/.foregent/workspaces`. |
-| `FOREGENT_MAX_AGENTS` | bridge | Live agents at once in pull request mode. Default 5; bootstrap is always one. |
+| `FOREGENT_MAX_AGENTS` | bridge | Live agents at once, in either mode (§5.2). Default 5. |
 | `FOREGENT_MAX_ACTIVE` | bridge | Of those, how many actually work at once (§5.2). Default 3, independent of `FOREGENT_MAX_AGENTS`. |
 | `FOREGENT_STATE_FILE` | bridge | Where the issue store is persisted (§5.4). Default `~/.local/state/foregent/state.json`. |
 | `FOREGENT_LOG_LEVEL` | CLI | Default of `serve --log-level`. Default `info`. |
