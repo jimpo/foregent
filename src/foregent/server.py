@@ -1346,15 +1346,14 @@ async def land(issue_key: str, issue: Issue | None) -> str | None:
 
     **A refusal stops the completion short**, and is the one thing in this
     path that does. jj declines to move ``main`` onto work that is not
-    descended from it, and with bootstrap agents running concurrently
-    (JIM-252) that is the ordinary race rather than an agent that never
-    rebased: ``main`` moves whenever another agent lands, which can be after
-    this one's last rebase. The refused agent is still alive, so the message
-    tells it what to do — rebase onto ``main``, resolve any conflicts, and
-    call ``complete_task`` again. Returning it leaves the issue in flight and
-    the workspace on disk, which is what makes the retry possible: the
-    commits exist only in that workspace, and going on would tear it down and
-    take them with it.
+    descended from it, which is the ordinary race between concurrent
+    bootstrap agents (JIM-252): ``main`` moves whenever one of them lands,
+    which can be after this agent's last rebase. The refused agent is alive,
+    so the message tells it what to do — rebase onto ``main``, resolve any
+    conflicts, and call ``complete_task`` again. Returning it leaves the issue
+    in flight and the workspace on disk, which is what makes the retry
+    possible: the commits exist only in that workspace, and going on would
+    tear it down and take them with it.
 
     Only an in-flight issue is landed, which is what keeps completing twice
     safe. The second call has no workspace left to name a revision in, and jj
