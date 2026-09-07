@@ -26,8 +26,9 @@ designed for:
 - **Credentials belong to the box.** `LINEAR_API_KEY` and `GITHUB_TOKEN` live
   in the herdr server's environment and expand per session (§6.3). An agent
   cannot be given a narrower set than its box has.
-- **Nothing on the box is irreplaceable.** Repositories are clones and state
-  is rebuilt at boot (§5.4). The box is rebuilt, not repaired.
+- **Nothing on the box is irreplaceable.** Repositories are clones, and the
+  one file the bridge keeps is reconciled against the live agents at boot and
+  can be deleted (§5.4). The box is rebuilt, not repaired.
 - **The operator watches and does not interact** (§8.2).
 
 The cost: a confused or hostile agent can do anything its box can. That is
@@ -62,15 +63,25 @@ screen, so a pane is prompted, read, waited on and closed by the same call
 whatever runs in it. Only starting one differs, in the agent kind and the
 argv, and both are looked up from the provider.
 
-### 1.4 Linear and herdr hold the state
+### 1.4 Three parties hold the state, split by what each can vouch for
 
-The bridge keeps no persistent store. Linear holds issue truth and ownership;
-herdr holds the live agents. The bridge's own issue map is an in-memory
-cache, and a restart rebuilds it from those two.
+**Linear holds issue truth**: ownership and status as the world sees them.
+**herdr holds liveness**: which agents exist and what each is doing. **The
+bridge's state file holds foregent's own intent**: queue order, which agent
+was bound to which issue, what a parked agent said it was waiting for, and
+whatever a scheduler decides later. Nothing else can rebuild that, because
+nothing else was told.
 
-Unbuilt: durable per-issue metadata. The conversation id and workspace path
-have nowhere to live across a reboot, so a restart recovers which issues are
-running but not enough to resume them (§5.4).
+The file claims nothing about the world. Every write to the issue store
+rewrites it atomically, and a restart reads it back and then checks it
+against herdr before trusting a word of it (§5.4). Deleting it puts the
+bridge where it was before it had one — every live agent adopted off its
+label, the queue gone — which is what keeps the box disposable (§1.1).
+
+The alternative was to keep making the herdr agent label carry the state,
+which it cannot: a label holds one issue key, so a Queued issue, with no
+agent, had nothing to survive in, and every feature that needed a field had
+to be designed to fit a name.
 
 ### 1.5 One agent owns one issue, end to end
 
@@ -109,7 +120,7 @@ One machine per project. Three layers.
                  │ webhooks            ▲ comments, PRs, issue updates
                  ▼ (HTTPS ingress)     │ (written by agents via MCP)
   ┌───────────────────────────────────┴─────────────┐
-  │ foregent bridge (Python / FastAPI, stateless)   │
+  │ foregent bridge (Python / FastAPI)              │
   │  • event ingest, authentication, matching       │
   │  • delivery queues + drainers, one per issue    │
   │  • dispatch and capacity                        │
@@ -136,7 +147,7 @@ the bridge through the foregent MCP server.
 | Module | Responsibility |
 |---|---|
 | `server.py` | The bridge: HTTP routes, the webhook endpoint, dispatch, the per-issue delivery queues and their drainers, the harness-event watcher, the mounted MCP server. |
-| `store.py` | `IssueStore`, the in-memory issue map, and what counts as in-flight. |
+| `store.py` | `IssueStore`, the issue map and the state file it is mirrored to, and what counts as in-flight. |
 | `models.py` | `Issue` and `IssueStatus`. |
 | `events.py` | `Event`, `EventKind`, and the pure `wakes()` and `delivery_message()`. No transport, no server. |
 | `linear.py` | Linear GraphQL client: claim an issue, close it, resolve foregent's account, authenticate a webhook, map a payload to an `Event`. |
@@ -356,10 +367,9 @@ costs one agent turn while a missed one leaves an agent parked forever on a
 base that has moved.
 
 **Nothing records which workers have a pull request open, deliberately.** The
-bridge has nothing to rebuild such a record from, so it would be
-empty after every restart — which is the ordinary case here (§5.4) — and the
-fallback for an empty one is the rule above. A worker parked on something
-else is therefore woken too; it reads one line and parks again.
+rule above is the whole answer, and a record beside it would be a second
+thing to keep true. A worker parked on something else is therefore woken too;
+it reads one line and parks again.
 
 **A wake un-blocks**, so a worker that handles one and is still waiting has to
 report itself blocked again or no later push will reach it. The worker skill
@@ -429,8 +439,10 @@ narrate the work.
 
 The bridge logs the herdr session it resolved, refuses to start on a protocol
 mismatch, warns if the machine's MCP servers or their credentials are absent,
-rebuilds the issue store, then starts two daemon threads: the harness-event
-watcher and the delivery drainer.
+opens the state file and reconciles it against the live agents (§5.4), starts
+the harness-event watcher, then dispatches whatever came back Queued. That
+last step is the boot's, because nothing else runs a dispatch until the next
+queue or completion; a failure there is logged and leaves the issue Queued.
 
 ## 5. State
 
@@ -460,9 +472,8 @@ The limit is set by the mode of the issue at the head of the queue, and every
 in-flight issue counts against it. A queued bootstrap issue therefore waits
 behind agents on any repo — over-strict only on a box hosting two projects,
 which §1.1 rules out, and the safe answer everywhere else. The mode is derived
-per call from the repo (§6.4), so it needs nothing persisted to survive a
-restart; an issue whose repo a restart could not recover reads bootstrap, the
-serial answer.
+per call from the repo (§6.4), so it is never stored; an issue whose repo is
+unknown reads bootstrap, the serial answer.
 
 **A parked agent holds its slot for the whole block** (§1.7). In pull request
 mode the steady state is therefore N agents all waiting on review, so
@@ -474,53 +485,75 @@ box.
 
 Each agent is launched with the herdr agent name `fg-<issue-key-lowercased>`,
 in a workspace labeled with the uppercase key. The name is the binding: it is
-unique among live agents and the issue key parses back out of it, so nothing
-about a running agent needs persisting to find it again.
+unique among live agents and the issue key parses back out of it, so a running
+agent is found again by name alone, whether or not the state file knew it.
 
 The harness is not in the name and does not need to be: herdr reports the
 agent kind it detected, and `Provider`'s values are those kinds.
 
 ### 5.4 What a restart recovers
 
-One `agent.list` against herdr rebuilds the issue-to-agent map from the
-labels, finding every live agent including parked ones. **Which harness each
-one runs comes back with it**, from the agent kind in that same listing; an
-agent of a kind foregent does not know reads as the default, which costs
-nothing, because the provider decides a brief, a skill directory and a
-workspace's trust and this issue was dispatched already. Which model it runs
-does not come back, and need not: the model is used at launch only, and a
-recovered agent is already launched.
+Restarts are the ordinary case: `--dev` reloads on every source change, and
+the operator restarts the bridge after merging a pull request. A restart
+loses nothing the store held, because the store is a file.
 
-**Whether an agent was parked comes back with it**, from the status in that
-same listing rather than from the label, which does not record it: an agent
-that is not mid-turn has finished one and is waiting, which in this system
-means it parked. A status that says the agent could not be read, or that it is
-waiting on input rather than on the world, is not read that way — claiming
-either had parked would be a guess in the direction that wakes agents nobody
-was waiting for.
+**The write path is one point and one file.** Every `IssueStore` mutation
+ends in `add()`, which serializes the whole store under the store's own lock,
+writes a sibling temporary file, fsyncs it and renames it over the old one.
+The next boot therefore reads either the previous state or this one, never a
+torn file. The file is `FOREGENT_STATE_FILE`,
+`~/.local/state/foregent/state.json` by default, and carries a `version`
+beside the issues; the issues are a list, so queue order is file order. A
+save that fails is logged at error level and the store in memory carries on:
+the file is what the *next* run reads, and failing the completion or the
+webhook that caused the write would trade a stale snapshot for a stuck agent.
 
-Getting it back matters beyond the operator's table. A push to `main` wakes
-the issues that are Blocked (§4.2), and in Pull Request mode the steady state
-is a fleet of agents all waiting on review (§5.2), so a restart that returned
-them all as working left that wake with nobody to find.
+**The boot path reads, then reconciles.** A missing file is the first boot; a
+file that will not parse, or names a version this code does not write, is
+logged and read as empty rather than half-read. Either way the bridge is
+where it stood before it had a file, and the reconciliation below rebuilds it
+from the live agents alone. There is no migration until there is a second
+version to migrate from. Then one `agent.list` against herdr, and each stored
+in-flight issue is checked against it:
 
-Titles and conversation ids are still lost, and so is the blocker's text: a
-recovered issue carries a placeholder saying it is unknown. That is affordable
-because the blocker is a note and never a key (§1.6) — nothing matches on it,
-so an honest placeholder tells the operator as much as prompting every idle
-worker to report itself again would have, and costs no agent turns to get.
+- **Its agent is gone → Orphaned.** The bridge was down when the agent
+  exited, so nobody freed the slot; this does. Deciding what happens next —
+  re-dispatch, defer, escalate — stays the scheduler's, as it is for an
+  agent that dies while the bridge is up (§4.3).
+- **Its agent is live → the stored record stands**, title, repo, conversation
+  id and blocker text included, with whether it is parked taken from herdr's
+  status: an agent that is not mid-turn has finished one and is waiting, which
+  in this system means it parked. A stored working issue whose agent has
+  since parked carries a placeholder blocker, because the words it chose
+  went to a bridge that was down. A status that says nothing — the state
+  could not be read, or the agent is waiting on input rather than on the
+  world — leaves the stored status as it was: the record is evidence, and the
+  In Progress guess was only ever for having none.
+- **A live agent the file does not know is adopted.** The issue key comes out
+  of its label (§5.3), the repo out of the `.jj/repo` in its cwd (§6.5), the
+  harness out of the agent kind herdr reports — a kind foregent does not
+  know reads as the default, which costs nothing, since the provider decides a
+  brief, a skill directory and a workspace's trust and this issue was
+  dispatched already — and parked or working from its status as above. The
+  title is empty and the blocker a placeholder saying it is unknown, which is
+  affordable because the blocker is a note and never a key (§1.6). This is
+  the whole of a boot with no file.
 
-The repo each workspace was built from is not lost with them, because it is
-not recovered from the label at all: a secondary workspace's `.jj/repo` names
-the repo it belongs to, so the agent's cwd is read for it (§6.5). Teardown
-needs that repo to forget the workspace, and a restart between dispatch and
-completion is the ordinary case rather than the exception — the operator
-merges an agent's pull request and restarts the bridge on the change.
+Queued, Done and Orphaned issues have no agent to check and come back as
+written. Getting the parked ones right matters beyond the operator's table: a
+push to `main` wakes the issues that are Blocked (§4.2), and in Pull Request
+mode the steady state is a fleet of agents all waiting on review (§5.2), so a
+restart that returned them all as working left that wake with nobody to find.
 
-Unbuilt: orphan reconciliation — querying Linear on boot for owned in-flight
-issues, moving the ones whose agents are gone to Orphaned, and re-dispatching
-an orphan by resuming its conversation. Until it lands, a reboot costs a
-fresh dispatch.
+A herdr that cannot be reached at boot logs and leaves the store as the file
+had it, rather than empty: what was written is the honest answer when the
+harness cannot say otherwise, and the drainers already cope with an agent
+that cannot be reached.
+
+What the file does not hold, and stays lost across a restart: the pending
+deliveries in the drainer queues, which neither webhook source re-sends. And
+what is held but not yet used: the conversation id, which is what resuming an
+orphan would need. Nothing re-dispatches an orphan today.
 
 ## 6. The agent contract
 
@@ -553,7 +586,7 @@ counterpart of `--session-id`; it records a session of its own and `resume`
 takes that id afterwards, so the id foregent generates is unused there and the
 one worth keeping is read back off herdr once the agent has started. The
 asymmetry costs nothing today, because resuming a conversation is unbuilt
-(§5.4).
+(§5.4); the id foregent records is whichever the manager returned at launch.
 
 ### 6.2 The workflow lives in a skill
 
@@ -642,7 +675,7 @@ opened, and everything else — no remotes, an origin hosted elsewhere, a
 directory that is not a jj repo — is bootstrap, which needs nothing. The
 answer travels to the agent in the brief (§4.1), and the same call answers
 again at completion, because it is a pure function of the repo and a stored
-copy would be one more thing a restart cannot recover (§5.4).
+copy would be a second place for it to be wrong.
 
 Derived rather than declared because the alternative is two places to
 disagree. A file saying `pull request` in a repository with no GitHub remote
@@ -702,10 +735,10 @@ Three behaviors of jj shape this, all established by driving jj 0.43 directly:
   free, with no ancestry revset of foregent's own to get wrong (§4.3).
 - **A secondary workspace names the repo it belongs to.** Its `.jj/repo` is a
   file holding the path of the shared repo directory, so the repo a teardown
-  has to run `forget` in is read back out of the agent's cwd instead of
-  remembered. That is what makes a restart between dispatch and completion
-  survivable (§5.4). A repo's own root answers nothing — there `.jj/repo` is a
-  directory — so nothing mistakes a project for a disposable workspace.
+  has to run `forget` in can be read back out of the agent's cwd. That is how
+  an agent the state file does not know gets its repo at boot (§5.4). A repo's
+  own root answers nothing — there `.jj/repo` is a directory — so nothing
+  mistakes a project for a disposable workspace.
 
 A fresh workspace holds only what version control tracks, so the untracked
 files a project needs to run — `.env`, a local settings file, a key — are not
@@ -902,6 +935,7 @@ installed.
 | `FOREGENT_HERDR_SESSION` | bridge | Which herdr session agents run in. |
 | `FOREGENT_WORKSPACE_ROOT` | bridge | Where per-issue workspaces are built. Default `~/.foregent/workspaces`. |
 | `FOREGENT_MAX_AGENTS` | bridge | Agents at once in pull request mode. Default 3; bootstrap is always one. |
+| `FOREGENT_STATE_FILE` | bridge | Where the issue store is persisted (§5.4). Default `~/.local/state/foregent/state.json`. |
 | `FOREGENT_LOG_LEVEL` | CLI | Default of `serve --log-level`. Default `info`. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |

@@ -25,8 +25,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-# Agent labels are the bridge's own persistence scheme: an issue's agent is
-# found again after a restart by name alone. The form is the lowest common
+# Agent labels are how the bridge finds an issue's agent again: by name alone,
+# whether or not its state file knew the agent. The form is the lowest common
 # denominator across harnesses — herdr requires `[a-z][a-z0-9_-]{0,31}`, and
 # tmux-backed runtimes forbid "/" — so the same label works whoever runs the
 # agent.
@@ -75,8 +75,8 @@ class Provider(StrEnum):
     it to read the answer off.
 
     The value is also herdr's own name for the agent kind, which is what lets a
-    restart recover an agent's provider from the harness instead of from
-    anything foregent persisted (:meth:`AgentManager.list_agents`).
+    restart recover the provider of an agent its state file does not know
+    (:meth:`AgentManager.list_agents`).
     """
 
     CLAUDE = "claude"
