@@ -90,6 +90,39 @@ class MaxAgentsTests(unittest.TestCase):
                     self.assertEqual(config.max_agents(), 1)
 
 
+class MaxActiveTests(unittest.TestCase):
+    """How many agents a box will run at once, versus merely hold (JIM-248)."""
+
+    def test_the_environment_overrides_the_default(self) -> None:
+        with mock.patch.dict(os.environ, {"FOREGENT_MAX_ACTIVE": "5"}):
+            self.assertEqual(config.max_active(), 5)
+
+    def test_the_default_is_used_when_unset(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(config.max_active(), config.DEFAULT_MAX_ACTIVE)
+
+    def test_unset_uses_its_own_default_not_max_agents(self) -> None:
+        # The two knobs are tuned separately: raising FOREGENT_MAX_AGENTS
+        # does not, on its own, also raise how many run at once (JIM-248).
+        with mock.patch.dict(os.environ, {"FOREGENT_MAX_AGENTS": "7"}, clear=True):
+            self.assertEqual(config.max_active(), config.DEFAULT_MAX_ACTIVE)
+
+    def test_a_value_that_is_not_a_number_falls_back_and_says_so(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"FOREGENT_MAX_ACTIVE": "three", "FOREGENT_MAX_AGENTS": "4"}
+        ):
+            with self.assertLogs(config.logger, "WARNING"):
+                self.assertEqual(config.max_active(), config.DEFAULT_MAX_ACTIVE)
+
+    def test_no_setting_can_stop_every_wake(self) -> None:
+        # A zero would leave the box refusing every wake with nothing to say
+        # why, which is worse than ignoring the operator.
+        for setting in ("0", "-1"):
+            with self.subTest(setting=setting):
+                with mock.patch.dict(os.environ, {"FOREGENT_MAX_ACTIVE": setting}):
+                    self.assertEqual(config.max_active(), 1)
+
+
 class LogLevelTests(unittest.TestCase):
     """What level the server logs at (JIM-149)."""
 

@@ -267,9 +267,12 @@ quiet morning; a timestamp hours old is what tells the two apart.
 `queue` records the issue and dispatches it if there is capacity. **How many
 agents run at once is the project's mode**: bootstrap mode is one at a time,
 because the bridge advances `main` onto each agent's work and the next
-workspace is built from it; Pull Request mode runs up to `FOREGENT_MAX_AGENTS`
-(default 3), each in its own workspace with its own branch. Dispatch assigns
-the issue to the foregent account in Linear and moves it to `In Progress`, and
+workspace is built from it; Pull Request mode holds up to `FOREGENT_MAX_AGENTS`
+(default 5) live — each in its own workspace with its own branch — and works
+up to `FOREGENT_MAX_ACTIVE` (default 3, independent of `FOREGENT_MAX_AGENTS`)
+of them at once, since a parked agent gives back the run slot it is not
+using. Dispatch assigns the
+issue to the foregent account in Linear and moves it to `In Progress`, and
 completion moves it to `Done` unless the agent already closed or cancelled it,
 so the team must have states with exactly those two names. A queued issue
 waits its turn, in the order it was queued, and the queue survives a restart
@@ -316,12 +319,16 @@ then call `complete_task`.
 Completion tears the agent down and dispatches the next queued issue.
 
 An agent that hits an external dependency calls `report_blocked` and **stays
-alive** in its workspace with its context intact. It keeps holding the capacity
+alive** in its workspace with its context intact. It keeps holding its live
 slot, so `FOREGENT_MAX_AGENTS` is in practice how many pull requests may be
-open and waiting for review at once. Comment on the issue in Linear, or review
-the agent's pull request on GitHub; either reaches the agent as a prompt, and
-delivering it unblocks the issue. A review is matched to the agent by the
-branch it is on, so nothing has to be told which pull request is whose.
+open and waiting for review at once — but it gives back its run slot, so a
+fresh agent can be launched to use the box while it waits, and
+`FOREGENT_MAX_ACTIVE` (default 3) is what bounds how many run at once
+instead. Comment on the issue in Linear, or review the agent's pull request
+on GitHub; either reaches the agent as a prompt, and
+delivering it unblocks the issue — taking a run slot back to do it, ahead of
+any fresh agent waiting on the same one. A review is matched to the agent by
+the branch it is on, so nothing has to be told which pull request is whose.
 
 Observe by attaching, from the box or from a laptop:
 
@@ -356,7 +363,8 @@ state.
 | `FOREGENT_API_URL` | Base URL of the bridge (default `http://127.0.0.1:8577`). `serve` binds the host and port from it; the CLI and the agents' MCP config both address it. |
 | `FOREGENT_WORKSPACE_ROOT` | Where per-issue workspaces are built (default `~/.foregent/workspaces`). |
 | `FOREGENT_LOG_LEVEL` | What level `serve` logs at (default `info`), for uvicorn's loggers and foregent's own. `--log-level` overrides it. |
-| `FOREGENT_MAX_AGENTS` | How many agents run at once in Pull Request mode (default 3). Bootstrap mode is always one. |
+| `FOREGENT_MAX_AGENTS` | How many agents hold a live slot at once in Pull Request mode — in flight, working or parked (default 5). Bootstrap mode is always one. |
+| `FOREGENT_MAX_ACTIVE` | How many of those are actually worked at once (default 3, independent of `FOREGENT_MAX_AGENTS`). A parked agent gives back its run slot, so a fresh one can use it while others wait on review. |
 | `FOREGENT_STATE_FILE` | Where the bridge keeps the issues it is tracking (default `~/.local/state/foregent/state.json`). |
 | `CLAUDE_CONFIG_DIR` | Relocates `~/.claude`, honored by `foregent setup`. |
 | `CODEX_HOME` | Relocates `~/.codex`, the same. |
@@ -364,7 +372,7 @@ state.
 ## Development
 
 ```sh
-uv run python -m unittest discover -s tests -t .   # 479 unit tests, ~9s
+uv run python -m unittest discover -s tests -t .   # 500 unit tests, ~9s
 uv run ty check                                    # type check
 ```
 
