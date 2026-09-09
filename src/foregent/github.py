@@ -176,7 +176,8 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     type. The remaining cost is unchanged: if a person opens a pull request by
     hand on the agent's branch, feedback they write on that pull request is
     attributed to its author and reaches nobody; feedback from anyone else
-    does.
+    does. Workflow runs bypass the author comparison because their sender is
+    the actor whose push triggered CI.
     """
     if kind == _PUSH:
         return _pushed(payload)
@@ -239,22 +240,28 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
 def _completed_workflow(payload: dict) -> Event | None:
     """The ``PR_CHECK`` for a completed Actions run, or ``None``.
 
-    A workflow run may name more than one pull request. The first branch that
-    names a Linear key is the link to a worker; a run with no such branch is
-    still normalized, but names no issue and therefore reaches nobody. This
-    path deliberately does not compare sender with pull-request author: the
-    sender is commonly the agent whose push started the run.
+    A workflow run may name more than one pull request. The run's own branch is
+    the link to a worker, and the matching pull request supplies its number; a
+    run whose branch names no key, or whose pull-request list has no matching
+    entry, is still normalized but names no issue and therefore reaches
+    nobody. This path deliberately does not compare sender with pull-request
+    author: the sender is commonly the agent whose push started the run.
     """
     if payload.get("action") != "completed":
         return None
     workflow_run = payload.get("workflow_run") or {}
+    if not isinstance(workflow_run, dict):
+        workflow_run = {}
     pull_requests = workflow_run.get("pull_requests")
+    head_branch = workflow_run.get("head_branch") or ""
     issue = ""
     number = 0
     for pull_request in pull_requests if isinstance(pull_requests, list) else []:
         if not isinstance(pull_request, dict):
             continue
         branch = (pull_request.get("head") or {}).get("ref") or ""
+        if branch != head_branch:
+            continue
         key = issue_key(branch)
         if key:
             issue = key
@@ -270,7 +277,14 @@ def _completed_workflow(payload: dict) -> Event | None:
         workflow=workflow_run.get("name") or "",
         conclusion=workflow_run.get("conclusion") or "",
         author=sender.get("login") or "",
-        body=workflow_run.get("html_url") or "",
+        body=_joined(
+            (
+                f"Commit: {workflow_run.get('head_sha')}."
+                if workflow_run.get("head_sha")
+                else ""
+            ),
+            workflow_run.get("html_url"),
+        ),
     )
 
 

@@ -650,6 +650,8 @@ def workflow_run(
         "workflow_run": {
             "name": "tests",
             "conclusion": conclusion,
+            "head_branch": BRANCH,
+            "head_sha": "0123456789abcdef0123456789abcdef01234567",
             "html_url": "https://github.com/jimpo/foregent/actions/runs/123",
             "pull_requests": (
                 [{"number": 9, "head": {"ref": BRANCH}}]
@@ -884,9 +886,8 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertEqual(event.number, 9)
         self.assertEqual(event.workflow, "tests")
         self.assertEqual(event.conclusion, "success")
-        self.assertEqual(
-            event.body, "https://github.com/jimpo/foregent/actions/runs/123"
-        )
+        self.assertIn("Commit: 0123456789abcdef0123456789abcdef01234567.", event.body)
+        self.assertIn("https://github.com/jimpo/foregent/actions/runs/123", event.body)
 
     def test_a_completed_failure_is_delivered(self) -> None:
         event = github.webhook_event(
@@ -896,11 +897,11 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertEqual(event.kind, EventKind.PR_CHECK)
         self.assertEqual(event.conclusion, "failure")
 
-    def test_the_first_branch_naming_an_issue_resolves_the_workflow(self) -> None:
+    def test_only_the_runs_own_branch_can_resolve_the_workflow(self) -> None:
         event = github.webhook_event(
             workflow_run(
                 pull_requests=[
-                    {"number": 7, "head": {"ref": "dependabot/urllib3"}},
+                    {"number": 7, "head": {"ref": "aj/jim-999-unrelated"}},
                     {"number": 9, "head": {"ref": BRANCH}},
                 ]
             ),
