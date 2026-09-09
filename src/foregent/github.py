@@ -66,10 +66,9 @@ def webhook_authentic(body: bytes, signature: str) -> bool:
 # to a pull request foregent did not open.
 _BRANCH_KEY = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 
-# The deliveries that are a person answering an agent, and the one action of
-# each that is the answer arriving. An edited or deleted review comment is a
-# reviewer amending themselves, not new feedback to act on.
-#
+# Comment and review deliveries that are a person answering an agent. An
+# edited or deleted review comment is a reviewer amending themselves, not new
+# feedback to act on.
 # ``issue_comment`` is a comment in the pull request's conversation tab — the
 # ordinary way a reviewer says something that hangs off no line. GitHub sends
 # it under the same name for a comment on a plain issue, and its payload calls
@@ -97,6 +96,14 @@ _PR_UPDATE_ACTIONS = frozenset(
     }
 )
 
+# App-authored edits, review requests, and label changes are normally linkback,
+# automation, or CI bookkeeping rather than a person changing the agent's work.
+# Actions with immediate state or code consequences remain meaningful whoever
+# GitHub attributes them to, and are not listed here.
+_BOT_BOOKKEEPING_ACTIONS = frozenset(
+    {"edited", "review_requested", "labeled", "unlabeled"}
+)
+
 # Where the bridge asks GitHub for a pull request, and how long it waits. A
 # conversation comment is resolved inside the webhook route, so a wedged API
 # has to give up rather than hold the route open.
@@ -106,7 +113,8 @@ _TIMEOUT = 10
 # The delivery that is the base moving under everyone with a pull request
 # open, and the ref it has to name to be that. GitHub sends nothing when a
 # pull request stops merging cleanly, so a push to the trunk is the only
-# signal there is for it — and the same one that says a pull request landed.
+# signal outside a merge queue — and the same one that says a pull request
+# landed.
 _PUSH = "push"
 _TRUNK_REF = "refs/heads/main"
 
@@ -134,9 +142,9 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
 
     The issue is resolved from the pull request's head branch
     (:func:`issue_key`), and the body carries what the agent needs to act on
-    the feedback without going to read the pull request: the state a review
-    was submitted with, the file and line an inline comment hangs off, and
-    what was written.
+    the delivery without going to read the pull request: review state and
+    comments, or a concise lifecycle description including merge state,
+    reviewer, edited fields, head change, label, or dequeue reason.
 
     **Not pure for a conversation comment**, and that one kind alone: its
     payload names no branch, so the branch is fetched (:func:`_head_ref`).
@@ -144,14 +152,16 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     level up would put the reading of a GitHub payload into the route, which
     is the boundary this module exists to hold.
 
-    **A delivery whose sender is the pull request's own author is dropped.**
-    The agent opened the pull request, so a review comment it writes there
-    comes back here as an event about its own issue, and a wake that causes a
-    write is a loop. This is the GitHub half of what ``viewer`` does for
-    Linear in :func:`~foregent.events.wakes`, and it needs no account id of
-    foregent's own: the payload names both sides of the comparison. The cost
-    is that a person who opens a pull request by hand does not wake the agent
-    by commenting on it themselves; anyone else reviewing it does.
+    **Loop-capable deliveries from the pull request's author are dropped.**
+    The agent opened the pull request, so review feedback it writes and the
+    ``synchronize`` caused by its own push come back as events about its own
+    issue. Lifecycle changes that cannot loop are still delivered: GitHub can
+    attribute an automatic merge or a person's edit to the account that opened
+    the pull request, especially when a box uses one token for both roles.
+
+    App-authored edits, review requests, and label changes are dropped as
+    bookkeeping. Other lifecycle changes are delivered regardless of sender
+    type.
     """
     if kind == _PUSH:
         return _pushed(payload)
@@ -159,15 +169,25 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     if pull_request is None:
         return None
     sender = payload.get("sender") or {}
-    if sender.get("login") and sender.get("login") == (
-        pull_request.get("user") or {}
-    ).get("login"):
-        return None
     action = payload.get("action")
+    sent_by_author = sender.get("login") and sender.get("login") == (
+        pull_request.get("user") or {}
+    ).get("login")
     event_kind = EventKind.PR_REVIEW
-    if kind == _PULL_REQUEST and action in _PR_UPDATE_ACTIONS:
+    if kind == _PULL_REQUEST:
+        if not isinstance(action, str) or action not in _PR_UPDATE_ACTIONS:
+            return None
+        if sent_by_author and action == "synchronize":
+            return None
+        if (
+            sender.get("type") == "Bot"
+            and action in _BOT_BOOKKEEPING_ACTIONS
+        ):
+            return None
         event_kind = EventKind.PR_UPDATE
         body = _pull_request_update_body(payload, pull_request, action)
+    elif sent_by_author:
+        return None
     elif kind == _REVIEW and action == "submitted":
         review = payload.get("review") or {}
         state = (review.get("state") or "").lower().replace("_", " ")
@@ -194,7 +214,6 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         actor=sender.get("login") or "",
         repo=repo,
         number=number,
-        action=action if event_kind is EventKind.PR_UPDATE else "",
         author=sender.get("login") or "",
         body=body,
     )
@@ -203,23 +222,34 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
 def _pull_request_update_body(payload: dict, pull_request: dict, action: str) -> str:
     """Action-specific detail worth carrying with a pull request update."""
     if action == "closed":
-        return f"Merged: {'yes' if pull_request.get('merged') else 'no'}."
+        return "Merged." if pull_request.get("merged") else "Closed without merging."
+    if action == "reopened":
+        return "Reopened."
+    if action == "ready_for_review":
+        return "Marked ready for review."
+    if action == "converted_to_draft":
+        return "Converted to draft."
     if action == "review_requested":
         reviewer = payload.get("requested_reviewer") or {}
         team = payload.get("requested_team") or {}
         name = reviewer.get("login") or team.get("name") or team.get("slug") or ""
-        return f"Review requested from: {name}." if name else ""
+        return f"Review requested from {name}." if name else "Review requested."
     if action == "edited":
         return _edited_fields(payload.get("changes"), pull_request)
     if action == "synchronize":
-        return _change("head", payload, "before", "after")
-    if action in {"labeled", "unlabeled"}:
+        return _values("Head updated", payload.get("before"), payload.get("after"))
+    if action == "labeled":
         label = payload.get("label") or {}
         name = label.get("name") or ""
-        return f"Label: {name}." if name else ""
+        return f"Label added: {name}." if name else "Label added."
+    if action == "unlabeled":
+        label = payload.get("label") or {}
+        name = label.get("name") or ""
+        return f"Label removed: {name}." if name else "Label removed."
     if action == "dequeued":
         reason = payload.get("reason") or ""
-        return f"Reason: {reason}." if reason else ""
+        suffix = f" Reason: {reason}." if reason else ""
+        return f"Removed from the merge queue.{suffix}"
     return ""
 
 
@@ -228,23 +258,20 @@ def _edited_fields(changes: object, pull_request: dict) -> str:
     if not isinstance(changes, dict):
         return ""
     lines = []
-    for field in ("title", "body"):
-        change = changes.get(field)
-        if isinstance(change, dict) and "from" in change:
-            lines.append(_values(field, change.get("from"), pull_request.get(field)))
+    title = changes.get("title")
+    if isinstance(title, dict) and "from" in title:
+        lines.append(_values("Title", title.get("from"), pull_request.get("title")))
+    body = changes.get("body")
+    if isinstance(body, dict) and "from" in body:
+        # A pull request body is arbitrary multiline Markdown. Carrying both
+        # versions can bury every other change in the delivery.
+        lines.append("Body edited.")
     base = changes.get("base")
     ref = base.get("ref") if isinstance(base, dict) else None
     current_base = pull_request.get("base") or {}
     if isinstance(ref, dict) and "from" in ref:
-        lines.append(_values("base", ref.get("from"), current_base.get("ref")))
+        lines.append(_values("Base", ref.get("from"), current_base.get("ref")))
     return "\n".join(lines)
-
-
-def _change(label: str, values: dict, before: str, after: str) -> str:
-    """One old-to-new detail, or nothing when neither side was supplied."""
-    if before not in values and after not in values:
-        return ""
-    return _values(label, values.get(before), values.get(after))
 
 
 def _values(label: str, before: object, after: object) -> str:

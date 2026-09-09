@@ -127,19 +127,20 @@ class DeliveryMessageTests(unittest.TestCase):
         self.assertIn("jimpo/binius64#123", message)
         self.assertIn("rename this", message)
 
-    def test_a_pull_request_update_names_its_action_and_pull_request(self) -> None:
+    def test_a_pull_request_update_names_the_pull_request(self) -> None:
         message = delivery_message(
             Event(
                 kind=EventKind.PR_UPDATE,
                 issue_key="JIM-42",
                 repo="jimpo/binius64",
                 number=123,
-                action="ready_for_review",
                 author="AJ",
+                body="Marked ready for review.",
             ),
             parked=True,
         )
-        self.assertIn("AJ ready for review jimpo/binius64#123.", message)
+        self.assertIn("AJ updated jimpo/binius64#123.", message)
+        self.assertIn("Marked ready for review.", message)
 
     def test_main_advancing_says_where_and_what_landed(self) -> None:
         # Nobody said anything here, so the message has to stand on its own,

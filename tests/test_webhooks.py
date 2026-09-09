@@ -551,6 +551,11 @@ class GitHubWebhookRouteTests(unittest.TestCase):
         self.assertEqual(self.post(form, sign_github(form)).status_code, 400)
         self.assertEqual(self.post(b"[]", sign_github(b"[]")).status_code, 400)
 
+    def test_a_delivery_with_a_non_string_action_is_ignored(self) -> None:
+        payload = self.PULL_REQUEST | {"action": ["closed"]}
+        body = json.dumps(payload).encode()
+        self.assertEqual(self.post(body, sign_github(body)).status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -684,7 +689,6 @@ class GitHubWebhookEventTests(unittest.TestCase):
                 )
                 assert event is not None
                 self.assertEqual(event.kind, EventKind.PR_UPDATE)
-                self.assertEqual(event.action, action)
                 self.assertEqual(event.issue_key, "JIM-141")
                 self.assertEqual(event.repo, "jimpo/foregent")
                 self.assertEqual(event.number, 9)
@@ -695,19 +699,19 @@ class GitHubWebhookEventTests(unittest.TestCase):
             pull_request_payload("closed"), "pull_request"
         )
         assert merged is not None
-        self.assertIn("Merged: yes.", merged.body)
+        self.assertEqual(merged.body, "Merged.")
 
         closed = pull_request_payload("closed")
         closed["pull_request"]["merged"] = False
         event = github.webhook_event(closed, "pull_request")
         assert event is not None
-        self.assertIn("Merged: no.", event.body)
+        self.assertEqual(event.body, "Closed without merging.")
 
     def test_action_specific_pull_request_detail_is_carried(self) -> None:
         expected = {
             "review_requested": "octocat",
-            "edited": "title: Old title → New title",
-            "synchronize": "head: 1111111 → 2222222",
+            "edited": "Title: Old title → New title",
+            "synchronize": "Head updated: 1111111 → 2222222",
             "labeled": "needs-review",
             "unlabeled": "needs-review",
             "dequeued": "MERGE_CONFLICT",
@@ -725,15 +729,38 @@ class GitHubWebhookEventTests(unittest.TestCase):
             pull_request_payload("edited"), "pull_request"
         )
         assert event is not None
-        self.assertIn("title: Old title → New title", event.body)
-        self.assertIn("body: Old body → New body", event.body)
-        self.assertIn("base: develop → main", event.body)
+        self.assertIn("Title: Old title → New title", event.body)
+        self.assertIn("Body edited.", event.body)
+        self.assertIn("Base: develop → main", event.body)
+        self.assertNotIn("Old body", event.body)
+        self.assertNotIn("New body", event.body)
 
     def test_the_pull_request_authors_own_push_maps_to_nothing(self) -> None:
         # Pushing the head branch produces `synchronize`; the author is the
         # agent that opened the PR, so the existing loop guard drops it.
         payload = pull_request_payload("synchronize")
         payload["sender"]["login"] = AGENT_LOGIN
+        self.assertIsNone(github.webhook_event(payload, "pull_request"))
+
+    def test_an_author_attributed_close_is_still_delivered(self) -> None:
+        # Auto-merge and a box whose agent and operator share one token can
+        # attribute a terminal update to the PR's author. It cannot loop.
+        payload = pull_request_payload("closed")
+        payload["sender"]["login"] = AGENT_LOGIN
+        event = github.webhook_event(payload, "pull_request")
+        assert event is not None
+        self.assertEqual(event.body, "Merged.")
+
+    def test_bot_bookkeeping_maps_to_nothing(self) -> None:
+        for action in ("edited", "review_requested", "labeled", "unlabeled"):
+            with self.subTest(action=action):
+                payload = pull_request_payload(action)
+                payload["sender"] = {"login": "linear[bot]", "type": "Bot"}
+                self.assertIsNone(github.webhook_event(payload, "pull_request"))
+
+    def test_a_non_string_action_maps_to_nothing(self) -> None:
+        payload = pull_request_payload("closed")
+        payload["action"] = ["closed"]
         self.assertIsNone(github.webhook_event(payload, "pull_request"))
 
     def test_a_noisy_pull_request_action_maps_to_nothing(self) -> None:
@@ -980,7 +1007,8 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         self.assertEqual(response.status_code, 200)
         ref, text = self.manager.sent[0]
         self.assertEqual(ref, self.AGENT)
-        self.assertIn("jimpo reopened jimpo/foregent#9.", text)
+        self.assertIn("jimpo updated jimpo/foregent#9.", text)
+        self.assertIn("Reopened.", text)
 
     def test_a_review_of_a_parked_agents_pull_request_wakes_and_unblocks_it(
         self,

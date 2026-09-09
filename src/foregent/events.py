@@ -80,11 +80,9 @@ class Event:
     # against foregent's own id to drop the bridge's own writes; see
     # :func:`wakes`.
     actor: str = ""
-    # GitHub repository and pull request number, for the PR kinds, and the
-    # platform action for a lifecycle update.
+    # GitHub repository and pull request number, for the PR kinds.
     repo: str = ""
     number: int = 0
-    action: str = ""
     # Human-readable name of the actor, and what they said.
     author: str = ""
     body: str = ""
@@ -138,8 +136,7 @@ def delivery_message(event: Event, *, parked: bool) -> str:
         case EventKind.PR_REVIEW:
             what = f"{who} reviewed {pull_request}."
         case EventKind.PR_UPDATE:
-            action = event.action.replace("_", " ") or "updated"
-            what = f"{who} {action} {pull_request}."
+            what = f"{who} updated {pull_request}."
         case EventKind.MAIN_ADVANCED:
             # What moved, and nothing about what it did to the agent's branch:
             # a push proves the base changed and no more than that. What to do
