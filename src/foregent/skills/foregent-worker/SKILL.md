@@ -199,10 +199,23 @@ you when something happens. Waiting costs nothing; starting over costs
 everything you have worked out so far.
 
 What wakes you is activity on **your own issue**: a comment or reply on it, or
-a review or comment on the pull request linked to it. Foregent finds that pull
-request itself — Linear links it off your branch name — so you never have to
-report which PR is yours. A sub-issue you queued yourself wakes you too, once,
-as it lands (*Delegating sub-issues*).
+a review, comment, or completed CI workflow on the pull request linked to it.
+Foregent finds that pull request itself — Linear links it off your branch name
+— so you never have to report which PR is yours. A sub-issue you queued
+yourself wakes you too, once, as it lands (*Delegating sub-issues*).
+
+A CI wake names one workflow's conclusion, the commit it ran against, and a
+link to the run. First compare that commit with the head you most recently
+pushed: an older result says nothing about the current revision. For a current
+failure, timeout, or action-required result, inspect the run through the GitHub
+MCP, fix what failed, then fetch, rebase, test and push as usual. Treat
+cancelled, skipped, stale and neutral results according to whether the workflow
+was expected to run. A success means only that one workflow passed, not that
+every check is green or the pull request is ready to merge. If the cause needs
+an external change, or the same current workflow fails again after your attempted
+fix without new actionable evidence, comment with what you found and report
+blocked on that cause instead of pushing again. If the result needs no action
+and you are still waiting for review, report yourself blocked again.
 
 In `pull-request` mode you are woken by one more thing: **`main` advancing**.
 That is the base of your branch moving, and it is all foregent can tell you —

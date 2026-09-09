@@ -78,6 +78,10 @@ _REVIEW_COMMENT = "pull_request_review_comment"
 _CONVERSATION_COMMENT = "issue_comment"
 _PULL_REQUEST = "pull_request"
 
+# GitHub Actions reports a workflow's result here. Only completion is useful:
+# requested and in-progress runs carry no conclusion for a worker to act on.
+_WORKFLOW_RUN = "workflow_run"
+
 # Pull request activity that changes what the agent should do or tells it
 # what happened to its work. Everything else in this broad webhook stays
 # noise: assignment, locking, milestones, and auto-merge bookkeeping.
@@ -138,12 +142,14 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     ``kind`` is the ``X-GitHub-Event`` header, because only the header says
     what a delivery is about. A review being submitted, a comment being
     written — inline or in the conversation tab — selected pull request
-    lifecycle changes, and a push to ``main`` are the ones that map; every
-    other event and action returns ``None``, an organization webhook carrying
-    far more than foregent has any use for.
+    lifecycle changes, a workflow completing, and a push to ``main`` are the
+    ones that map; every other event and action returns ``None``, an
+    organization webhook carrying far more than foregent has any use for.
 
-    A push is the odd one and is handled first, because it is the one
-    delivery here that carries no pull request at all (:func:`_pushed`).
+    Pushes and workflow runs are handled before pull request events. A push
+    carries no pull request at all (:func:`_pushed`), while a workflow run's
+    sender is the actor whose push triggered it and must not be mistaken for a
+    loop-capable event from the pull request's author.
 
     The issue is resolved from the pull request's head branch
     (:func:`issue_key`), and the body carries what the agent needs to act on
@@ -170,10 +176,13 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     type. The remaining cost is unchanged: if a person opens a pull request by
     hand on the agent's branch, feedback they write on that pull request is
     attributed to its author and reaches nobody; feedback from anyone else
-    does.
+    does. Workflow runs bypass the author comparison because their sender is
+    the actor whose push triggered CI.
     """
     if kind == _PUSH:
         return _pushed(payload)
+    if kind == _WORKFLOW_RUN:
+        return _completed_workflow(payload)
     pull_request = _commented_on(payload, kind)
     if pull_request is None:
         return None
@@ -225,6 +234,57 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         number=number,
         author=sender.get("login") or "",
         body=body,
+    )
+
+
+def _completed_workflow(payload: dict) -> Event | None:
+    """The ``PR_CHECK`` for a completed Actions run, or ``None``.
+
+    A workflow run may name more than one pull request. The run's own branch is
+    the link to a worker, and the matching pull request supplies its number; a
+    run whose branch names no key, or whose pull-request list has no matching
+    entry, is still normalized but names no issue and therefore reaches
+    nobody. This path deliberately does not compare sender with pull-request
+    author: the sender is commonly the agent whose push started the run.
+    """
+    if payload.get("action") != "completed":
+        return None
+    workflow_run = payload.get("workflow_run") or {}
+    if not isinstance(workflow_run, dict):
+        workflow_run = {}
+    pull_requests = workflow_run.get("pull_requests")
+    head_branch = workflow_run.get("head_branch") or ""
+    issue = ""
+    number = 0
+    for pull_request in pull_requests if isinstance(pull_requests, list) else []:
+        if not isinstance(pull_request, dict):
+            continue
+        branch = (pull_request.get("head") or {}).get("ref") or ""
+        if branch != head_branch:
+            continue
+        key = issue_key(branch)
+        if key:
+            issue = key
+            number = pull_request.get("number") or 0
+            break
+    sender = payload.get("sender") or {}
+    return Event(
+        kind=EventKind.PR_CHECK,
+        issue_key=issue,
+        actor=sender.get("login") or "",
+        repo=(payload.get("repository") or {}).get("full_name") or "",
+        number=number,
+        workflow=workflow_run.get("name") or "",
+        conclusion=workflow_run.get("conclusion") or "",
+        author=sender.get("login") or "",
+        body=_joined(
+            (
+                f"Commit: {workflow_run.get('head_sha')}."
+                if workflow_run.get("head_sha")
+                else ""
+            ),
+            workflow_run.get("html_url"),
+        ),
     )
 
 

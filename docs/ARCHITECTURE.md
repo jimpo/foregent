@@ -351,14 +351,14 @@ request's conversation tab — map to a `PR_REVIEW` event. Pull request lifecycl
 changes that affect the worker map to `PR_UPDATE`: close or reopen, draft
 transitions, review requests, title/body/base edits, head synchronization,
 labels, and merge-queue removal. Assignment, locking, milestones, and
-auto-merge bookkeeping remain noise. A push that leaves commits on `main` maps
-to `MAIN_ADVANCED`; every other event and action maps to nothing, an
-organization webhook carrying far more than foregent has a use for. From there
-the path is the Linear one, joined at `queue_event`: match, enqueue, drain,
-send. The two guards ahead of that join stay Linear's own — both key on what
-Linear signs and stamps — so a GitHub delivery is checked against no freshness
-window, and a retry of one GitHub believes failed reaches the agent a second
-time.
+auto-merge bookkeeping remain noise. A completed Actions `workflow_run` maps
+to `PR_CHECK`, and a push that leaves commits on `main` maps to
+`MAIN_ADVANCED`; every other event and action maps to nothing, an organization
+webhook carrying far more than foregent has a use for. From there the path is
+the Linear one, joined at `queue_event`: match, enqueue, drain, send. The two
+guards ahead of that join stay Linear's own — both key on what Linear signs and
+stamps — so a GitHub delivery is checked against no freshness window, and a
+retry of one GitHub believes failed reaches the agent a second time.
 
 **The pull request is resolved back to its issue through its head branch.**
 Linear names an agent's branch after the issue and links a pull request opened
@@ -402,6 +402,26 @@ the author comparison, so GitHub deliveries need no account-id lookup. The
 cost is unchanged for a pull request a person opens by hand on an agent's
 branch: feedback from that person is attributed to the pull request's author
 and reaches nobody, while feedback from anyone else does.
+
+**A completed workflow run bypasses that sender comparison.** GitHub names the
+actor whose push triggered the run as its sender, so an agent is ordinarily
+the sender of CI on its own pull request. The result resolves to the first pull
+request in `workflow_run.pull_requests` whose `head.ref` both matches
+`workflow_run.head_branch` and names an issue key, so an associated pull
+request based on the run's branch cannot claim the result. It carries the
+workflow name, conclusion, head commit and run URL to that worker. Requested
+and in-progress runs carry no result and map to nothing; a run on a fork has
+an empty pull-request list, resolves to no issue and reaches nobody.
+
+Every conclusion is delivered deliberately. A blocked worker therefore takes
+a run slot and wakes for successful, skipped and stale workflows as well as
+failures; its worker skill tells it how to distinguish an actionable result,
+an obsolete result and one after which it should park again. Each independently
+finishing workflow outside the debounce window is a separate wake, run-slot
+acquisition and re-block round trip, so the cost scales with workflows per push
+and can delay fresh dispatches under sustained CI load. That buys one policy at
+the worker, rather than a conclusion filter at ingestion that could hide a
+result a project cares about.
 
 **A push to `main` is the one delivery that is about a repository rather than
 an issue.** It names no branch of foregent's, so it resolves to no issue and
