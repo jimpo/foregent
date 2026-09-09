@@ -22,6 +22,7 @@ import hmac
 import io
 import json
 import os
+import pathlib
 import queue
 import threading
 import time
@@ -40,6 +41,7 @@ from foregent.store import IssueStore
 from tests.test_server import FakeManager, drain_deliveries
 
 SECRET = "s3cret"
+PAYLOADS = pathlib.Path(__file__).parent / "payloads"
 
 PAYLOAD = {
     "action": "create",
@@ -55,6 +57,12 @@ def sign(body: bytes, secret: str = SECRET) -> str:
 def sign_github(body: bytes, secret: str = SECRET) -> str:
     """The same digest, prefixed the way GitHub names the algorithm it used."""
     return f"sha256={sign(body, secret)}"
+
+
+def pull_request_payload(action: str) -> dict:
+    return json.loads(
+        (PAYLOADS / f"github_pull_request_{action}.json").read_text()
+    )
 
 
 class WebhookAuthenticTests(unittest.TestCase):
@@ -657,6 +665,84 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertIn("src/foregent/github.py:42", event.body)
         self.assertIn("why?", event.body)
 
+    def test_pull_request_lifecycle_actions_map_to_updates(self) -> None:
+        for action in (
+            "closed",
+            "reopened",
+            "ready_for_review",
+            "converted_to_draft",
+            "review_requested",
+            "edited",
+            "synchronize",
+            "labeled",
+            "unlabeled",
+            "dequeued",
+        ):
+            with self.subTest(action=action):
+                event = github.webhook_event(
+                    pull_request_payload(action), "pull_request"
+                )
+                assert event is not None
+                self.assertEqual(event.kind, EventKind.PR_UPDATE)
+                self.assertEqual(event.action, action)
+                self.assertEqual(event.issue_key, "JIM-141")
+                self.assertEqual(event.repo, "jimpo/foregent")
+                self.assertEqual(event.number, 9)
+                self.assertEqual(event.author, "jimpo")
+
+    def test_a_closed_update_says_whether_the_pull_request_was_merged(self) -> None:
+        merged = github.webhook_event(
+            pull_request_payload("closed"), "pull_request"
+        )
+        assert merged is not None
+        self.assertIn("Merged: yes.", merged.body)
+
+        closed = pull_request_payload("closed")
+        closed["pull_request"]["merged"] = False
+        event = github.webhook_event(closed, "pull_request")
+        assert event is not None
+        self.assertIn("Merged: no.", event.body)
+
+    def test_action_specific_pull_request_detail_is_carried(self) -> None:
+        expected = {
+            "review_requested": "octocat",
+            "edited": "title: Old title → New title",
+            "synchronize": "head: 1111111 → 2222222",
+            "labeled": "needs-review",
+            "unlabeled": "needs-review",
+            "dequeued": "MERGE_CONFLICT",
+        }
+        for action, detail in expected.items():
+            with self.subTest(action=action):
+                event = github.webhook_event(
+                    pull_request_payload(action), "pull_request"
+                )
+                assert event is not None
+                self.assertIn(detail, event.body)
+
+    def test_an_edit_carries_title_body_and_base_branch_changes(self) -> None:
+        event = github.webhook_event(
+            pull_request_payload("edited"), "pull_request"
+        )
+        assert event is not None
+        self.assertIn("title: Old title → New title", event.body)
+        self.assertIn("body: Old body → New body", event.body)
+        self.assertIn("base: develop → main", event.body)
+
+    def test_the_pull_request_authors_own_push_maps_to_nothing(self) -> None:
+        # Pushing the head branch produces `synchronize`; the author is the
+        # agent that opened the PR, so the existing loop guard drops it.
+        payload = pull_request_payload("synchronize")
+        payload["sender"]["login"] = AGENT_LOGIN
+        self.assertIsNone(github.webhook_event(payload, "pull_request"))
+
+    def test_a_noisy_pull_request_action_maps_to_nothing(self) -> None:
+        self.assertIsNone(
+            github.webhook_event(
+                pull_request_payload("assigned"), "pull_request"
+            )
+        )
+
     def test_the_issue_comes_from_the_branch_however_it_is_written(self) -> None:
         # Linear lower-cases the key in the branch it names; a key written any
         # other way reads the same.
@@ -773,7 +859,7 @@ class GitHubWebhookEventTests(unittest.TestCase):
             ("pull_request_review", review() | {"action": "edited"}),
             ("pull_request_review_comment", review_comment(action="deleted")),
             ("issue_comment", conversation_comment(action="edited")),
-            # The pull request opening and closing is foregent's own doing.
+            # Opening is foregent's own doing and is not a lifecycle update.
             ("pull_request", review() | {"action": "opened"}),
         ):
             with self.subTest(kind=kind):
@@ -883,6 +969,18 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         self.assertEqual(ref, self.AGENT)
         self.assertIn("jimpo reviewed jimpo/foregent#9.", text)
         self.assertIn("rename this", text)
+
+    def test_a_pull_request_update_reaches_the_agent_whose_branch_it_is_on(
+        self,
+    ) -> None:
+        self.track()
+        response = self.deliver(
+            pull_request_payload("reopened"), event="pull_request"
+        )
+        self.assertEqual(response.status_code, 200)
+        ref, text = self.manager.sent[0]
+        self.assertEqual(ref, self.AGENT)
+        self.assertIn("jimpo reopened jimpo/foregent#9.", text)
 
     def test_a_review_of_a_parked_agents_pull_request_wakes_and_unblocks_it(
         self,

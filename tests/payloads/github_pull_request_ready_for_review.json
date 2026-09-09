@@ -1,0 +1,12 @@
+{
+  "action": "ready_for_review",
+  "number": 9,
+  "pull_request": {
+    "number": 9,
+    "draft": false,
+    "head": {"ref": "aj/jim-141-deliver-github-pr-updates-to-workers"},
+    "user": {"login": "foregent-bot"}
+  },
+  "repository": {"full_name": "jimpo/foregent"},
+  "sender": {"login": "jimpo"}
+}

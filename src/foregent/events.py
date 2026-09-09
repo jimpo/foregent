@@ -44,6 +44,9 @@ class EventKind(StrEnum):
     ISSUE_UPDATE = "issue_update"
     # A review or a comment on the linked pull request, inline or PR-level.
     PR_REVIEW = "pr_review"
+    # A lifecycle change to the linked pull request: closed, reopened, draft
+    # state, review assignment, edits, pushes, labels, or merge-queue removal.
+    PR_UPDATE = "pr_update"
     # `main` moved in a repository. The one kind that is about a repository
     # rather than an issue, and so the one that carries no issue key.
     MAIN_ADVANCED = "main_advanced"
@@ -77,9 +80,11 @@ class Event:
     # against foregent's own id to drop the bridge's own writes; see
     # :func:`wakes`.
     actor: str = ""
-    # GitHub repository and pull request number, for the PR kinds.
+    # GitHub repository and pull request number, for the PR kinds, and the
+    # platform action for a lifecycle update.
     repo: str = ""
     number: int = 0
+    action: str = ""
     # Human-readable name of the actor, and what they said.
     author: str = ""
     body: str = ""
@@ -132,6 +137,9 @@ def delivery_message(event: Event, *, parked: bool) -> str:
             what = f"{who} updated {event.issue_key}."
         case EventKind.PR_REVIEW:
             what = f"{who} reviewed {pull_request}."
+        case EventKind.PR_UPDATE:
+            action = event.action.replace("_", " ") or "updated"
+            what = f"{who} {action} {pull_request}."
         case EventKind.MAIN_ADVANCED:
             # What moved, and nothing about what it did to the agent's branch:
             # a push proves the base changed and no more than that. What to do
