@@ -294,8 +294,9 @@ bridge forever.
    delivery the bridge is slow to answer.
 5. **Drain.** Each issue has its own queue and its own daemon thread, started
    on the first delivery to it, so one agent's messages reach it in the order
-   written and no agent waits behind another. Each queue waits for ten seconds of quiet after its most
-   recent notification, then sends the batch as one prompt with blank lines
+   written and no agent waits behind another. Each queue waits for five seconds
+   of quiet after its most recent notification, then sends the batch as one
+   prompt with blank lines
    between the original messages (JIM-267). New arrivals reset the timer;
    notifications arriving during a send form the next batch. A send is offered
    again until it lands or the agent is gone, so a fleet-wide queue would let
