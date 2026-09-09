@@ -347,14 +347,18 @@ a body that is not a JSON object, 200 for everything else. Only the header
 and the pull request.
 
 A review being submitted and a comment being written — inline, or in the pull
-request's conversation tab — map to a `PR_REVIEW` event, and a push that leaves
-commits on `main` to a `MAIN_ADVANCED` one; every other event and every other
-action of those maps to nothing, an organization webhook carrying far more than
-foregent has a use for. From there the path is the Linear one, joined at
-`queue_event`: match, enqueue, drain, send. The two guards ahead of that join
-stay Linear's own — both key on what Linear signs and stamps — so a GitHub
-delivery is checked against no freshness window, and a retry of one GitHub
-believes failed reaches the agent a second time.
+request's conversation tab — map to a `PR_REVIEW` event. Pull request lifecycle
+changes that affect the worker map to `PR_UPDATE`: close or reopen, draft
+transitions, review requests, title/body/base edits, head synchronization,
+labels, and merge-queue removal. Assignment, locking, milestones, and
+auto-merge bookkeeping remain noise. A push that leaves commits on `main` maps
+to `MAIN_ADVANCED`; every other event and action maps to nothing, an
+organization webhook carrying far more than foregent has a use for. From there
+the path is the Linear one, joined at `queue_event`: match, enqueue, drain,
+send. The two guards ahead of that join stay Linear's own — both key on what
+Linear signs and stamps — so a GitHub delivery is checked against no freshness
+window, and a retry of one GitHub believes failed reaches the agent a second
+time.
 
 **The pull request is resolved back to its issue through its head branch.**
 Linear names an agent's branch after the issue and links a pull request opened
@@ -386,23 +390,28 @@ worker thread rather than on the event loop. Resolving the branch a level up
 instead would put the reading of a GitHub payload into the route, which is the
 boundary `github.py` exists to hold.
 
-**Foregent's own writes are dropped by comparing the delivery's sender to the
-pull request's author.** The agent opened the pull request, so a review comment
-it writes there comes back as an event about its own issue, and a wake that
-causes a write is a loop. That is what `viewer` does on the Linear side, except
-that the payload names both sides of this comparison, so a GitHub delivery is
-matched without an account id and without a Linear call. The cost is that a
-person who opens a pull request by hand does not wake the agent by commenting
-on it themselves; anyone else reviewing it does.
+**Loop-capable writes are dropped by comparing the delivery's sender to the
+pull request's author.** The agent opened the pull request, so review feedback
+it writes there and the `synchronize` caused by its own push come back as events
+about its own issue, and a wake that causes a write is a loop. Other lifecycle
+changes still pass: an automatic merge or an operator's change can be
+attributed to the account that opened the pull request, particularly on a box
+where both roles share one token. App-authored edits, review requests and label
+changes are dropped separately as bookkeeping. The payload names both sides of
+the author comparison, so GitHub deliveries need no account-id lookup. The
+cost is unchanged for a pull request a person opens by hand on an agent's
+branch: feedback from that person is attributed to the pull request's author
+and reaches nobody, while feedback from anyone else does.
 
 **A push to `main` is the one delivery that is about a repository rather than
 an issue.** It names no branch of foregent's, so it resolves to no issue and
 matches to nobody; who it reaches is decided from the issues instead, below.
-It is also the only signal there is for a pull request going stale — GitHub
-sends nothing when one stops merging cleanly — so it says only that the base
-moved, and leaves the agent to find out what that did to its branch. The
-pushed commit subjects ride along, which is what lets an agent recognize its
-own pull request landing without going to read the repository.
+Outside a merge queue, it is also the only signal there is for a pull request
+going stale — GitHub sends nothing when one stops merging cleanly — so it says
+only that the base moved, and leaves the agent to find out what that did to its
+branch. A merge queue additionally emits `dequeued` with its reason. The pushed
+commit subjects ride along, which is what lets an agent recognize its own pull
+request landing without going to read the repository.
 
 **Who a push reaches is decided from the issues, not from the payload.** Three
 things make an issue one of them, and none of it is remembered anywhere:

@@ -44,6 +44,9 @@ class EventKind(StrEnum):
     ISSUE_UPDATE = "issue_update"
     # A review or a comment on the linked pull request, inline or PR-level.
     PR_REVIEW = "pr_review"
+    # A lifecycle change to the linked pull request: closed, reopened, draft
+    # state, review assignment, edits, pushes, labels, or merge-queue removal.
+    PR_UPDATE = "pr_update"
     # `main` moved in a repository. The one kind that is about a repository
     # rather than an issue, and so the one that carries no issue key.
     MAIN_ADVANCED = "main_advanced"
@@ -132,6 +135,8 @@ def delivery_message(event: Event, *, parked: bool) -> str:
             what = f"{who} updated {event.issue_key}."
         case EventKind.PR_REVIEW:
             what = f"{who} reviewed {pull_request}."
+        case EventKind.PR_UPDATE:
+            what = f"{who} updated {pull_request}."
         case EventKind.MAIN_ADVANCED:
             # What moved, and nothing about what it did to the agent's branch:
             # a push proves the base changed and no more than that. What to do

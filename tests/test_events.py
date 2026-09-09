@@ -127,6 +127,21 @@ class DeliveryMessageTests(unittest.TestCase):
         self.assertIn("jimpo/binius64#123", message)
         self.assertIn("rename this", message)
 
+    def test_a_pull_request_update_names_the_pull_request(self) -> None:
+        message = delivery_message(
+            Event(
+                kind=EventKind.PR_UPDATE,
+                issue_key="JIM-42",
+                repo="jimpo/binius64",
+                number=123,
+                author="AJ",
+                body="Marked ready for review.",
+            ),
+            parked=True,
+        )
+        self.assertIn("AJ updated jimpo/binius64#123.", message)
+        self.assertIn("Marked ready for review.", message)
+
     def test_main_advancing_says_where_and_what_landed(self) -> None:
         # Nobody said anything here, so the message has to stand on its own,
         # and the commit subjects are what let an agent recognize its own

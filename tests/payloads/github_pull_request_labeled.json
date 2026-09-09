@@ -1,0 +1,12 @@
+{
+  "action": "labeled",
+  "number": 9,
+  "label": {"name": "needs-review"},
+  "pull_request": {
+    "number": 9,
+    "head": {"ref": "aj/jim-141-deliver-github-pr-updates-to-workers"},
+    "user": {"login": "foregent-bot"}
+  },
+  "repository": {"full_name": "jimpo/foregent"},
+  "sender": {"login": "jimpo"}
+}
