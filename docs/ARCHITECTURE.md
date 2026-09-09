@@ -293,14 +293,19 @@ bridge forever.
    enqueues, and returns. It never waits on an agent: Linear retries any
    delivery the bridge is slow to answer.
 5. **Drain.** Each issue has its own queue and its own daemon thread, started
-   on the first delivery to it, so one agent's messages reach it one at a time
-   in the order written and no agent waits behind another. A send is offered
+   on the first delivery to it, so one agent's messages reach it in the order
+   written and no agent waits behind another. Each queue waits for ten seconds of quiet after its most
+   recent notification, then sends the batch as one prompt with blank lines
+   between the original messages (JIM-267). New arrivals reset the timer;
+   notifications arriving during a send form the next batch. A send is offered
    again until it lands or the agent is gone, so a fleet-wide queue would let
-   one unreachable agent silence the rest. Nothing is coalesced — merging two
-   people's comments into one prompt loses who said what. A drainer ends when
-   its issue completes or its agent dies.
-6. **Send, then unblock.** The prompt is submitted straight away, whatever
-   the agent is doing, and offered again until it lands or the harness
+   one unreachable agent silence the rest. Batching preserves every message,
+   including who said what. Completion or agent death ends the quiet-period
+   wait immediately; queued messages are still checked against the current
+   issue state before sending. A drainer ends when its issue completes or its
+   agent dies.
+6. **Send, then unblock.** After the quiet period and run-slot admission, the
+   batch is submitted whatever the agent is doing, and offered again until it lands or the harness
    reports the agent gone. Unblocking happens only after the send succeeds,
    so a failure leaves the issue Blocked with nothing to roll back.
 
