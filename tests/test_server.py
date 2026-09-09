@@ -2126,7 +2126,7 @@ class DeliveryBatchTests(unittest.TestCase):
             server.drain("JIM-88", pending)
         self.assertEqual(
             pending.get.call_args_list,
-            [mock.call(), mock.call(timeout=10.0), mock.call(timeout=10.0), mock.call()],
+            [mock.call(), mock.call(timeout=5.0), mock.call(timeout=5.0), mock.call()],
         )
         send.assert_called_once_with(
             "JIM-88", "AJ commented: ship it\n\nSam commented: hold on"
@@ -2146,7 +2146,7 @@ class DeliveryBatchTests(unittest.TestCase):
             server.drain("JIM-88", pending)
         self.assertEqual(
             pending.get.call_args_list,
-            [mock.call(), mock.call(timeout=10.0), mock.call(),
+            [mock.call(), mock.call(timeout=5.0), mock.call(),
              mock.call(timeout=0.0), mock.call(timeout=0.0), mock.call()],
         )
         self.assertEqual(send.call_args_list, [

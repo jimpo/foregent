@@ -163,7 +163,7 @@ _last_delivery = ""
 DELIVERY_RETRY_SECONDS = 5.0
 
 # Wait for a quiet period after the latest queued notification (JIM-267).
-DELIVERY_DEBOUNCE_SECONDS = 10.0
+DELIVERY_DEBOUNCE_SECONDS = 5.0
 
 
 def check_herdr_protocol() -> None:
@@ -391,7 +391,7 @@ def stop_deliveries(key: str) -> None:
 
 
 def drain(key: str, pending: queue.Queue[tuple[str, float] | None]) -> None:
-    """Send one ordered batch after ten seconds without a new notification.
+    """Send one ordered batch after five seconds without a new notification.
 
     Runs on a daemon thread, for the reason :func:`watch_agents` does: a send
     talks to the harness and is retried until it lands, so it can take as long
