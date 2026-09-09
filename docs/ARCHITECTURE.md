@@ -398,7 +398,10 @@ changes still pass: an automatic merge or an operator's change can be
 attributed to the account that opened the pull request, particularly on a box
 where both roles share one token. App-authored edits, review requests and label
 changes are dropped separately as bookkeeping. The payload names both sides of
-the author comparison, so GitHub deliveries need no account-id lookup.
+the author comparison, so GitHub deliveries need no account-id lookup. The
+cost is unchanged for a pull request a person opens by hand on an agent's
+branch: feedback from that person is attributed to the pull request's author
+and reaches nobody, while feedback from anyone else does.
 
 **A push to `main` is the one delivery that is about a repository rather than
 an issue.** It names no branch of foregent's, so it resolves to no issue and

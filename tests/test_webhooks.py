@@ -742,6 +742,15 @@ class GitHubWebhookEventTests(unittest.TestCase):
         payload["sender"]["login"] = AGENT_LOGIN
         self.assertIsNone(github.webhook_event(payload, "pull_request"))
 
+    def test_the_pull_request_authors_own_bookkeeping_maps_to_nothing(self) -> None:
+        # Agents use an ordinary user's PAT, so GitHub reports their own MCP
+        # edits as `User`, not `Bot`. Author identity is the loop guard.
+        for action in ("edited", "review_requested", "labeled", "unlabeled"):
+            with self.subTest(action=action):
+                payload = pull_request_payload(action)
+                payload["sender"] = {"login": AGENT_LOGIN, "type": "User"}
+                self.assertIsNone(github.webhook_event(payload, "pull_request"))
+
     def test_an_author_attributed_close_is_still_delivered(self) -> None:
         # Auto-merge and a box whose agent and operator share one token can
         # attribute a terminal update to the PR's author. It cannot loop.

@@ -104,6 +104,11 @@ _BOT_BOOKKEEPING_ACTIONS = frozenset(
     {"edited", "review_requested", "labeled", "unlabeled"}
 )
 
+# The same bookkeeping actions can come from an ordinary user when the agent
+# authenticates with a personal access token. Its own head push is the other
+# lifecycle write that comes straight back through the webhook.
+_AUTHOR_LOOPABLE_ACTIONS = _BOT_BOOKKEEPING_ACTIONS | {"synchronize"}
+
 # Where the bridge asks GitHub for a pull request, and how long it waits. A
 # conversation comment is resolved inside the webhook route, so a wedged API
 # has to give up rather than hold the route open.
@@ -156,12 +161,16 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     The agent opened the pull request, so review feedback it writes and the
     ``synchronize`` caused by its own push come back as events about its own
     issue. Lifecycle changes that cannot loop are still delivered: GitHub can
-    attribute an automatic merge or a person's edit to the account that opened
-    the pull request, especially when a box uses one token for both roles.
+    attribute an automatic merge or another terminal change to the account that
+    opened the pull request, especially when a box uses one token for both
+    roles.
 
     App-authored edits, review requests, and label changes are dropped as
     bookkeeping. Other lifecycle changes are delivered regardless of sender
-    type.
+    type. The remaining cost is unchanged: if a person opens a pull request by
+    hand on the agent's branch, feedback they write on that pull request is
+    attributed to its author and reaches nobody; feedback from anyone else
+    does.
     """
     if kind == _PUSH:
         return _pushed(payload)
@@ -177,7 +186,7 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     if kind == _PULL_REQUEST:
         if not isinstance(action, str) or action not in _PR_UPDATE_ACTIONS:
             return None
-        if sent_by_author and action == "synchronize":
+        if sent_by_author and action in _AUTHOR_LOOPABLE_ACTIONS:
             return None
         if (
             sender.get("type") == "Bot"
