@@ -680,6 +680,7 @@ class DeliverTests(unittest.TestCase):
         # A fresh set of queues per test, so a drainer left over from an
         # earlier one cannot take this test's messages.
         self.enterContext(mock.patch.object(server, "deliveries", {}))
+        self.enterContext(mock.patch.object(server, "DELIVERY_DEBOUNCE_SECONDS", 0))
         # The drainer paces its retries against a real agent's turn; nothing
         # here is really busy.
         self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
@@ -798,15 +799,15 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(self.issue().status, IssueStatus.IN_REVIEW)
 
     def test_two_events_for_one_agent_keep_the_order_they_arrived_in(self) -> None:
-        # Two people commenting during one long turn are two prompts, in the
-        # order they were written; merging them would lose who said what.
+        # One prompt preserves both authors and their original message order.
+        self.enterContext(mock.patch.object(server, "DELIVERY_DEBOUNCE_SECONDS", 0.05))
         self.work()
         server.deliver_issue("JIM-88", "AJ commented: ship it")
         server.deliver_issue("JIM-88", "Sam commented: hold on")
         drain_deliveries()
         self.assertEqual(
             [text for _, text in self.manager.sent],
-            ["AJ commented: ship it", "Sam commented: hold on"],
+            ["AJ commented: ship it\n\nSam commented: hold on"],
         )
 
     def test_a_refused_message_is_offered_again_rather_than_dropped(self) -> None:
@@ -1779,6 +1780,7 @@ class DelegationTests(unittest.TestCase):
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
         self.enterContext(mock.patch.object(server, "deliveries", {}))
+        self.enterContext(mock.patch.object(server, "DELIVERY_DEBOUNCE_SECONDS", 0))
         self.enterContext(mock.patch.object(server, "DELIVERY_RETRY_SECONDS", 0))
         self.enterContext(mock.patch.object(server, "_waking", set()))
         self.enterContext(mock.patch.object(server, "_claimed", set()))
@@ -2104,3 +2106,77 @@ class McpDependencyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeliveryBatchTests(unittest.TestCase):
+    """Drive quiet-period deadlines without sleeping for wall-clock timers."""
+
+    def test_each_arrival_resets_the_deadline_and_preserves_attribution(self) -> None:
+        pending = mock.Mock()
+        pending.get.side_effect = [
+            ("AJ commented: ship it", 0.0),
+            ("Sam commented: hold on", 9.0),
+            queue.Empty,
+            None,
+        ]
+        with (
+            mock.patch.object(server.time, "monotonic", side_effect=[0.0, 9.0]),
+            mock.patch.object(server, "send_queued") as send,
+        ):
+            server.drain("JIM-88", pending)
+        self.assertEqual(
+            pending.get.call_args_list,
+            [mock.call(), mock.call(timeout=10.0), mock.call(timeout=10.0), mock.call()],
+        )
+        send.assert_called_once_with(
+            "JIM-88", "AJ commented: ship it\n\nSam commented: hold on"
+        )
+        self.assertEqual(pending.task_done.call_count, 3)
+
+    def test_a_backlog_uses_enqueue_time_and_new_arrivals_form_the_next_batch(self) -> None:
+        pending = mock.Mock()
+        pending.get.side_effect = [
+            ("first", 0.0), queue.Empty,
+            ("second", 2.0), ("third", 3.0), queue.Empty, None,
+        ]
+        with (
+            mock.patch.object(server.time, "monotonic", side_effect=[0.0, 20.0, 20.0]),
+            mock.patch.object(server, "send_queued") as send,
+        ):
+            server.drain("JIM-88", pending)
+        self.assertEqual(
+            pending.get.call_args_list,
+            [mock.call(), mock.call(timeout=10.0), mock.call(),
+             mock.call(timeout=0.0), mock.call(timeout=0.0), mock.call()],
+        )
+        self.assertEqual(send.call_args_list, [
+            mock.call("JIM-88", "first"), mock.call("JIM-88", "second\n\nthird"),
+        ])
+        self.assertEqual(pending.task_done.call_count, 4)
+
+    def test_stop_interrupts_the_quiet_period_and_accounts_for_every_item(self) -> None:
+        pending = queue.Queue()
+        pending.put(("first", time.monotonic()))
+        pending.put(("second", time.monotonic()))
+        pending.put(None)
+        with mock.patch.object(server, "send_queued") as send:
+            server.drain("JIM-88", pending)
+        send.assert_called_once_with("JIM-88", "first\n\nsecond")
+        self.assertEqual(pending.unfinished_tasks, 0)
+
+    def test_a_failed_batch_does_not_strand_the_next_batch(self) -> None:
+        pending = mock.Mock()
+        pending.get.side_effect = [
+            ("first", 0.0), ("second", 1.0), queue.Empty,
+            ("third", 20.0), queue.Empty, None,
+        ]
+        with (
+            mock.patch.object(server.time, "monotonic", return_value=30.0),
+            mock.patch.object(server, "send_queued", side_effect=[RuntimeError("oops"), None]) as send,
+            self.assertLogs(server.logger, "ERROR"),
+        ):
+            server.drain("JIM-88", pending)
+        self.assertEqual(send.call_args_list, [
+            mock.call("JIM-88", "first\n\nsecond"), mock.call("JIM-88", "third"),
+        ])
+        self.assertEqual(pending.task_done.call_count, 4)

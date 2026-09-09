@@ -191,6 +191,7 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
         self.enterContext(mock.patch.object(server, "deliveries", {}))
+        self.enterContext(mock.patch.object(server, "DELIVERY_DEBOUNCE_SECONDS", 0))
         # The account id is remembered process-wide, so each test starts
         # without one and says for itself whether Linear can be asked.
         self.enterContext(mock.patch.object(server, "_viewer", ""))
@@ -837,6 +838,7 @@ class GitHubDeliveryTest(unittest.TestCase):
         self.manager = FakeManager()
         self.enterContext(mock.patch.object(server, "manager", self.manager))
         self.enterContext(mock.patch.object(server, "deliveries", {}))
+        self.enterContext(mock.patch.object(server, "DELIVERY_DEBOUNCE_SECONDS", 0))
         self.viewer = self.enterContext(
             mock.patch.object(server.linear, "viewer_id", return_value="viewer-id")
         )

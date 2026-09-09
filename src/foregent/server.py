@@ -104,10 +104,10 @@ manager: AgentManager = HerdrManager(session=config.herdr_session())
 
 # Events waiting for the agent they are for, one queue per issue key, oldest
 # first. Each has a drainer of its own, so two events for one agent reach it
-# one at a time and in the order they were written, whoever ingested them
+# in batches and in the order they were written, whoever ingested them
 # waited on neither, and an agent that cannot be reached delays only its own
 # messages. `None` is the sentinel that ends a drainer.
-deliveries: dict[str, queue.Queue[str | None]] = {}
+deliveries: dict[str, queue.Queue[tuple[str, float] | None]] = {}
 
 # Guards the dict above, not the queues in it: a queue is created on the first
 # delivery to an issue, and two deliveries arriving together must find the same
@@ -161,6 +161,9 @@ _last_delivery = ""
 # submitted without waiting for the agent to be free, so a refusal is the
 # harness being unreachable rather than the agent being busy.
 DELIVERY_RETRY_SECONDS = 5.0
+
+# Wait for a quiet period after the latest queued notification (JIM-267).
+DELIVERY_DEBOUNCE_SECONDS = 10.0
 
 
 def check_herdr_protocol() -> None:
@@ -354,7 +357,7 @@ def watch_agents() -> None:
     threading.Thread(target=consume, name="foregent-agent-events", daemon=True).start()
 
 
-def deliveries_for(key: str) -> queue.Queue[str | None]:
+def deliveries_for(key: str) -> queue.Queue[tuple[str, float] | None]:
     """Issue ``key``'s delivery queue, with a drainer running behind it.
 
     Created on the first delivery to an issue rather than at dispatch, so an
@@ -387,8 +390,8 @@ def stop_deliveries(key: str) -> None:
         pending.put(None)
 
 
-def drain(key: str, pending: queue.Queue[str | None]) -> None:
-    """Hand ``key``'s queued messages to its agent, one at a time.
+def drain(key: str, pending: queue.Queue[tuple[str, float] | None]) -> None:
+    """Send one ordered batch after ten seconds without a new notification.
 
     Runs on a daemon thread, for the reason :func:`watch_agents` does: a send
     talks to the harness and is retried until it lands, so it can take as long
@@ -401,15 +404,37 @@ def drain(key: str, pending: queue.Queue[str | None]) -> None:
     behind it.
     """
     while True:
-        message = pending.get()
+        item = pending.get()
+        count = 1
+        stopping = item is None
         try:
-            if message is None:
-                return
-            send_queued(key, message)
+            if item is not None:
+                message, added = item
+                messages = [message]
+                while DELIVERY_DEBOUNCE_SECONDS > 0:
+                    # A backlog left by a slow send must not start a fresh
+                    # quiet period when it is consumed.
+                    timeout = max(
+                        0.0, added + DELIVERY_DEBOUNCE_SECONDS - time.monotonic()
+                    )
+                    try:
+                        item = pending.get(timeout=timeout)
+                    except queue.Empty:
+                        break
+                    count += 1
+                    if item is None:
+                        stopping = True
+                        break
+                    message, added = item
+                    messages.append(message)
+                send_queued(key, "\n\n".join(messages))
         except Exception:
             logger.exception("delivering to %s failed", key)
         finally:
-            pending.task_done()
+            for _ in range(count):
+                pending.task_done()
+        if stopping:
+            return
 
 
 def _active() -> int:
@@ -1054,7 +1079,7 @@ def deliver_issue(
         raise HTTPException(
             status_code=409, detail=f"{key} has no agent to deliver to ({status})"
         )
-    deliveries_for(key).put(message)
+    deliveries_for(key).put((message, time.monotonic()))
     return _record(issue)
 
 
