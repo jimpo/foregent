@@ -351,14 +351,14 @@ request's conversation tab — map to a `PR_REVIEW` event. Pull request lifecycl
 changes that affect the worker map to `PR_UPDATE`: close or reopen, draft
 transitions, review requests, title/body/base edits, head synchronization,
 labels, and merge-queue removal. Assignment, locking, milestones, and
-auto-merge bookkeeping remain noise. A push that leaves commits on `main` maps
-to `MAIN_ADVANCED`; every other event and action maps to nothing, an
-organization webhook carrying far more than foregent has a use for. From there
-the path is the Linear one, joined at `queue_event`: match, enqueue, drain,
-send. The two guards ahead of that join stay Linear's own — both key on what
-Linear signs and stamps — so a GitHub delivery is checked against no freshness
-window, and a retry of one GitHub believes failed reaches the agent a second
-time.
+auto-merge bookkeeping remain noise. A completed Actions `workflow_run` maps
+to `PR_CHECK`, and a push that leaves commits on `main` maps to
+`MAIN_ADVANCED`; every other event and action maps to nothing, an organization
+webhook carrying far more than foregent has a use for. From there the path is
+the Linear one, joined at `queue_event`: match, enqueue, drain, send. The two
+guards ahead of that join stay Linear's own — both key on what Linear signs and
+stamps — so a GitHub delivery is checked against no freshness window, and a
+retry of one GitHub believes failed reaches the agent a second time.
 
 **The pull request is resolved back to its issue through its head branch.**
 Linear names an agent's branch after the issue and links a pull request opened

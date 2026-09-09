@@ -638,6 +638,30 @@ def conversation_comment(**overrides) -> dict:
     return payload
 
 
+def workflow_run(
+    *,
+    action: str = "completed",
+    conclusion: str = "success",
+    pull_requests: list[dict] | None = None,
+    sender: str = AGENT_LOGIN,
+) -> dict:
+    return {
+        "action": action,
+        "workflow_run": {
+            "name": "tests",
+            "conclusion": conclusion,
+            "html_url": "https://github.com/jimpo/foregent/actions/runs/123",
+            "pull_requests": (
+                [{"number": 9, "head": {"ref": BRANCH}}]
+                if pull_requests is None
+                else pull_requests
+            ),
+        },
+        "repository": {"full_name": "jimpo/foregent"},
+        "sender": {"login": sender},
+    }
+
+
 class GitHubWebhookEventTests(unittest.TestCase):
     """What a GitHub delivery maps to, before anyone is looked up (JIM-141)."""
 
@@ -851,6 +875,62 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertIn("(JIM-167) (#12)", event.body)
         self.assertIn("(JIM-149) (#9)", event.body)
 
+    def test_a_completed_success_carries_the_workflow_result_and_link(self) -> None:
+        event = github.webhook_event(workflow_run(), "workflow_run")
+        assert event is not None
+        self.assertEqual(event.kind, EventKind.PR_CHECK)
+        self.assertEqual(event.issue_key, "JIM-141")
+        self.assertEqual(event.repo, "jimpo/foregent")
+        self.assertEqual(event.number, 9)
+        self.assertEqual(event.workflow, "tests")
+        self.assertEqual(event.conclusion, "success")
+        self.assertEqual(
+            event.body, "https://github.com/jimpo/foregent/actions/runs/123"
+        )
+
+    def test_a_completed_failure_is_delivered(self) -> None:
+        event = github.webhook_event(
+            workflow_run(conclusion="failure"), "workflow_run"
+        )
+        assert event is not None
+        self.assertEqual(event.kind, EventKind.PR_CHECK)
+        self.assertEqual(event.conclusion, "failure")
+
+    def test_the_first_branch_naming_an_issue_resolves_the_workflow(self) -> None:
+        event = github.webhook_event(
+            workflow_run(
+                pull_requests=[
+                    {"number": 7, "head": {"ref": "dependabot/urllib3"}},
+                    {"number": 9, "head": {"ref": BRANCH}},
+                ]
+            ),
+            "workflow_run",
+        )
+        assert event is not None
+        self.assertEqual(event.issue_key, "JIM-141")
+        self.assertEqual(event.number, 9)
+
+    def test_an_in_progress_workflow_maps_to_nothing(self) -> None:
+        self.assertIsNone(
+            github.webhook_event(
+                workflow_run(action="in_progress", conclusion=""), "workflow_run"
+            )
+        )
+
+    def test_a_workflow_with_no_pull_requests_names_no_issue(self) -> None:
+        event = github.webhook_event(
+            workflow_run(pull_requests=[]), "workflow_run"
+        )
+        assert event is not None
+        self.assertEqual(event.kind, EventKind.PR_CHECK)
+        self.assertEqual(event.issue_key, "")
+
+    def test_a_workflow_triggered_by_the_agent_is_not_dropped(self) -> None:
+        event = github.webhook_event(
+            workflow_run(sender=AGENT_LOGIN), "workflow_run"
+        )
+        self.assertIsNotNone(event)
+
     def test_a_push_names_no_issue(self) -> None:
         # It is about a repository. Fanning it out is the bridge's job.
         event = github.webhook_event(push(), "push")
@@ -1031,6 +1111,15 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         issue = server.store.get(self.KEY)
         assert issue is not None
         self.assertEqual(issue.status, IssueStatus.IN_PROGRESS)
+
+    def test_a_completed_workflow_wakes_its_pull_requests_agent(self) -> None:
+        self.track(IssueStatus.BLOCKED)
+        response = self.deliver(workflow_run(), event="workflow_run")
+        self.assertEqual(response.status_code, 200)
+        ref, text = self.manager.sent[0]
+        self.assertEqual(ref, self.AGENT)
+        self.assertIn("Waking you: CI success on jimpo/foregent#9: tests.", text)
+        self.assertIn("https://github.com/jimpo/foregent/actions/runs/123", text)
 
     def test_a_review_on_a_branch_nobody_is_working_is_accepted_and_dropped(
         self,

@@ -142,6 +142,25 @@ class DeliveryMessageTests(unittest.TestCase):
         self.assertIn("AJ updated jimpo/binius64#123.", message)
         self.assertIn("Marked ready for review.", message)
 
+    def test_a_completed_check_names_its_result_workflow_and_link(self) -> None:
+        message = delivery_message(
+            Event(
+                kind=EventKind.PR_CHECK,
+                issue_key="JIM-42",
+                repo="jimpo/binius64",
+                number=123,
+                workflow="tests",
+                conclusion="failure",
+                body="https://github.com/jimpo/binius64/actions/runs/456",
+            ),
+            parked=False,
+        )
+        self.assertEqual(
+            message,
+            "CI failure on jimpo/binius64#123: tests.\n\n"
+            "https://github.com/jimpo/binius64/actions/runs/456",
+        )
+
     def test_main_advancing_says_where_and_what_landed(self) -> None:
         # Nobody said anything here, so the message has to stand on its own,
         # and the commit subjects are what let an agent recognize its own

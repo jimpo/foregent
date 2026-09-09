@@ -1113,9 +1113,11 @@ def queue_event(event: Event, viewer: str = "") -> None:
 
     ``viewer`` is foregent's own account id on the event's platform, and is
     how its own writes coming back are dropped. Only Linear has one to give:
-    GitHub deliveries foregent caused are already dropped in the mapping
+    GitHub review comments foregent caused are already dropped in the mapping
     (:func:`~foregent.github.webhook_event`), which is what keeps a GitHub
-    delivery from needing a Linear call to be matched.
+    delivery from needing a Linear call to be matched. Completed workflows
+    deliberately bypass that drop because their sender is the actor whose push
+    triggered them.
 
     ``MAIN_ADVANCED`` is the one kind that names no issue, and is handed to
     :func:`wake_on_push` instead of matched. It is branched on here rather
@@ -1275,10 +1277,12 @@ async def github_webhook(request: Request) -> dict[str, str]:
     report its own pull request number to be findable.
 
     Foregent's own account id is not needed here, and no Linear call is made:
-    a delivery caused by the agent that opened the pull request is dropped in
-    the mapping, where the payload names both sides of that comparison. A
-    comment in the conversation tab is the one delivery whose payload names no
-    branch, and mapping one asks GitHub for it.
+    a review comment caused by the agent that opened the pull request is
+    dropped in the mapping, where the payload names both sides of that
+    comparison. Completed workflows bypass that comparison because the sender
+    is normally the agent whose push triggered CI. A comment in the
+    conversation tab is the one delivery whose payload names no branch, and
+    mapping one asks GitHub for it.
 
     **A delivery foregent does nothing with is still a success**, as on the
     Linear side: an organization webhook carries every repository and every
