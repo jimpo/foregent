@@ -18,5 +18,6 @@ __pycache__/
 # Editor swap files
 .*.swp
 
+*.local.md
 .worktreeinclude
 
