@@ -16,7 +16,7 @@ from pathlib import Path
 # Protocol version this client is written against. herdr is a hard dependency,
 # so a drift here must stop the bridge at startup rather than surface as
 # mystery errors mid-dispatch.
-PROTOCOL = 20
+PROTOCOL = 22
 
 # Default per-call budget. Calls that block server-side (``agent.wait``,
 # ``agent.prompt`` with ``wait``) must pass their own, larger timeout — see
