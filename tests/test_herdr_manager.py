@@ -26,9 +26,14 @@ from foregent.agents import (
 from foregent.agents.herdr_manager import HerdrManager
 
 WORKSPACE = {
-    "workspace": {"workspace_id": "w1", "label": "JIM-85"},
+    "workspace": {"workspace_id": "w1", "label": "repo workers"},
+    "tab": {"tab_id": "w1:t1"},
     "root_pane": {"pane_id": "w1:p1"},
 }
+
+# A group's workspace that already exists, and the tab opened in it.
+EXISTING = {"workspaces": [{"workspace_id": "w1", "label": "repo workers"}]}
+TAB = {"tab": {"tab_id": "w1:t2"}, "root_pane": {"pane_id": "w1:p2"}}
 
 # A live, prompt-ready agent as herdr reports it. `interactive_ready` is the
 # real precondition for prompting: an agent reads as idle several seconds
@@ -162,20 +167,61 @@ class LaunchTests(unittest.TestCase):
         ref = manager(client).launch(spec(conversation_id="abc-123"))
 
         self.assertEqual(
-            client.methods()[:3],
-            ["workspace.create", "agent.start", "agent.wait"],
+            client.methods()[:5],
+            ["workspace.list", "workspace.create", "tab.rename", "agent.start", "agent.wait"],
         )
         created = client.params_for("workspace.create")
         self.assertEqual(created["cwd"], "/ws/JIM-85")
-        # The workspace is labeled with the issue key, not the agent label:
-        # it is what an attached operator scans the session for.
+        # With no group, the workspace is the agent's own, labeled with the
+        # issue key rather than the agent label: it is what an attached
+        # operator scans the session for.
         self.assertEqual(created["label"], "JIM-85")
+        # So is the tab it runs in, which is the workspace's root tab.
+        self.assertEqual(
+            client.params_for("tab.rename"), {"tab_id": "w1:t1", "label": "JIM-85"}
+        )
 
         started = client.params_for("agent.start")
         self.assertEqual(started["name"], "fg-jim-85")
         self.assertEqual(started["kind"], "claude")
         self.assertEqual(started["pane_id"], "w1:p1")
         self.assertEqual(ref, AgentRef("fg-jim-85", "abc-123"))
+
+    def test_the_first_of_a_group_creates_its_workspace(self) -> None:
+        client = FakeClient({"workspace.create": WORKSPACE})
+        manager(client).launch(spec(group="repo workers"))
+        self.assertEqual(client.params_for("workspace.create")["label"], "repo workers")
+        self.assertNotIn("tab.create", client.methods())
+        self.assertEqual(client.params_for("agent.start")["pane_id"], "w1:p1")
+
+    def test_the_rest_of_a_group_open_tabs_in_its_workspace(self) -> None:
+        client = FakeClient({"workspace.list": EXISTING, "tab.create": TAB})
+        manager(client).launch(spec(group="repo workers", env={"X": "1"}))
+        self.assertNotIn("workspace.create", client.methods())
+        self.assertEqual(
+            client.params_for("tab.create"),
+            {"cwd": "/ws/JIM-85", "env": {"X": "1"}, "label": "JIM-85", "workspace_id": "w1"},
+        )
+        self.assertEqual(client.params_for("agent.start")["pane_id"], "w1:p2")
+
+    def test_a_workspace_that_closed_since_the_listing_is_recreated(self) -> None:
+        # Its last agent's teardown can close it between the two calls.
+        client = FakeClient(
+            {"workspace.list": EXISTING, "workspace.create": WORKSPACE},
+            {"tab.create": herdr.HerdrAPIError("workspace_not_found", "gone")},
+        )
+        manager(client).launch(spec(group="repo workers"))
+        self.assertEqual(client.params_for("agent.start")["pane_id"], "w1:p1")
+
+    def test_a_failed_start_in_a_group_closes_only_its_tab(self) -> None:
+        client = FakeClient(
+            {"workspace.list": EXISTING, "tab.create": TAB},
+            {"agent.start": herdr.HerdrAPIError("agent_exists", "taken")},
+        )
+        with self.assertRaises(AgentError):
+            manager(client).launch(spec(group="repo workers"))
+        self.assertEqual(client.params_for("tab.close")["tab_id"], "w1:t2")
+        self.assertNotIn("workspace.close", client.methods())
 
     def test_launch_waits_for_idle_before_returning(self) -> None:
         client = FakeClient({"workspace.create": WORKSPACE})
@@ -198,7 +244,7 @@ class LaunchTests(unittest.TestCase):
         )
         with self.assertRaises(AgentError):
             manager(client).launch(spec())
-        self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+        self.assertEqual(client.params_for("tab.close")["tab_id"], "w1:t1")
 
     def test_an_agent_that_never_settles_reports_the_screen(self) -> None:
         # A start that hangs is nearly always a modal (the trust dialog), so
@@ -213,7 +259,7 @@ class LaunchTests(unittest.TestCase):
         with self.assertRaises(AgentError) as caught:
             manager(client).launch(spec())
         self.assertIn("I trust this folder", str(caught.exception))
-        self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+        self.assertEqual(client.params_for("tab.close")["tab_id"], "w1:t1")
 
 
 class SendTests(unittest.TestCase):
@@ -424,19 +470,25 @@ class WaitTests(unittest.TestCase):
 
 
 class StopTests(unittest.TestCase):
-    def test_stop_closes_the_whole_workspace(self) -> None:
+    def test_stop_closes_only_the_agents_tab(self) -> None:
+        # The workspace is shared with the rest of the agent's group.
         client = FakeClient(
-            {"agent.get": {"agent": {"workspace_id": "w1", "pane_id": "w1:p1"}}}
+            {
+                "agent.get": {
+                    "agent": {"workspace_id": "w1", "tab_id": "w1:t2", "pane_id": "w1:p2"}
+                }
+            }
         )
         manager(client).stop(AgentRef("fg-jim-85"))
-        self.assertEqual(client.params_for("workspace.close")["workspace_id"], "w1")
+        self.assertEqual(client.params_for("tab.close")["tab_id"], "w1:t2")
+        self.assertNotIn("workspace.close", client.methods())
 
     def test_stopping_an_absent_agent_is_not_an_error(self) -> None:
         client = FakeClient(
             errors={"agent.get": herdr.HerdrAPIError("agent_not_found", "nope")}
         )
         manager(client).stop(AgentRef("fg-jim-85"))
-        self.assertNotIn("workspace.close", client.methods())
+        self.assertNotIn("tab.close", client.methods())
 
 
 class ListAgentsTests(unittest.TestCase):
@@ -509,7 +561,9 @@ class EventTests(unittest.TestCase):
         listed = (
             agents
             if agents is not None
-            else [{"name": "fg-jim-87", "pane_id": "w1:p1", "workspace_id": "w1"}]
+            else [
+                {"name": "fg-jim-87", "pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"}
+            ]
         )
         client = FakeClient({"agent.list": {"agents": listed}})
         client.stream = stream
@@ -570,16 +624,50 @@ class EventTests(unittest.TestCase):
         )
         self.assertEqual(self.events(client, 1)[0].kind, AgentEventKind.EXITED)
 
-    def test_a_closed_workspace_is_an_exit(self) -> None:
-        # Stopping an agent closes its workspace, and that emits no pane
-        # event at all — without this the bridge would never see its own
-        # teardowns, or an operator closing a workspace by hand.
+    def test_a_closed_tab_is_an_exit(self) -> None:
+        # Stopping an agent closes its tab, and that emits no pane event at
+        # all — without this the bridge would never see its own teardowns.
         client = self.client_with(
-            [{"event": "workspace_closed", "data": {"workspace_id": "w1"}}]
+            [{"event": "tab_closed", "data": {"tab_id": "w1:t1", "workspace_id": "w1"}}]
         )
         [event] = self.events(client, 1)
         self.assertEqual(event.kind, AgentEventKind.EXITED)
         self.assertEqual(event.ref.label, "fg-jim-87")
+
+    def test_a_closed_workspace_is_an_exit_for_every_agent_in_it(self) -> None:
+        # An operator closing a group's workspace by hand emits only
+        # `workspace_closed`, with no event per tab.
+        client = self.client_with(
+            [
+                {"event": "workspace_closed", "data": {"workspace_id": "w1"}},
+                {"event": "tab_closed", "data": {"tab_id": "w1:t1", "workspace_id": "w1"}},
+                status_changed("w1:p2", "idle"),
+            ],
+            agents=[
+                {"name": "fg-jim-87", "pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1"},
+                {"name": "fg-jim-88", "pane_id": "w1:p2", "tab_id": "w1:t2", "workspace_id": "w1"},
+            ],
+        )
+        events = self.events(client, 3)
+        # The trailing tab_closed of a last tab does not report it twice.
+        self.assertEqual(
+            [(e.kind, e.ref.label) for e in events],
+            [
+                (AgentEventKind.EXITED, "fg-jim-87"),
+                (AgentEventKind.EXITED, "fg-jim-88"),
+                (AgentEventKind.STATUS_CHANGED, "fg-jim-88"),
+            ],
+        )
+
+    def test_an_agent_is_reported_gone_once(self) -> None:
+        # A crashed agent's pane exits; its tab closing later says nothing new.
+        client = self.client_with(
+            [
+                {"event": "pane_exited", "data": {"pane_id": "w1:p1"}},
+                {"event": "tab_closed", "data": {"tab_id": "w1:t1", "workspace_id": "w1"}},
+            ]
+        )
+        self.assertEqual(len(list(manager(client)._events_once())), 1)
 
     def test_panes_that_are_not_ours_are_ignored(self) -> None:
         # An operator's own pane in the same session must not look like a

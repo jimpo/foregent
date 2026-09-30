@@ -131,6 +131,9 @@ class LaunchSpec:
     # per issue.
     label: str
     cwd: str
+    # Agents that share a group are shown together, one per tab of a herdr
+    # workspace of that name. Empty names the workspace for the issue key.
+    group: str = ""
     # Which harness to run. Everything below the seam is the same call
     # whichever it is; this decides the agent kind and the argv alone.
     provider: Provider = DEFAULT_PROVIDER
