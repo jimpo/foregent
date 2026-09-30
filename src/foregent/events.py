@@ -82,7 +82,8 @@ class Event:
     # against foregent's own id to drop the bridge's own writes; see
     # :func:`wakes`.
     actor: str = ""
-    # GitHub repository and pull request number, for the PR kinds.
+    # GitHub repository and pull request number, for the PR kinds; on
+    # ``MAIN_ADVANCED``, the pull request the push left conflicting, if known.
     repo: str = ""
     number: int = 0
     # GitHub Actions workflow result, for ``PR_CHECK``.
@@ -145,10 +146,14 @@ def delivery_message(event: Event, *, parked: bool) -> str:
         case EventKind.PR_CHECK:
             what = f"CI {event.conclusion} on {pull_request}: {event.workflow}."
         case EventKind.MAIN_ADVANCED:
-            # What moved, and nothing about what it did to the agent's branch:
-            # a push proves the base changed and no more than that. What to do
-            # about it is the worker skill's to say, and saying it twice is
-            # how the two come to disagree.
+            # What moved, and whether GitHub says it broke the agent's pull
+            # request. What to do about it is the worker skill's to say, and
+            # saying it twice is how the two come to disagree.
             what = f"main advanced in {event.repo}."
+            if event.number:
+                what = (
+                    f"main advanced in {event.repo}, and {pull_request} "
+                    "now conflicts with it."
+                )
     header = f"Waking you: {what}" if parked else what
     return f"{header}\n\n{event.body}" if event.body else header

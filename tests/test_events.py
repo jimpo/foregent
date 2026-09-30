@@ -177,14 +177,21 @@ class DeliveryMessageTests(unittest.TestCase):
         self.assertIn("main advanced", message)
         self.assertIn("(#12)", message)
 
-    def test_main_advancing_claims_no_conflict(self) -> None:
-        # A push proves the base moved and nothing about whether the pull
-        # request still merges. A claim the agent has to disprove would be
+    def test_main_advancing_claims_no_conflict_github_did_not_report(self) -> None:
+        # Without a conflicting pull request named, nothing is known about
+        # whether it still merges. A claim the agent has to disprove would be
         # worse than no claim.
         message = delivery_message(
             Event(kind=EventKind.MAIN_ADVANCED, repo="jimpo/binius64"), parked=True
         )
         self.assertNotIn("conflict", message.lower())
+
+    def test_main_advancing_names_the_pull_request_it_conflicts_with(self) -> None:
+        message = delivery_message(
+            Event(kind=EventKind.MAIN_ADVANCED, repo="jimpo/binius64", number=7),
+            parked=True,
+        )
+        self.assertIn("jimpo/binius64#7 now conflicts with it", message)
 
     def test_a_parked_agent_is_told_it_is_being_woken(self) -> None:
         self.assertIn("Waking", delivery_message(comment("JIM-42"), parked=True))

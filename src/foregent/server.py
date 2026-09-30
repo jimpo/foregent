@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
 
-from fastapi import Body, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Body, FastAPI, HTTPException, Request
 from mcp.server.mcpserver import MCPServer
 from starlette.concurrency import run_in_threadpool
 
@@ -1149,11 +1149,11 @@ def queue_event(event: Event, viewer: str = "") -> None:
 
 
 def wake_on_push(event: Event) -> None:
-    """Wake the agents parked on a pull request into the repo that moved.
+    """Wake the agents whose pull request a push to ``main`` left conflicting.
 
     A push to ``main`` is about a repository, so who it reaches is decided
     here, from the issues, rather than by matching the payload
-    (:func:`~foregent.events.wakes`). Three things make an issue one of them,
+    (:func:`~foregent.events.wakes`). Three things make an issue a candidate,
     and none of it is remembered from anywhere:
 
     - **Blocked**, because a working agent is told to check ``main`` before it
@@ -1164,19 +1164,22 @@ def wake_on_push(event: Event) -> None:
       and the payload as ``owner/name``; ``origin`` joins the two
       (:func:`~foregent.workspaces.remote_slug`).
 
-    **A repo whose slug cannot be read is woken anyway.** The failure is
-    unreadable remotes, not a wrong answer, and a spurious wake costs one
-    agent turn while a missed one leaves an agent parked forever on a base
-    that has moved.
+    **Then only the conflicting ones are woken.** The policy is to rebase on
+    conflicts alone — a squash merge puts a clean branch on top of ``main``
+    anyway — so GitHub is asked which candidates' pull requests still merge
+    (:func:`~foregent.github.pull_request_states`), and one that does, merely
+    behind included, is left parked. A conflicting one is told so.
 
-    Nothing is remembered about which workers pushed a pull request, and that
-    is deliberate: the bridge holds no GitHub client to rebuild such a record
-    with, so it would be empty after every restart — which is the ordinary
-    case here, the operator merging a pull request and restarting on the
-    change (§5.4). A worker parked on something else is woken too, reads one
-    line and parks again; that is the whole price of not keeping it.
+    **Anything undetermined is woken, with the plain "main advanced"
+    wording**: a repo whose slug cannot be read, a query that failed, a state
+    still ``UNKNOWN`` after the retries, a branch with no open pull request. A
+    spurious wake costs one agent turn while a missed one leaves an agent
+    parked forever on a base that has moved.
+
+    Blocking — the query waits on GitHub computing mergeability — so the
+    caller keeps it off the event loop, as it already does for the jj reads.
     """
-    woken = 0
+    candidates = []
     for issue in store.in_flight():
         if issue.status is not IssueStatus.BLOCKED:
             continue
@@ -1185,15 +1188,31 @@ def wake_on_push(event: Event) -> None:
         slug = workspaces.remote_slug(Path(issue.repo))
         if slug and slug != event.repo:
             continue
+        candidates.append((issue, slug))
+    known = {issue.key for issue, slug in candidates if slug}
+    states = github.pull_request_states(event.repo, known) if known else {}
+    woken = 0
+    for issue, _ in candidates:
+        number, state = states.get(issue.key, (0, ""))
+        if state == "MERGEABLE":
+            logger.debug("%s still merges into main in %s", issue.key, event.repo)
+            continue
+        conflicting = state == "CONFLICTING"
+        wake = replace(event, number=number) if conflicting else event
         try:
-            deliver_issue(issue.key, delivery_message(event, parked=True))
+            deliver_issue(issue.key, delivery_message(wake, parked=True))
         except HTTPException as exc:
             logger.debug("%s was not woken by the push: %s", issue.key, exc.detail)
             continue
-        logger.info("woke %s: main advanced in %s", issue.key, event.repo)
+        logger.info(
+            "woke %s: main advanced in %s%s",
+            issue.key,
+            event.repo,
+            f", and #{number} conflicts" if conflicting else "",
+        )
         woken += 1
     if not woken:
-        logger.debug("main advanced in %s: no parked agent to wake", event.repo)
+        logger.debug("main advanced in %s: no agent woken", event.repo)
 
 
 @app.post("/webhooks/linear")
@@ -1268,7 +1287,9 @@ async def linear_webhook(request: Request) -> dict[str, str]:
 
 
 @app.post("/webhooks/github")
-async def github_webhook(request: Request) -> dict[str, str]:
+async def github_webhook(
+    request: Request, background: BackgroundTasks
+) -> dict[str, str]:
     """Deliver what GitHub pushes to the agent whose pull request it is about.
 
     The same three steps as the Linear route — authenticate, map, queue — over
@@ -1321,11 +1342,18 @@ async def github_webhook(request: Request) -> dict[str, str]:
     if event is None:
         logger.debug("GitHub delivered a %s event foregent has no use for", kind)
         return {"status": "ok"}
-    # Threadpooled because a push reads each parked issue's remotes to find
-    # out whose repo moved (:func:`wake_on_push`), and jj is a subprocess.
-    # Enqueuing is the only thing that happens after that, so answering is
-    # still not waiting on any agent.
-    await run_in_threadpool(queue_event, event)
+    # A push runs after answering, on a worker thread: it reads each parked
+    # issue's remotes (:func:`wake_on_push`), and jj is a subprocess, then asks
+    # GitHub which pull requests conflict, retrying for seconds while it
+    # computes — longer than GitHub waits on a delivery. So its unexpected
+    # errors show only in the server log, not as a 500 on GitHub's delivery
+    # page. Every other kind is queued before answering, so its errors do.
+    # ponytail: a wake is lost if the bridge restarts during the retries; a
+    # persisted queue of pushes to wake on if that ever bites.
+    if event.kind is EventKind.MAIN_ADVANCED:
+        background.add_task(queue_event, event)
+    else:
+        await run_in_threadpool(queue_event, event)
     return {"status": "ok"}
 
 
