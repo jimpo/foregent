@@ -217,11 +217,17 @@ fix without new actionable evidence, comment with what you found and report
 blocked on that cause instead of pushing again. If the result needs no action
 and you are still waiting for review, report yourself blocked again.
 
-In `pull-request` mode you are woken by one more thing: **`main` advancing**.
-That is the base of your branch moving, and it is all foregent can tell you —
-GitHub says nothing about whether your pull request still merges. So fetch,
-rebase if it moved, push the update, and say so on the pull request if you had
-to resolve anything.
+In `pull-request` mode you are woken by one more thing: **`main` advancing
+into a conflict**. Foregent asks GitHub whether your pull request still merges
+after every push to `main`, and a pull request that is merely behind is left
+alone — the squash merge lands it cleanly — so you are not woken for it. A wake
+that says your pull request conflicts with `main` means fetch, rebase, resolve
+the conflicts, push the update, and say so on the pull request. A wake that
+only says `main` advanced comes when GitHub could not tell, or when your pull
+request is no longer open. If the pushed commit subjects carry your issue key,
+your pull request landed: do not rebase, finish as *The lifecycle* describes.
+Otherwise fetch, and rebase and push only if your branch no longer merges
+cleanly.
 
 **A wake un-blocks you.** Foregent marks you working again as soon as it
 prompts you, so if you handle a wake and are still waiting on the same thing,

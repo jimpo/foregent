@@ -369,15 +369,16 @@ from it to that issue, so the key is in the branch and reading it there is the
 whole of following the link — and no pull request number a worker has to report
 to be findable.
 
-**One delivery names no branch, and is the only thing the bridge asks GitHub
-for.** A comment in the pull request's conversation tab — the ordinary way a
-reviewer says something that hangs off no line — arrives as `issue_comment`,
-GitHub's one event for a comment on an issue and on a pull request alike, and
-its payload carries the branch nowhere. The bridge fetches it: one
-authenticated `GET /repos/{owner}/{name}/pulls/{number}`, read for `head.ref`,
-with the `GITHUB_TOKEN` the box already holds for the agents' MCP server.
-Nothing else of GitHub's API is reached and there is no client — a payload
-short of one field is not a reason to own one.
+**One delivery names no branch, and is one of two things the bridge asks
+GitHub for.** A comment in the pull request's conversation tab — the ordinary
+way a reviewer says something that hangs off no line — arrives as
+`issue_comment`, GitHub's one event for a comment on an issue and on a pull
+request alike, and its payload carries the branch nowhere. The bridge fetches
+it: one authenticated `GET /repos/{owner}/{name}/pulls/{number}`, read for
+`head.ref`, with the `GITHUB_TOKEN` the box already holds for the agents' MCP
+server. The other is a push to `main`'s mergeability query, below. Nothing else
+of GitHub's API is reached and there is no client — two reads over `urllib` are
+not a reason to own one.
 
 The two cheap drops run ahead of the call, so it is made only for a comment
 that would otherwise be delivered. The `pull_request` link inside the `issue`
@@ -429,12 +430,12 @@ result a project cares about.
 **A push to `main` is the one delivery that is about a repository rather than
 an issue.** It names no branch of foregent's, so it resolves to no issue and
 matches to nobody; who it reaches is decided from the issues instead, below.
-Outside a merge queue, it is also the only signal there is for a pull request
-going stale — GitHub sends nothing when one stops merging cleanly — so it says
-only that the base moved, and leaves the agent to find out what that did to its
-branch. A merge queue additionally emits `dequeued` with its reason. The pushed
-commit subjects ride along, which is what lets an agent recognize its own pull
-request landing without going to read the repository.
+Outside a merge queue, it is also the only cue there is for a pull request
+going stale — GitHub sends nothing when one stops merging cleanly, but answers
+when asked — so the bridge asks, and wakes only the agents whose pull request
+now conflicts (below). A merge queue additionally emits `dequeued` with its
+reason. The pushed commit subjects ride along, which is what lets an agent
+recognize its own pull request landing without going to read the repository.
 
 **Who a push reaches is decided from the issues, not from the payload.** Three
 things make an issue one of them, and none of it is remembered anywhere:
@@ -447,10 +448,23 @@ failure is unreadable remotes rather than a wrong answer, and a spurious wake
 costs one agent turn while a missed one leaves an agent parked forever on a
 base that has moved.
 
-**Nothing records which workers have a pull request open, deliberately.** The
-rule above is the whole answer, and a record beside it would be a second
-thing to keep true. A worker parked on something else is therefore woken too;
-it reads one line and parks again.
+**Of those, only the ones whose pull request conflicts are woken.** The policy
+is to rebase on conflicts alone: a squash merge onto linear history puts a
+clean branch on top of `main` anyway, so a pull request that is merely behind
+is left parked. One GraphQL query per push, with `GITHUB_TOKEN`, reads the
+newest 100 open pull requests into `main` with `mergeable` and
+`mergeStateStatus`; each `headRefName` resolves to its issue key as a
+delivery's branch does, so the bridge still records no pull request numbers,
+and two pull requests on one key count as the worse of the two. GitHub computes
+mergeability lazily — the first read after `main` moves usually answers
+`UNKNOWN` — so the query is repeated a few seconds apart, up to three tries.
+`CONFLICTING` (or a `DIRTY` merge state) wakes with a message naming the
+conflicting pull request; `MERGEABLE`, `BEHIND` included, does not wake.
+Anything undetermined wakes with the plain "main advanced" wording, on the same
+fail-open reasoning: a state still `UNKNOWN` after the tries, a failed query, a
+candidate with no open pull request, and a repo whose remote will not read. The route answers
+GitHub before any of this runs, since the retries outlast GitHub's delivery
+timeout.
 
 **A wake un-blocks**, so a worker that handles one and is still waiting has to
 report itself blocked again or no later push will reach it. The worker skill
@@ -1111,7 +1125,7 @@ installed.
 | `FOREGENT_LOG_LEVEL` | CLI | Default of `serve --log-level`. Default `info`. |
 | `LINEAR_API_KEY` | bridge, agents | Linear API and MCP authentication. |
 | `LINEAR_WEBHOOK_SECRET` | bridge | Webhook signature verification. |
-| `GITHUB_TOKEN` | bridge, agents | GitHub MCP authentication, and the bridge's lookup of a pull request's head branch (§4.2). |
+| `GITHUB_TOKEN` | bridge, agents | GitHub MCP authentication, and the bridge's lookups of a pull request's head branch and of which pull requests conflict with `main` (§4.2). |
 | `GITHUB_WEBHOOK_SECRET` | bridge | GitHub webhook signature verification. |
 | `CLAUDE_CONFIG_DIR` | bridge | Claude Code's own: where its skills and trusted projects are read and written. Default `~/.claude`. |
 | `CODEX_HOME` | bridge | Codex's own: the same, plus its MCP servers. Default `~/.codex`. |
