@@ -191,6 +191,11 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(spec.cwd, "/ws/JIM-88")
         self.assertEqual(spec.label, "fg-jim-88")
 
+    def test_dispatch_groups_the_agent_with_its_repos_workers(self) -> None:
+        self.queue(directory="/src/acme")
+        server.dispatch()
+        self.assertEqual(self.manager.launched[0].group, "acme workers")
+
     def test_dispatch_gives_the_agent_foregents_own_tools(self) -> None:
         # Without these an agent cannot report itself blocked or done, so the
         # bridge never learns the outcome of the work it dispatched.

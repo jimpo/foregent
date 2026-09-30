@@ -1,6 +1,6 @@
 """Agents run in herdr panes, whichever harness they run.
 
-The manager owns every herdr detail: the socket calls that open a workspace
+The manager owns every herdr detail: the socket calls that open a tab
 and start a process, and the mapping from herdr's agent status onto
 :class:`AgentStatus`. Nothing above it knows either name.
 
@@ -63,11 +63,13 @@ CONFIRM_MS = 15_000
 # an agent can end — which are the bridge's crash authority — plus the arrival
 # of a new one.
 #
-# `workspace.closed` is not redundant. Stopping an agent closes its whole
-# workspace, and that emits only `workspace_closed`; no pane event follows.
+# Neither closing event is redundant, and neither emits a pane event. Stopping
+# an agent closes its tab, which emits only `tab_closed`; an operator closing a
+# whole workspace emits only `workspace_closed`, not one per tab in it.
 GLOBAL_SUBSCRIPTIONS = [
     {"type": "pane.exited"},
     {"type": "pane.closed"},
+    {"type": "tab.closed"},
     {"type": "workspace.closed"},
     {"type": "pane.agent_detected"},
 ]
@@ -92,6 +94,7 @@ _TIMEOUT = "timeout"
 _NOT_READY = "agent_not_ready"
 _STALLED = "agent_prompt_stalled"
 _NOT_IDLE = "agent_not_idle"
+_NO_WORKSPACE = "workspace_not_found"
 
 # herdr's agent statuses. Anything unrecognized (a new herdr release) maps to
 # UNKNOWN rather than raising: an unreadable state is not a dead agent.
@@ -123,7 +126,11 @@ class HerdrManager:
         return self.client.describe()
 
     def launch(self, spec: LaunchSpec) -> AgentRef:
-        """Open a workspace at ``spec.cwd`` and start an agent in it.
+        """Open a tab at ``spec.cwd`` and start an agent in it.
+
+        The tab is labeled with the issue key and opened in the workspace
+        labeled ``spec.group``, which is created if there is none; with no
+        group, the workspace is labeled with the issue key.
 
         Returns once the agent is idle and settled enough to accept a
         prompt. A conversation id is assigned here when the caller did not
@@ -131,16 +138,10 @@ class HerdrManager:
         """
         if not spec.conversation_id:
             spec = replace(spec, conversation_id=str(uuid.uuid4()))
-        workspace = self._call(
-            "workspace.create",
-            {
-                "cwd": spec.cwd,
-                "label": issue_key_from_label(spec.label) or spec.label,
-                "env": dict(spec.env),
-            },
-        )
-        pane_id = workspace["root_pane"]["pane_id"]
-        workspace_id = workspace["workspace"]["workspace_id"]
+        tab_label = issue_key_from_label(spec.label) or spec.label
+        opened = self._open_tab(spec, spec.group or tab_label, tab_label)
+        pane_id = opened["root_pane"]["pane_id"]
+        tab_id = opened["tab"]["tab_id"]
         harness = harness_for(spec.provider)
         try:
             self._call(
@@ -156,11 +157,42 @@ class HerdrManager:
             )
             self._await_ready(spec.label)
         except AgentError:
-            # Never leave a bare workspace behind: a failed dispatch that
-            # leaks a pane per attempt would fill the session with debris.
-            self._close_workspace(workspace_id)
+            # Never leave a bare tab behind: a failed dispatch that leaks a
+            # pane per attempt would fill the session with debris. herdr
+            # closes the workspace with its last tab.
+            self._close_tab(tab_id)
             raise
         return AgentRef(spec.label, spec.conversation_id)
+
+    def _open_tab(self, spec: LaunchSpec, group: str, label: str) -> dict:
+        """A new tab labeled ``label`` in the workspace labeled ``group``.
+
+        A workspace created here is born with a root tab, and that tab is the
+        one used, so a group never carries an idle shell tab of its own.
+        """
+        params = {"cwd": spec.cwd, "env": dict(spec.env)}
+        workspaces = self._call("workspace.list").get("workspaces", [])
+        existing = next((w for w in workspaces if w.get("label") == group), None)
+        if existing is not None:
+            try:
+                return self.client.call(
+                    "tab.create",
+                    {**params, "label": label, "workspace_id": existing["workspace_id"]},
+                )
+            except herdr.HerdrAPIError as exc:
+                # Its last tab closed since the listing, taking it with it.
+                if exc.code != _NO_WORKSPACE:
+                    raise AgentError(str(exc)) from exc
+            except herdr.HerdrError as exc:
+                raise AgentError(str(exc)) from exc
+        created = self._call("workspace.create", {**params, "label": group})
+        tab_id = created["tab"]["tab_id"]
+        try:
+            self._call("tab.rename", {"tab_id": tab_id, "label": label})
+        except AgentError:
+            self._close_tab(tab_id)
+            raise
+        return created
 
     def send(self, ref: AgentRef, text: str, *, when_idle: bool = True) -> None:
         """Deliver ``text`` to the agent, retrying only if it did not land.
@@ -242,13 +274,17 @@ class HerdrManager:
         return result.get("read", {}).get("text", "")
 
     def stop(self, ref: AgentRef) -> None:
-        """Close the agent's whole workspace, killing its process with it."""
+        """Close the agent's tab, killing its process with it.
+
+        The rest of its workspace belongs to other agents and stays, unless
+        this was its last tab, which herdr closes it with.
+        """
         agent = self._agent(ref.label)
         if agent is None:
             return
-        workspace_id = agent.get("workspace_id")
-        if workspace_id:
-            self._close_workspace(workspace_id)
+        tab_id = agent.get("tab_id")
+        if tab_id:
+            self._close_tab(tab_id)
         elif agent.get("pane_id"):
             self._call("pane.close", {"pane_id": agent["pane_id"]})
 
@@ -350,7 +386,12 @@ class HerdrManager:
         The cost is that a pane arriving later needs a new subscription,
         which is what the return value asks for.
         """
-        panes, workspaces = self._agent_labels()
+        panes, tabs, workspaces = self._agent_labels()
+        # An agent can be reported gone by more than one event — closing a
+        # workspace's last tab emits both `workspace_closed` and `tab_closed`,
+        # and a crashed agent's tab can close after its pane exited — but is
+        # reported once.
+        exited: set[str] = set()
         subscriptions = GLOBAL_SUBSCRIPTIONS + [
             {"type": "pane.agent_status_changed", "pane_id": pane_id}
             for pane_id in panes
@@ -360,7 +401,7 @@ class HerdrManager:
             if message is None:
                 # A quiet moment: pick up agents that appeared since this
                 # subscription opened, whose status nothing is watching yet.
-                live, _ = self._agent_labels()
+                live, _, _ = self._agent_labels()
                 if set(live) != set(panes):
                     return True
                 continue
@@ -388,17 +429,23 @@ class HerdrManager:
                 pane_id = data.get("pane_id")
                 label = panes.pop(pane_id, None) if pane_id else None
                 seen.pop(pane_id, None)
-                if label is not None:
+                if label is not None and label not in exited:
+                    exited.add(label)
                     yield AgentEvent(
                         AgentEventKind.EXITED, AgentRef(label), AgentStatus.GONE
                     )
-            elif kind == "workspace_closed":
-                workspace_id = data.get("workspace_id")
-                label = workspaces.pop(workspace_id, None) if workspace_id else None
-                if label is not None:
-                    yield AgentEvent(
-                        AgentEventKind.EXITED, AgentRef(label), AgentStatus.GONE
-                    )
+            elif kind in ("tab_closed", "workspace_closed"):
+                if kind == "tab_closed":
+                    label = tabs.pop(data.get("tab_id"), None)
+                    labels = [label] if label is not None else []
+                else:
+                    labels = workspaces.pop(data.get("workspace_id"), [])
+                for label in labels:
+                    if label not in exited:
+                        exited.add(label)
+                        yield AgentEvent(
+                            AgentEventKind.EXITED, AgentRef(label), AgentStatus.GONE
+                        )
             elif kind == "pane_agent_detected":
                 pane_id = data.get("pane_id")
                 if pane_id is None or pane_id in panes:
@@ -415,23 +462,29 @@ class HerdrManager:
                     return True
         return False
 
-    def _agent_labels(self) -> tuple[dict[str, str], dict[str, str]]:
-        """Agent labels keyed by pane and by workspace.
+    def _agent_labels(
+        self,
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, list[str]]]:
+        """Agent labels keyed by pane, by tab, and by workspace.
 
-        Events name panes and workspaces; the bridge speaks in labels, and
-        only `agent.list` joins the two.
+        Events name panes, tabs and workspaces; the bridge speaks in labels,
+        and only `agent.list` joins them. A workspace holds a whole group of
+        agents, so it maps to every label in it.
         """
         panes: dict[str, str] = {}
-        workspaces: dict[str, str] = {}
+        tabs: dict[str, str] = {}
+        workspaces: dict[str, list[str]] = {}
         for agent in self._call("agent.list").get("agents", []):
             label = agent.get("name")
             if not label or issue_key_from_label(label) is None:
                 continue
             if agent.get("pane_id"):
                 panes[agent["pane_id"]] = label
+            if agent.get("tab_id"):
+                tabs[agent["tab_id"]] = label
             if agent.get("workspace_id"):
-                workspaces[agent["workspace_id"]] = label
-        return panes, workspaces
+                workspaces.setdefault(agent["workspace_id"], []).append(label)
+        return panes, tabs, workspaces
 
     def _await_interactive(self, label: str) -> None:
         """Block until herdr reports the agent's TUI can accept input."""
@@ -482,10 +535,10 @@ class HerdrManager:
         except herdr.HerdrError as exc:
             raise AgentError(f"reading {label}: {exc}") from exc
 
-    def _close_workspace(self, workspace_id: str) -> None:
-        """Close a workspace, tolerating one that is already gone."""
+    def _close_tab(self, tab_id: str) -> None:
+        """Close a tab, tolerating one that is already gone."""
         try:
-            self.client.call("workspace.close", {"workspace_id": workspace_id})
+            self.client.call("tab.close", {"tab_id": tab_id})
         except herdr.HerdrError:
             pass
 

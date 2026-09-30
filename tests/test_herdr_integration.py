@@ -412,6 +412,43 @@ class ManagerIntegrationTests(unittest.TestCase):
             "exit",
         )
 
+    def test_a_group_shares_one_workspace_until_its_last_tab_closes(self) -> None:
+        group = f"grouptest-{os.getpid()} workers"
+
+        def workspaces() -> list[str]:
+            listed = self.manager.client.call("workspace.list")["workspaces"]
+            return [w["workspace_id"] for w in listed if w["label"] == group]
+
+        refs = [
+            self.manager.launch(
+                LaunchSpec(
+                    label=f"fg-group{n}-{os.getpid()}",
+                    cwd=str(_REPO_ROOT),
+                    group=group,
+                    model="haiku",
+                )
+            )
+            for n in (1, 2)
+        ]
+        for ref in refs:
+            self.addCleanup(self.manager.stop, ref)
+        [workspace_id] = workspaces()
+        tabs = self.manager.client.call("tab.list", {"workspace_id": workspace_id})
+        # The first agent took the workspace's root tab: no idle shell beside.
+        # Each tab is labeled with the issue key, as the label spells it.
+        self.assertEqual(
+            [t["label"] for t in tabs["tabs"]],
+            [f"GROUP{n}-{os.getpid()}" for n in (1, 2)],
+        )
+
+        self.manager.stop(refs[0])
+        self.assertEqual(self.manager.status(refs[0]), AgentStatus.GONE)
+        self.assertEqual(self.manager.status(refs[1]), AgentStatus.IDLE)
+        self.assertEqual(workspaces(), [workspace_id])
+
+        self.manager.stop(refs[1])
+        self.assertEqual(workspaces(), [])
+
     def test_a_second_launch_for_one_issue_is_refused(self) -> None:
         # The deterministic label is what makes a double dispatch impossible
         # rather than merely unlikely.

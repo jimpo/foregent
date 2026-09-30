@@ -878,6 +878,7 @@ def _dispatch_one() -> bool:
                 LaunchSpec(
                     label=label,
                     cwd=cwd,
+                    group=f"{repo.name} workers",
                     provider=provider,
                     model=issue.model,
                     mcp_servers=agent_mcp_servers(),

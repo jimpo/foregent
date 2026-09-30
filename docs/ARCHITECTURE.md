@@ -185,7 +185,7 @@ the bridge through the foregent MCP server.
 | `github.py` | The inbound half of GitHub: authenticate a webhook delivery, map a payload to an `Event`, and read the issue key out of a branch name. Agents reach GitHub through the MCP server; the bridge's own reach is one GET, for the one delivery that names no branch. |
 | `herdr.py` | The herdr socket client: newline-delimited JSON, session resolution, protocol check. |
 | `agents/base.py` | The `AgentManager` protocol and its types, `Provider` among them. Harness-agnostic. |
-| `agents/herdr_manager.py` | The one implementation: drives `workspace.create` → `agent.start` → `agent.prompt` and translates herdr's events, for every harness. |
+| `agents/herdr_manager.py` | The one implementation: drives `tab.create` (or `workspace.create` for a repo's first agent) → `agent.start` → `agent.prompt` and translates herdr's events, for every harness. |
 | `agents/harness.py` | Which herdr agent kind a provider names, and which module renders its argv. |
 | `agents/claude.py` | Claude Code's own half: the agent kind, the flags a `LaunchSpec` renders to, and the brief. |
 | `agents/codex.py` | The same for Codex. |
@@ -218,8 +218,11 @@ one is named, that model, then:
 4. **Workspace.** A fresh jj workspace is built from the queued repo, named
    for the issue key, and the repo's `.worktreeinclude` files are copied into
    it (§6.5). Before the launch, because it is the agent's cwd.
-5. **Launch.** A herdr workspace opens at that directory and the named
-   harness starts in it, with a conversation id foregent generates rather than
+5. **Launch.** A herdr tab labeled with the issue key opens at that
+   directory, in the workspace named `<repo> workers` — created with the
+   repo's first agent, whose tab is its root tab, and closed by herdr with
+   its last — so an attached operator sees one workspace per repo and one tab
+   per worker. The named harness starts in it, with a conversation id foregent generates rather than
    scrapes — for Claude Code, which takes one; Codex records its own, which
    herdr reports back (§6.1). A named model is passed as the harness's own
    `--model`; an unnamed one is no flag at all, so the harness's default
@@ -993,9 +996,12 @@ and none is obvious from either tool's documentation.
   `agent_status` that lags, reporting an agent idle while it works. A quiet
   subscription re-checks the fleet periodically, because an agent started
   since the subscription opened is invisible until re-subscribed.
-- **Stopping an agent emits only `workspace_closed`.** Closing a workspace
-  kills its panes with no pane event, so watching pane events alone misses
-  every deliberate teardown.
+- **Closing a tab or a workspace emits no pane event.** Stopping an agent
+  closes its tab, which emits only `tab_closed`; closing a whole workspace,
+  however many tabs it holds, emits only `workspace_closed`, and closing its
+  last tab emits both. So watching pane events alone misses every deliberate
+  teardown, a workspace maps to every agent in it, and an agent is reported
+  gone once whichever arrives. Read off herdr 0.9.3 (protocol 22).
 - **Workspace trust is inherited, not matched.** Claude Code opens its trust
   dialog in a directory it has not seen, and herdr reads that dialog as
   `blocked`, so an untrusted cwd fails a dispatch outright (§8.3). The check
