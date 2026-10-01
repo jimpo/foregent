@@ -7,9 +7,10 @@ shape. Nothing above this module reads a GitHub payload, in the shape of
 GitHub is a second source rather than a second pipeline.
 
 Agents reach GitHub the other way, through the GitHub MCP server the machine
-is provisioned with. The bridge's own reach into GitHub is one GET
+is provisioned with. The bridge's own reach into GitHub is two reads: one GET
 (:func:`_head_ref`), for the one delivery whose payload is short of the branch
-that resolves it.
+that resolves it, and one GraphQL query (:func:`pull_request_states`) for
+which pull requests a push to ``main`` left conflicting.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ import json
 import logging
 import os
 import re
+import time
 import urllib.request
+from typing import Any
 
 from foregent.events import Event, EventKind
 
@@ -121,9 +124,9 @@ _TIMEOUT = 10
 
 # The delivery that is the base moving under everyone with a pull request
 # open, and the ref it has to name to be that. GitHub sends nothing when a
-# pull request stops merging cleanly, so a push to the trunk is the only
-# signal outside a merge queue — and the same one that says a pull request
-# landed.
+# pull request stops merging cleanly, so a push to the trunk is the cue to go
+# and ask (:func:`pull_request_states`) — and the same delivery says a pull
+# request landed.
 _PUSH = "push"
 _TRUNK_REF = "refs/heads/main"
 
@@ -374,7 +377,7 @@ def _commented_on(payload: dict, kind: str) -> dict | None:
 def _head_ref(repo: str, number: int) -> str:
     """The head branch of pull request ``number`` in ``repo``, or ``""``.
 
-    The bridge's only outbound GitHub call, for the only delivery whose
+    One of the bridge's two outbound GitHub calls, for the only delivery whose
     payload leaves out the branch that resolves it to an issue. Authenticated
     with ``GITHUB_TOKEN``, which the box already holds for the agents' MCP
     server.
@@ -385,28 +388,133 @@ def _head_ref(repo: str, number: int) -> str:
     and neither is worth failing a webhook GitHub would only retry into the
     same wall, so both are logged and the comment is dropped.
     """
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        logger.warning(
-            "GITHUB_TOKEN is not set, so %s#%s resolves to no issue", repo, number
-        )
-        return ""
-    request = urllib.request.Request(
+    payload = _github_json(
         f"{_API}/repos/{repo}/pulls/{number}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-        },
+        f"{repo}#{number}",
+        accept="application/vnd.github+json",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
-            payload = json.load(response)
-    except (OSError, ValueError) as exc:
-        logger.warning("cannot read %s#%s from GitHub: %s", repo, number, exc)
-        return ""
     if not isinstance(payload, dict):
         return ""
     return (payload.get("head") or {}).get("ref") or ""
+
+
+def _github_json(
+    url: str, what: str, *, accept: str, data: bytes | None = None
+) -> Any:
+    """GitHub's JSON answer at ``url``, or ``None`` if there is none to read.
+
+    Authenticated with ``GITHUB_TOKEN``; a missing token or a failed read is
+    logged against ``what`` and answers ``None``. ``data`` makes it a POST.
+    """
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        logger.warning("GITHUB_TOKEN is not set, so %s cannot be read", what)
+        return None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Authorization": f"Bearer {token}", "Accept": accept},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+            return json.load(response)
+    except (OSError, ValueError) as exc:
+        logger.warning("cannot read %s from GitHub: %s", what, exc)
+        return None
+
+
+# The open pull requests into ``main`` and whether each still merges. One
+# query per push to ``main``: the newest 100 is every open pull request a
+# foregent box has in flight, many times over. ``mergeStateStatus`` is still
+# behind a preview media type.
+_GRAPHQL = f"{_API}/graphql"
+_OPEN_PULL_REQUESTS = """
+query($owner: String!, $name: String!, $base: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(
+      states: OPEN, baseRefName: $base, first: 100,
+      orderBy: {field: CREATED_AT, direction: DESC}
+    ) {
+      nodes { number headRefName mergeable mergeStateStatus }
+    }
+  }
+}
+"""
+_MERGE_INFO = "application/vnd.github.merge-info-preview+json"
+
+# Worst last: when two open pull requests resolve to one issue, the worse
+# state is the one that decides whether its agent is woken.
+_STATES = ("MERGEABLE", "UNKNOWN", "CONFLICTING")
+
+# GitHub computes mergeability lazily: the first read after ``main`` moves
+# usually answers ``UNKNOWN`` and starts the computation. So the query is
+# asked again after a pause, a few times, before ``UNKNOWN`` is taken as the
+# answer.
+_MERGEABILITY_TRIES = 3
+_MERGEABILITY_WAIT = 3
+
+
+def pull_request_states(repo: str, keys: set[str]) -> dict[str, tuple[int, str]]:
+    """The open pull request on each of ``keys``' branches in ``repo``.
+
+    Maps an issue key to its pull request's number and one of
+    ``"CONFLICTING"``, ``"MERGEABLE"`` or ``"UNKNOWN"``; a ``DIRTY`` merge
+    state counts as conflicting, and ``BEHIND`` is left as whatever
+    ``mergeable`` said, which is mergeable. The branch resolves to the key
+    through :func:`issue_key`, so the bridge still keeps no record of pull
+    request numbers. Two pull requests on one key answer the worse state.
+
+    Blocking: it asks again after :data:`_MERGEABILITY_WAIT` seconds while any
+    of ``keys`` still reads ``UNKNOWN``, so the caller keeps it off the event
+    loop.
+
+    **A failed read answers what the last good one did**, ``{}`` if it was
+    the first, which leaves those keys undetermined; the caller wakes on that
+    rather than guess.
+    """
+    owner, _, name = repo.partition("/")
+    query = json.dumps(
+        {
+            "query": _OPEN_PULL_REQUESTS,
+            "variables": {
+                "owner": owner,
+                "name": name,
+                "base": _TRUNK_REF.removeprefix("refs/heads/"),
+            },
+        }
+    ).encode()
+    states: dict[str, tuple[int, str]] = {}
+    for attempt in range(_MERGEABILITY_TRIES):
+        if attempt:
+            time.sleep(_MERGEABILITY_WAIT)
+        payload = _github_json(
+            _GRAPHQL, f"{repo}'s pull requests", accept=_MERGE_INFO, data=query
+        )
+        if payload is None:
+            return states
+        try:
+            nodes = list(payload["data"]["repository"]["pullRequests"]["nodes"])
+        except (LookupError, TypeError) as exc:
+            logger.warning("cannot read %s's pull requests from GitHub: %s", repo, exc)
+            return states
+        read: dict[str, tuple[int, str]] = {}
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            key = issue_key(str(node.get("headRefName") or ""))
+            if key not in keys:
+                continue
+            state = node.get("mergeable")
+            if node.get("mergeStateStatus") == "DIRTY":
+                state = "CONFLICTING"
+            if state not in _STATES:
+                state = "UNKNOWN"
+            pr = (node.get("number") or 0, state)
+            read[key] = max(read.get(key, pr), pr, key=lambda s: _STATES.index(s[1]))
+        states = read
+        if all(state != "UNKNOWN" for _, state in states.values()):
+            break
+    return states
 
 
 def _pushed(payload: dict) -> Event | None:

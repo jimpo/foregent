@@ -1176,6 +1176,39 @@ class PushWakeTests(GitHubDeliveryTest):
         self.slug = self.enterContext(
             mock.patch.object(server.workspaces, "remote_slug", return_value=self.SLUG)
         )
+        # GitHub's GraphQL answer, one per try: no open pull request unless a
+        # test says otherwise, which leaves every parked worker undetermined.
+        self.enterContext(mock.patch.dict(os.environ, {"GITHUB_TOKEN": "t0ken"}))
+        self.enterContext(mock.patch.object(github, "_MERGEABILITY_WAIT", 0))
+        self.urlopen = self.enterContext(
+            mock.patch.object(github.urllib.request, "urlopen")
+        )
+        self.answer()
+
+    def answer(self, *tries: list) -> None:
+        """Answer the query with each try's nodes in turn, the last repeating."""
+        answers = list(tries) or [[]]
+
+        def urlopen(request, timeout):
+            nodes = answers.pop(0) if len(answers) > 1 else answers[0]
+            payload = {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
+            return io.BytesIO(json.dumps(payload).encode())
+
+        self.urlopen.side_effect = urlopen
+
+    @staticmethod
+    def pr(
+        mergeable: str,
+        merge_state: str = "",
+        branch: str = BRANCH,
+        number: int = 12,
+    ) -> dict:
+        return {
+            "number": number,
+            "headRefName": branch,
+            "mergeable": mergeable,
+            "mergeStateStatus": merge_state,
+        }
 
     def park(
         self,
@@ -1234,7 +1267,7 @@ class PushWakeTests(GitHubDeliveryTest):
             self.push_to_main()
         text = "\n".join(logs.output)
         self.assertIn("GitHub delivered a nameless push", text)
-        self.assertIn("no parked agent to wake", text)
+        self.assertIn("no agent woken", text)
 
     def test_a_working_worker_is_left_alone(self) -> None:
         # It is told to check main before it pushes, so it does not need
@@ -1281,3 +1314,131 @@ class PushWakeTests(GitHubDeliveryTest):
         self.park("JIM-141")
         self.push_to_main()
         self.viewer.assert_not_called()
+
+    def test_github_is_asked_for_the_pushed_repositorys_pull_requests(self) -> None:
+        self.park("JIM-141")
+        self.push_to_main()
+        request = self.urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "https://api.github.com/graphql")
+        self.assertEqual(request.get_header("Authorization"), "Bearer t0ken")
+        self.assertEqual(
+            request.get_header("Accept"),
+            "application/vnd.github.merge-info-preview+json",
+        )
+        body = json.loads(request.data)
+        self.assertEqual(
+            body["variables"], {"owner": "jimpo", "name": "foregent", "base": "main"}
+        )
+        self.assertIn("baseRefName: $base", body["query"])
+        self.assertIn("orderBy: {field: CREATED_AT, direction: DESC}", body["query"])
+
+    def test_nobody_parked_asks_github_nothing(self) -> None:
+        self.push_to_main()
+        self.urlopen.assert_not_called()
+
+    def test_a_conflicting_pull_request_wakes_its_worker_and_says_so(self) -> None:
+        self.answer([self.pr("CONFLICTING")])
+        self.park("JIM-141")
+        self.push_to_main()
+        _, text = self.manager.sent[0]
+        self.assertIn("jimpo/foregent#12 now conflicts with it", text)
+        self.assertIn("(JIM-167) (#12)", text)
+
+    def test_a_dirty_merge_state_counts_as_conflicting(self) -> None:
+        self.answer([self.pr("UNKNOWN", "DIRTY")])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertIn("now conflicts", self.manager.sent[0][1])
+        self.assertEqual(self.urlopen.call_count, 1)
+
+    def test_a_mergeable_pull_request_is_left_parked(self) -> None:
+        # Merely behind included: a squash merge lands it on main cleanly.
+        self.answer([self.pr("MERGEABLE", "BEHIND")])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(self.manager.sent, [])
+        issue = server.store.get("JIM-141")
+        assert issue is not None
+        self.assertEqual(issue.status, IssueStatus.BLOCKED)
+
+    def test_github_is_asked_again_while_it_computes(self) -> None:
+        self.answer([self.pr("UNKNOWN")], [self.pr("MERGEABLE")])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(self.urlopen.call_count, 2)
+        self.assertEqual(self.manager.sent, [])
+
+    def test_unknown_after_every_try_wakes_with_the_plain_wording(self) -> None:
+        self.answer([self.pr("UNKNOWN")])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(self.urlopen.call_count, github._MERGEABILITY_TRIES)
+        _, text = self.manager.sent[0]
+        self.assertIn("main advanced in jimpo/foregent.", text)
+        self.assertNotIn("conflicts", text)
+
+    def test_a_failed_retry_keeps_what_the_earlier_try_read(self) -> None:
+        tries = [
+            [self.pr("CONFLICTING"), self.pr("UNKNOWN", branch="aj/jim-142-other")]
+        ]
+
+        def urlopen(request, timeout):
+            if not tries:
+                raise OSError("connection reset")
+            nodes = tries.pop()
+            payload = {"data": {"repository": {"pullRequests": {"nodes": nodes}}}}
+            return io.BytesIO(json.dumps(payload).encode())
+
+        self.urlopen.side_effect = urlopen
+        self.park("JIM-141")
+        self.park("JIM-142")
+        self.push_to_main()
+        self.assertEqual(self.urlopen.call_count, 2)
+        sent = {ref.label: text for ref, text in self.manager.sent}
+        self.assertIn("jimpo/foregent#12 now conflicts", sent["fg-jim-141"])
+        self.assertNotIn("conflicts", sent["fg-jim-142"])
+
+    def test_an_unreachable_api_wakes_with_the_plain_wording(self) -> None:
+        self.urlopen.side_effect = OSError("connection refused")
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertIn("main advanced in jimpo/foregent.", self.manager.sent[0][1])
+
+    def test_a_query_github_refuses_wakes_with_the_plain_wording(self) -> None:
+        self.urlopen.side_effect = None
+        self.urlopen.return_value = io.BytesIO(b'{"errors": [{"message": "no"}]}')
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertIn("main advanced in jimpo/foregent.", self.manager.sent[0][1])
+
+    def test_a_worker_with_no_open_pull_request_is_woken(self) -> None:
+        # Undetermined, so woken: its pull request may be closed, or on a
+        # branch that names no key.
+        self.answer([self.pr("MERGEABLE", branch="aj/jim-999-something-else")])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertEqual(len(self.manager.sent), 1)
+
+    def test_only_the_conflicting_worker_is_woken(self) -> None:
+        self.answer(
+            [
+                self.pr("CONFLICTING"),
+                self.pr("MERGEABLE", branch="aj/jim-142-other"),
+            ]
+        )
+        self.park("JIM-141")
+        self.park("JIM-142")
+        self.push_to_main()
+        self.assertEqual([ref.label for ref, _ in self.manager.sent], ["fg-jim-141"])
+
+    def test_two_pull_requests_on_one_issue_answer_the_worse_state(self) -> None:
+        self.answer([self.pr("CONFLICTING"), self.pr("MERGEABLE", number=13)])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertIn("jimpo/foregent#12 now conflicts", self.manager.sent[0][1])
+
+    def test_a_malformed_node_is_skipped_and_the_rest_are_kept(self) -> None:
+        self.answer([None, self.pr("CONFLICTING")])
+        self.park("JIM-141")
+        self.push_to_main()
+        self.assertIn("now conflicts", self.manager.sent[0][1])
