@@ -281,6 +281,40 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(caught.exception.status_code, 409)
         self.assertEqual(len(self.manager.launched), 1)
 
+    def test_requeuing_a_queued_issue_retries_its_dispatch(self) -> None:
+        # A dispatch that fails after the claim leaves the issue Queued with
+        # nothing to retry it, so queuing it again is the operator's way to
+        # force one once the cause is fixed (JIM-300).
+        self.manager.fail_launch = AgentError("stale working copy")
+        with self.assertRaises(server.HTTPException) as caught:
+            server.queue_issue("JIM-88", directory="/ws/JIM-88")
+        self.assertEqual(caught.exception.status_code, 502)
+        self.manager.fail_launch = None
+        record = server.queue_issue(
+            "JIM-88", directory="/ws/JIM-88", model="claude-sonnet-5"
+        )
+        self.assertEqual(record["status"], IssueStatus.IN_PROGRESS)
+        self.assertEqual(len(self.manager.launched), 1)
+        # What the retry names replaces what was stored.
+        self.assertEqual(self.manager.launched[0].model, "claude-sonnet-5")
+
+    def test_a_bare_requeue_keeps_what_the_issue_was_queued_with(self) -> None:
+        # The CLI leaves the harness and model unset unless named, so a plain
+        # retry must not reset what a worker queued its sub-issue with — nor
+        # move it, orphan it from its parent, or point it at another repo.
+        server.store.queue(
+            "JIM-88", "/ws/JIM-88", Provider.CODEX, "gpt-5.5", parent="JIM-1"
+        )
+        server.store.queue("JIM-89", "/ws/JIM-89")
+        with mock.patch.object(server, "admits", return_value=False):
+            server.queue_issue("JIM-88", directory="/elsewhere")
+        head = server.store.next_queued()
+        assert head is not None
+        self.assertEqual(
+            (head.key, head.parent, head.repo, head.provider, head.model),
+            ("JIM-88", "JIM-1", "/ws/JIM-88", Provider.CODEX, "gpt-5.5"),
+        )
+
     def test_the_queued_harness_decides_the_brief(self) -> None:
         # Codex has no slash form for a skill, so its brief names the skill in
         # a sentence instead. An agent given the wrong one loads no skill.

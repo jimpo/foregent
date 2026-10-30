@@ -934,7 +934,7 @@ def list_issues() -> list[dict[str, str]]:
 def queue_issue(
     key: str,
     directory: Annotated[str, Body(embed=True)],
-    provider: Annotated[Provider, Body(embed=True)] = DEFAULT_PROVIDER,
+    provider: Annotated[Provider | None, Body(embed=True)] = None,
     model: Annotated[str | None, Body(embed=True)] = None,
 ) -> dict[str, str]:
     """Queue issue ``key`` against the repo at ``directory``, dispatching if free.
@@ -944,7 +944,8 @@ def queue_issue(
     (:mod:`foregent.workspaces`).
 
     ``provider`` is which harness works it, and is the operator's to name
-    (§1.3) — unlike the mode, which is read off the repo. A harness foregent
+    (§1.3) — unlike the mode, which is read off the repo; unset, it is
+    :data:`DEFAULT_PROVIDER`. A harness foregent
     does not run is refused here rather than at launch, where an issue would
     already have been claimed.
 
@@ -953,20 +954,34 @@ def queue_issue(
     here: every harness has its own names for its models, and the harness is
     what refuses one it does not know.
 
-    Refused while the issue already has a live agent — :data:`IN_FLIGHT`, plus
-    Queued itself — because dispatch finds that agent under the issue's
-    deterministic label and adopts it as-is (§4.1) rather than starting a new
-    one, so a provider or model named here would be silently discarded rather
-    than reaching an agent at all.
+    Refused while the issue already has a live agent (:data:`IN_FLIGHT`),
+    because dispatch finds that agent under the issue's deterministic label
+    and adopts it as-is (§4.1) rather than starting a new one, so a provider
+    or model named here would be silently discarded rather than reaching an
+    agent at all.
+
+    **Queuing a Queued issue again retries its dispatch** (JIM-300). A
+    dispatch that fails after the claim leaves the issue Queued with nothing
+    to retry it until some other issue is queued or completed, so this is the
+    operator's way to force one once the cause is fixed. A harness or model
+    named here replaces the stored one and an unset one keeps it, so a bare
+    retry does not reset what a worker queued a sub-issue with. The repo,
+    queue place and parent are kept: the repo may already hold a workspace
+    for the issue. What dispatch then launches is still the head of the
+    queue, which a failed issue normally is, since it stalls the rest.
+
+    A failed attempt that got as far as launching left an agent the retry
+    adopts as it stands, so a harness or model changed on such a retry does
+    not reach it.
     """
     existing = store.get(key)
-    if existing is not None and (
-        existing.status is IssueStatus.QUEUED or existing.status in IN_FLIGHT
-    ):
+    if existing is not None and existing.status in IN_FLIGHT:
         raise HTTPException(
             status_code=409, detail=f"{key} is already {existing.status}"
         )
-    issue = store.queue(key, directory, provider, model)
+    issue = store.requeue(key, provider, model) or store.queue(
+        key, directory, provider or DEFAULT_PROVIDER, model
+    )
     dispatch()
     return _record(store.get(key) or issue)
 

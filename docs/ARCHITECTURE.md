@@ -247,6 +247,14 @@ capacity. The queue is strictly FIFO: an issue that does not fit stalls the
 ones behind it rather than being skipped, which keeps queue order from becoming
 a scheduling policy with a starvation question attached.
 
+**Queuing a Queued issue again retries it** (JIM-300). A launch that fails
+after the claim leaves the issue Queued, and nothing else retries it until
+another issue is queued or completed, so `foregent queue` on it is how the
+operator forces one: a harness or model it names replaces the stored one, an
+unset one is kept, and so are the issue's repo, place and parent. An issue in
+flight is still refused with a 409, because its agent would be adopted as it
+stands.
+
 **The queue has a second door.** `queue_sub_issues(issue_key, keys)`, an MCP
 tool a worker calls, queues each key at the back of the same queue against
 that worker's own repo, harness and model, records `issue_key` as its parent,
