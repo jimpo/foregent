@@ -21,8 +21,11 @@ class QueueProviderTests(unittest.TestCase):
     def parse(self, *argv: str) -> argparse.Namespace:
         return cli.build_parser().parse_args(["queue", "JIM-42", *argv])
 
-    def test_claude_code_is_the_default(self) -> None:
-        self.assertEqual(self.parse().provider, Provider.CLAUDE)
+    def test_unset_is_left_to_the_server(self) -> None:
+        # The server defaults a fresh queue to Claude Code and keeps the
+        # stored harness on a retry, which it cannot tell apart from a
+        # default the CLI filled in (JIM-300).
+        self.assertIsNone(self.parse().provider)
 
     def test_a_harness_can_be_named(self) -> None:
         self.assertEqual(self.parse("--provider", "codex").provider, "codex")

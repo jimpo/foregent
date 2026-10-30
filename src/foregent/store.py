@@ -140,7 +140,9 @@ class IssueStore:
         ``parent`` is the issue that delegated this one, and is what makes it
         a sub-issue for admission and for the wake its completion sends
         (JIM-250). It is written on every queue, so an issue an operator
-        queues by hand is an operator's issue again whatever it was before.
+        queues by hand is an operator's issue again whatever it was before —
+        except an issue that is still Queued, which :meth:`requeue` updates
+        in place instead.
 
         Only the repo, the harness, the model and the parent are known here.
         The agent's own directory is the workspace dispatch builds from them,
@@ -156,6 +158,28 @@ class IssueStore:
                 provider=provider,
                 model=model,
                 parent=parent,
+            )
+            self.add(issue)
+            return issue
+
+    def requeue(
+        self, key: str, provider: Provider | None, model: str | None
+    ) -> Issue | None:
+        """Update a still-Queued ``key`` in place; ``None`` if it is not Queued.
+
+        The check and the write share one lock hold, so a dispatch that has
+        meanwhile moved the issue in flight is never written back to Queued.
+        It keeps its place in the queue, its repo and its parent, and ``None``
+        for ``provider`` or ``model`` keeps the stored one (JIM-300).
+        """
+        with self._lock:
+            existing = self._issues.get(key)
+            if existing is None or existing.status is not IssueStatus.QUEUED:
+                return None
+            issue = replace(
+                existing,
+                provider=provider or existing.provider,
+                model=model or existing.model,
             )
             self.add(issue)
             return issue

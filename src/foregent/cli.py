@@ -67,10 +67,10 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument(
         "-p",
         "--provider",
-        default=DEFAULT_PROVIDER,
         choices=[str(provider) for provider in Provider],
         help=(
-            "The agent harness to work the issue on (default: %(default)s). "
+            f"The agent harness to work the issue on (default: {DEFAULT_PROVIDER}, "
+            "or the one already chosen when retrying a Queued issue). "
             "Unlike the mode, which foregent reads off the repository, this "
             "is yours to choose."
         ),
