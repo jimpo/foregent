@@ -209,8 +209,8 @@ requests agents open. Create an
 `<tunnel URL>/webhooks/github`, with **content type `application/json`**;
 foregent does not read the form-encoded delivery and answers 400 for one.
 Subscribe it to pull requests, pull request reviews, pull request review
-comments, issue comments, pushes, and workflow runs. Put the secret GitHub
-asks you to invent in the bridge's environment:
+comments, pull request review threads, issue comments, pushes, and workflow
+runs. Put the secret GitHub asks you to invent in the bridge's environment:
 
 ```sh
 export GITHUB_WEBHOOK_SECRET=...

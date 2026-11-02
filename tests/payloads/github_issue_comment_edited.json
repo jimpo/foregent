@@ -1,0 +1,12 @@
+{
+  "action": "edited",
+  "comment": {"body": "does this handle a force-push or a rebase?"},
+  "changes": {"body": {"from": "does this handle a force-push?"}},
+  "issue": {
+    "number": 9,
+    "pull_request": {"url": "https://api.github.com/repos/jimpo/foregent/pulls/9"},
+    "user": {"login": "foregent-bot"}
+  },
+  "repository": {"full_name": "jimpo/foregent"},
+  "sender": {"login": "jimpo"}
+}

@@ -696,6 +696,65 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertIn("src/foregent/github.py:42", event.body)
         self.assertIn("why?", event.body)
 
+    def test_feedback_being_revisited_is_delivered_as_a_review(self) -> None:
+        # A reviewer resolving a thread, dismissing a review, or rewording
+        # what they wrote is feedback; the body says which it was (JIM-269).
+        for kind, action, wanted in (
+            ("pull_request_review_thread", "resolved",
+             ["Resolved thread at src/foo.py:12.", "why?"]),
+            ("pull_request_review_thread", "unresolved",
+             ["Unresolved thread at src/foo.py:12.", "why?"]),
+            ("pull_request_review", "dismissed",
+             ["Review dismissed", "Written by octocat.", "rename this"]),
+            ("pull_request_review", "edited",
+             ["Review edited.", "changes requested", "rename this, and that"]),
+            ("pull_request_review_comment", "edited",
+             ["Comment edited.", "src/foo.py:12", "why this?"]),
+            ("issue_comment", "edited",
+             ["Comment edited.", "or a rebase?"]),
+        ):
+            with self.subTest(kind=kind, action=action):
+                payload = json.loads(
+                    (PAYLOADS / f"github_{kind}_{action}.json").read_text()
+                )
+                event = github.webhook_event(payload, kind)
+                assert event is not None
+                self.assertEqual(event.kind, EventKind.PR_REVIEW)
+                self.assertEqual(event.issue_key, "JIM-141")
+                self.assertEqual(event.repo, "jimpo/foregent")
+                self.assertEqual(event.number, 9)
+                self.assertEqual(event.author, "jimpo")
+                for text in wanted:
+                    self.assertIn(text, event.body)
+                # The agent resolving its own threads comes straight back.
+                payload["sender"] = {"login": AGENT_LOGIN}
+                self.assertIsNone(github.webhook_event(payload, kind))
+
+    def test_a_bot_rewriting_its_own_comment_maps_to_nothing(self) -> None:
+        payload = review_comment(
+            action="edited", sender={"login": "codecov[bot]", "type": "Bot"}
+        )
+        self.assertIsNone(
+            github.webhook_event(payload, "pull_request_review_comment")
+        )
+
+    def test_a_non_string_feedback_action_maps_to_nothing(self) -> None:
+        payload = review() | {"action": ["submitted"]}
+        self.assertIsNone(github.webhook_event(payload, "pull_request_review"))
+
+    def test_an_edited_comment_on_a_plain_issue_maps_to_nothing(self) -> None:
+        payload = json.loads(
+            (PAYLOADS / "github_issue_comment_edited.json").read_text()
+        )
+        del payload["issue"]["pull_request"]
+        self.assertIsNone(github.webhook_event(payload, "issue_comment"))
+
+    def test_a_thread_with_no_comments_still_says_it_was_resolved(self) -> None:
+        payload = review() | {"action": "resolved", "thread": {"comments": []}}
+        event = github.webhook_event(payload, "pull_request_review_thread")
+        assert event is not None
+        self.assertEqual(event.body, "Resolved thread.")
+
     def test_pull_request_lifecycle_actions_map_to_updates(self) -> None:
         for action in (
             "closed",
@@ -972,10 +1031,10 @@ class GitHubWebhookEventTests(unittest.TestCase):
         for kind, payload in (
             # An organization webhook carries every repository's every event.
             ("ping", {"zen": "Design for failure."}),
-            # A reviewer amending themselves is not new feedback to act on.
-            ("pull_request_review", review() | {"action": "edited"}),
+            # A deleted comment leaves nothing to act on.
             ("pull_request_review_comment", review_comment(action="deleted")),
-            ("issue_comment", conversation_comment(action="edited")),
+            ("issue_comment", conversation_comment(action="deleted")),
+            ("pull_request_review_thread", review() | {"action": "created"}),
             # Opening is foregent's own doing and is not a lifecycle update.
             ("pull_request", review() | {"action": "opened"}),
         ):

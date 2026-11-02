@@ -69,9 +69,8 @@ def webhook_authentic(body: bytes, signature: str) -> bool:
 # to a pull request foregent did not open.
 _BRANCH_KEY = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 
-# Comment and review deliveries that are a person answering an agent. An
-# edited or deleted review comment is a reviewer amending themselves, not new
-# feedback to act on.
+# Comment, review, and review thread deliveries that are a person answering
+# an agent.
 # ``issue_comment`` is a comment in the pull request's conversation tab — the
 # ordinary way a reviewer says something that hangs off no line. GitHub sends
 # it under the same name for a comment on a plain issue, and its payload calls
@@ -79,7 +78,22 @@ _BRANCH_KEY = re.compile(r"[A-Za-z][A-Za-z0-9]*-\d+")
 _REVIEW = "pull_request_review"
 _REVIEW_COMMENT = "pull_request_review_comment"
 _CONVERSATION_COMMENT = "issue_comment"
+_REVIEW_THREAD = "pull_request_review_thread"
 _PULL_REQUEST = "pull_request"
+
+# The actions of each feedback kind that are delivered, with the line that
+# leads the body to say which happened — ``delivery_message`` words every one
+# of them as a review. A reviewer resolving a thread, dismissing a review, or
+# rewording what they wrote is feedback too. A deleted comment is not: there
+# is nothing left in it to act on. A bot editing its own comment (a coverage
+# or CI summary rewritten on every push) is bookkeeping, as on a pull request.
+_REVIEW_ACTIONS = {
+    "submitted": "",
+    "edited": "Review edited.",
+    "dismissed": "Review dismissed; it no longer asks for anything.",
+}
+_COMMENT_ACTIONS = {"created": "", "edited": "Comment edited."}
+_THREAD_ACTIONS = frozenset({"resolved", "unresolved"})
 
 # GitHub Actions reports a workflow's result here. Only completion is useful:
 # requested and in-progress runs carry no conclusion for a worker to act on.
@@ -143,8 +157,9 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
     foregent's own shape, as on the Linear side.
 
     ``kind`` is the ``X-GitHub-Event`` header, because only the header says
-    what a delivery is about. A review being submitted, a comment being
-    written — inline or in the conversation tab — selected pull request
+    what a delivery is about. A review being submitted, edited or dismissed,
+    a comment being written or edited — inline or in the conversation tab — a
+    review thread being resolved or unresolved, selected pull request
     lifecycle changes, a workflow completing, and a push to ``main`` are the
     ones that map; every other event and action returns ``None``, an
     organization webhook carrying far more than foregent has any use for.
@@ -207,17 +222,37 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
             return None
         event_kind = EventKind.PR_UPDATE
         body = _pull_request_update_body(payload, pull_request, action)
-    elif sent_by_author:
+    elif sent_by_author or not isinstance(action, str):
         return None
-    elif kind == _REVIEW and action == "submitted":
+    elif sender.get("type") == "Bot" and action == "edited":
+        return None
+    elif kind == _REVIEW and action in _REVIEW_ACTIONS:
         review = payload.get("review") or {}
         state = (review.get("state") or "").lower().replace("_", " ")
-        body = _joined(f"Review state: {state}." if state else "", review.get("body"))
-    elif kind == _REVIEW_COMMENT and action == "created":
+        # Whoever dismisses a review is not who wrote it, and the event's
+        # author is the sender.
+        reviewer = (review.get("user") or {}).get("login")
+        body = _joined(
+            _REVIEW_ACTIONS[action],
+            f"Written by {reviewer}." if reviewer and action != "submitted" else "",
+            f"Review state: {state}." if state else "",
+            review.get("body"),
+        )
+    elif kind == _REVIEW_COMMENT and action in _COMMENT_ACTIONS:
         comment = payload.get("comment") or {}
-        body = _joined(_where(comment), comment.get("body"))
-    elif kind == _CONVERSATION_COMMENT and action == "created":
-        body = (payload.get("comment") or {}).get("body") or ""
+        body = _joined(_COMMENT_ACTIONS[action], _where(comment), comment.get("body"))
+    elif kind == _CONVERSATION_COMMENT and action in _COMMENT_ACTIONS:
+        comment = payload.get("comment") or {}
+        body = _joined(_COMMENT_ACTIONS[action], comment.get("body"))
+    elif kind == _REVIEW_THREAD and action in _THREAD_ACTIONS:
+        comments = (payload.get("thread") or {}).get("comments")
+        first = comments[0] if isinstance(comments, list) and comments else {}
+        first = first if isinstance(first, dict) else {}
+        where = _where(first)
+        body = _joined(
+            f"{action.capitalize()} thread{f' at {where}' if where else ''}.",
+            first.get("body"),
+        )
     else:
         return None
     repo = (payload.get("repository") or {}).get("full_name") or ""
