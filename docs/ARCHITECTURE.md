@@ -357,8 +357,10 @@ a body that is not a JSON object, 200 for everything else. Only the header
 `X-GitHub-Event` says what a delivery is about; the body names the repository
 and the pull request.
 
-A review being submitted and a comment being written — inline, or in the pull
-request's conversation tab — map to a `PR_REVIEW` event. Pull request lifecycle
+A review being submitted, edited or dismissed, a comment being written or
+edited — inline, or in the pull request's conversation tab — and a review
+thread being resolved or unresolved map to a `PR_REVIEW` event, the body
+leading with which it was; a deleted comment maps to nothing. Pull request lifecycle
 changes that affect the worker map to `PR_UPDATE`: close or reopen, draft
 transitions, review requests, title/body/base edits, head synchronization,
 labels, and merge-queue removal. Assignment, locking, milestones, and

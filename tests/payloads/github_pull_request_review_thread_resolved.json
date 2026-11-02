@@ -1,0 +1,17 @@
+{
+  "action": "resolved",
+  "thread": {
+    "node_id": "PRRT_kwDOAAAB",
+    "comments": [
+      {"path": "src/foo.py", "line": 12, "body": "why?"},
+      {"path": "src/foo.py", "line": 12, "body": "fixed"}
+    ]
+  },
+  "pull_request": {
+    "number": 9,
+    "head": {"ref": "aj/jim-141-deliver-github-pr-updates-to-workers"},
+    "user": {"login": "foregent-bot"}
+  },
+  "repository": {"full_name": "jimpo/foregent"},
+  "sender": {"login": "jimpo"}
+}
