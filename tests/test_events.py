@@ -127,6 +127,50 @@ class DeliveryMessageTests(unittest.TestCase):
         self.assertIn("jimpo/binius64#123", message)
         self.assertIn("rename this", message)
 
+    def test_a_plain_pr_comment_is_not_called_a_review(self) -> None:
+        # JIM-308: "reviewed" for a plain comment sent an agent looking in the
+        # wrong place, and the message had no text or link.
+        message = delivery_message(
+            Event(
+                kind=EventKind.PR_REVIEW,
+                issue_key="JIM-42",
+                repo="jimpo/binius64",
+                number=123,
+                author="AJ",
+                body="why this design?",
+                event_type="PR comment",
+                url="https://github.com/jimpo/binius64/pull/123#issuecomment-1",
+            ),
+            parked=True,
+        )
+        self.assertEqual(
+            message,
+            "Waking you.\n"
+            "Source: GitHub PR jimpo/binius64#123\n"
+            "Event: PR comment\n"
+            "Actor: AJ (human)\n"
+            "Link: https://github.com/jimpo/binius64/pull/123#issuecomment-1\n\n"
+            "why this design?",
+        )
+
+    def test_a_bot_actor_is_labelled_a_bot(self) -> None:
+        message = delivery_message(
+            Event(kind=EventKind.COMMENT, issue_key="JIM-42", author="Linear", bot=True),
+            parked=False,
+        )
+        self.assertIn("Actor: Linear (bot)", message)
+
+    def test_a_landed_sub_issue_names_it(self) -> None:
+        message = delivery_message(
+            Event(
+                kind=EventKind.SUB_ISSUE_LANDED,
+                issue_key="JIM-42",
+                event_type="JIM-43 is Done",
+            ),
+            parked=False,
+        )
+        self.assertEqual(message, "Source: Sub-issue landed\nEvent: JIM-43 is Done")
+
     def test_a_pull_request_update_names_the_pull_request(self) -> None:
         message = delivery_message(
             Event(
@@ -139,7 +183,8 @@ class DeliveryMessageTests(unittest.TestCase):
             ),
             parked=True,
         )
-        self.assertIn("AJ updated jimpo/binius64#123.", message)
+        self.assertIn("Event: pull request update", message)
+        self.assertIn("Actor: AJ (human)", message)
         self.assertIn("Marked ready for review.", message)
 
     def test_a_completed_check_names_its_result_workflow_and_link(self) -> None:
@@ -151,14 +196,16 @@ class DeliveryMessageTests(unittest.TestCase):
                 number=123,
                 workflow="tests",
                 conclusion="failure",
-                body="https://github.com/jimpo/binius64/actions/runs/456",
+                url="https://github.com/jimpo/binius64/actions/runs/456",
             ),
             parked=False,
         )
         self.assertEqual(
             message,
-            "CI failure on jimpo/binius64#123: tests.\n\n"
-            "https://github.com/jimpo/binius64/actions/runs/456",
+            "Source: GitHub CI jimpo/binius64#123\n"
+            "Event: CI workflow conclusion: failure (tests)\n"
+            "Actor: unknown (human)\n"
+            "Link: https://github.com/jimpo/binius64/actions/runs/456",
         )
 
     def test_main_advancing_says_where_and_what_landed(self) -> None:
@@ -211,7 +258,7 @@ class DeliveryMessageTests(unittest.TestCase):
         message = delivery_message(
             Event(kind=EventKind.COMMENT, issue_key="BIN-7"), parked=True
         )
-        self.assertIn("someone", message)
+        self.assertIn("unknown", message)
         self.assertIn("BIN-7", message)
 
 

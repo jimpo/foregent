@@ -1037,7 +1037,18 @@ def tell_parent(issue: Issue) -> None:
     if issue.parent is None:
         return
     try:
-        deliver_issue(issue.parent, f"{issue.key} is Done.")
+        parent = store.get(issue.parent)
+        landed = Event(
+            kind=EventKind.SUB_ISSUE_LANDED,
+            issue_key=issue.parent,
+            event_type=f"{issue.key} is Done",
+        )
+        deliver_issue(
+            issue.parent,
+            delivery_message(
+                landed, parked=parent is not None and parent.status is IssueStatus.BLOCKED
+            ),
+        )
     except Exception:
         # Everything, not just the 409 for a parent with no agent: this runs
         # before the run slot is given back and before the caller tears the

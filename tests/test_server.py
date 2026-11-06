@@ -2014,7 +2014,10 @@ class DelegationTests(unittest.TestCase):
         server.complete_issue("JIM-89")
         drain_deliveries()
 
-        self.assertEqual(self.manager.sent, [(self.ref, "JIM-89 is Done.")])
+        self.assertEqual(
+            self.manager.sent,
+            [(self.ref, "Waking you.\nSource: Sub-issue landed\nEvent: JIM-89 is Done")],
+        )
         parent = server.store.get("JIM-88")
         assert parent is not None
         self.assertEqual(parent.status, IssueStatus.IN_PROGRESS)
@@ -2035,7 +2038,10 @@ class DelegationTests(unittest.TestCase):
         server.complete_issue("JIM-89")
         drain_deliveries()
 
-        self.assertEqual(self.manager.sent, [(self.ref, "JIM-89 is Done.")])
+        self.assertEqual(
+            self.manager.sent,
+            [(self.ref, "Source: Sub-issue landed\nEvent: JIM-89 is Done")],
+        )
         parent = server.store.get("JIM-88")
         assert parent is not None
         self.assertEqual(parent.status, IssueStatus.IN_PROGRESS)

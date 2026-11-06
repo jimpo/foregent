@@ -63,6 +63,20 @@ rebase onto `main`, resolve any conflicts, and call the tool again.
 If you get blocked at any point, see *Being blocked* below instead of
 finishing.
 
+### Answer people where they wrote
+
+Anything a person writes on GitHub or Linear is answered on that same thread —
+a PR comment on the PR, a review thread in the thread, a Linear comment on the
+issue — even when a copy of it also reaches you in the wake or as a chat
+message. Your terminal is not a reply; nobody reads it. Reply before you park
+again.
+
+Wakes carry `Source`, `Event`, `Actor` (human or bot), `Link` and the text;
+`Actor` and `Link` are absent where there is no person or no exact object.
+Trust the `Event` line over your guess. On a PR wake, read all three GitHub
+sources: **reviews, review threads and PR comments**. The reviews and
+review-threads calls miss plain PR comments.
+
 **If your issue is closed under you** — someone moves it to Done or Canceled
 themselves, and that update wakes you — call `complete_task` and stop. The
 decision has been made, and foregent leaves an issue that is already closed

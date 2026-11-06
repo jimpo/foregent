@@ -476,6 +476,15 @@ candidate with no open pull request, and a repo whose remote will not read. The 
 GitHub before any of this runs, since the retries outlast GitHub's delivery
 timeout.
 
+**Every wake has the same shape** (`delivery_message`): an optional `Waking
+you.` line for a parked agent, then `Source` (Linear issue, GitHub PR, GitHub
+CI, sub-issue landed, `main` advanced), `Event` (the real type: PR comment,
+formal review, inline review comment, review thread resolved, CI workflow
+conclusion, Linear comment…), `Actor` with human or bot, `Link` to the exact
+comment, review or run, then the body. Ingestion sets `event_type`, `url` and
+`bot` on the `Event`; the worker skill tells agents to answer on the thread
+the person wrote on.
+
 **A wake un-blocks**, so a worker that handles one and is still waiting has to
 report itself blocked again or no later push will reach it. The worker skill
 says so, and that sentence is what the Blocked filter rests on.

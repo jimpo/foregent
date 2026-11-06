@@ -210,6 +210,8 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         pull_request.get("user") or {}
     ).get("login")
     event_kind = EventKind.PR_REVIEW
+    url = pull_request.get("html_url") or ""
+    event_type = ""
     if kind == _PULL_REQUEST:
         if not isinstance(action, str) or action not in _PR_UPDATE_ACTIONS:
             return None
@@ -221,6 +223,7 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         ):
             return None
         event_kind = EventKind.PR_UPDATE
+        event_type = f"pull request {action.replace('_', ' ')}"
         body = _pull_request_update_body(payload, pull_request, action)
     elif sent_by_author or not isinstance(action, str):
         return None
@@ -228,6 +231,10 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         return None
     elif kind == _REVIEW and action in _REVIEW_ACTIONS:
         review = payload.get("review") or {}
+        url = review.get("html_url") or url
+        event_type = (
+            "formal review" if action == "submitted" else f"review {action}"
+        )
         state = (review.get("state") or "").lower().replace("_", " ")
         # Whoever dismisses a review is not who wrote it, and the event's
         # author is the sender.
@@ -240,15 +247,21 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         )
     elif kind == _REVIEW_COMMENT and action in _COMMENT_ACTIONS:
         comment = payload.get("comment") or {}
+        url = comment.get("html_url") or url
+        event_type = "inline review comment" + (" edited" if action == "edited" else "")
         body = _joined(_COMMENT_ACTIONS[action], _where(comment), comment.get("body"))
     elif kind == _CONVERSATION_COMMENT and action in _COMMENT_ACTIONS:
         comment = payload.get("comment") or {}
+        url = comment.get("html_url") or url
+        event_type = "PR comment" + (" edited" if action == "edited" else "")
         body = _joined(_COMMENT_ACTIONS[action], comment.get("body"))
     elif kind == _REVIEW_THREAD and action in _THREAD_ACTIONS:
         comments = (payload.get("thread") or {}).get("comments")
         first = comments[0] if isinstance(comments, list) and comments else {}
         first = first if isinstance(first, dict) else {}
         where = _where(first)
+        url = first.get("html_url") or url
+        event_type = f"review thread {action}"
         body = _joined(
             f"{action.capitalize()} thread{f' at {where}' if where else ''}.",
             first.get("body"),
@@ -272,6 +285,9 @@ def webhook_event(payload: dict, kind: str) -> Event | None:
         number=number,
         author=sender.get("login") or "",
         body=body,
+        event_type=event_type,
+        url=url,
+        bot=sender.get("type") == "Bot",
     )
 
 
@@ -315,14 +331,13 @@ def _completed_workflow(payload: dict) -> Event | None:
         workflow=workflow_run.get("name") or "",
         conclusion=workflow_run.get("conclusion") or "",
         author=sender.get("login") or "",
-        body=_joined(
-            (
-                f"Commit: {workflow_run.get('head_sha')}."
-                if workflow_run.get("head_sha")
-                else ""
-            ),
-            workflow_run.get("html_url"),
+        body=(
+            f"Commit: {workflow_run.get('head_sha')}."
+            if workflow_run.get("head_sha")
+            else ""
         ),
+        url=workflow_run.get("html_url") or "",
+        bot=sender.get("type") == "Bot",
     )
 
 

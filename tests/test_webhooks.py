@@ -230,7 +230,7 @@ class WebhookDeliveryTests(unittest.TestCase):
         return {
             "action": "create",
             "type": "Comment",
-            "actor": {"id": actor, "name": "AJ"},
+            "actor": {"id": actor, "name": "AJ", "type": "user"},
             "data": {"body": "ship it", "issue": {"identifier": key}},
         }
 
@@ -272,7 +272,7 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         ref, text = self.manager.sent[0]
         self.assertEqual(ref, self.AGENT)
-        self.assertIn("AJ commented on JIM-133.", text)
+        self.assertIn("Source: Linear issue JIM-133\nEvent: comment\nActor: AJ (human)", text)
         self.assertIn("ship it", text)
 
     def test_a_comment_on_a_parked_issue_wakes_and_unblocks_it(self) -> None:
@@ -292,13 +292,13 @@ class WebhookDeliveryTests(unittest.TestCase):
             {
                 "action": "update",
                 "type": "Issue",
-                "actor": {"id": "operator", "name": "AJ"},
+                "actor": {"id": "operator", "name": "AJ", "type": "user"},
                 "data": {"identifier": self.KEY, "state": {"name": "Todo"}},
                 "updatedFrom": {"stateId": "state-was"},
             }
         )
         _, text = self.manager.sent[0]
-        self.assertIn("AJ updated JIM-133.", text)
+        self.assertIn("Source: Linear issue JIM-133\nEvent: issue update", text)
         self.assertIn("state: state-was → Todo", text)
 
     def test_the_route_answers_before_the_agent_is_sent_anything(self) -> None:
@@ -355,7 +355,7 @@ class WebhookDeliveryTests(unittest.TestCase):
         self.track()
         logs = self.logs_from(self.comment())
         self.assertIn("Linear delivered a create Comment", logs)
-        self.assertIn("delivered to JIM-133: AJ commented on JIM-133.", logs)
+        self.assertIn("delivered to JIM-133: Source: Linear issue JIM-133", logs)
 
     def test_a_filtered_delivery_says_it_was_filtered(self) -> None:
         self.track()
@@ -625,7 +625,10 @@ def conversation_comment(**overrides) -> dict:
     """
     payload = {
         "action": "created",
-        "comment": {"body": "does this handle a force-push?"},
+        "comment": {
+            "body": "does this handle a force-push?",
+            "html_url": "https://github.com/jimpo/foregent/pull/9#issuecomment-1",
+        },
         "issue": {
             "number": 9,
             "pull_request": {"url": "https://api.github.com/repos/x/y/pulls/9"},
@@ -893,6 +896,11 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertEqual(event.number, 9)
         self.assertEqual(event.author, "jimpo")
         self.assertIn("force-push", event.body)
+        self.assertEqual(event.event_type, "PR comment")
+        self.assertEqual(
+            event.url, "https://github.com/jimpo/foregent/pull/9#issuecomment-1"
+        )
+        self.assertFalse(event.bot)
         self.head_ref.assert_called_once_with("jimpo/foregent", 9)
 
     def test_a_conversation_comment_on_an_unresolvable_branch_names_no_issue(
@@ -946,7 +954,9 @@ class GitHubWebhookEventTests(unittest.TestCase):
         self.assertEqual(event.workflow, "tests")
         self.assertEqual(event.conclusion, "success")
         self.assertIn("Commit: 0123456789abcdef0123456789abcdef01234567.", event.body)
-        self.assertIn("https://github.com/jimpo/foregent/actions/runs/123", event.body)
+        self.assertEqual(
+            event.url, "https://github.com/jimpo/foregent/actions/runs/123"
+        )
 
     def test_a_completed_failure_is_delivered(self) -> None:
         event = github.webhook_event(
@@ -1143,7 +1153,7 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         self.assertEqual(response.status_code, 200)
         ref, text = self.manager.sent[0]
         self.assertEqual(ref, self.AGENT)
-        self.assertIn("jimpo reviewed jimpo/foregent#9.", text)
+        self.assertIn("Source: GitHub PR jimpo/foregent#9\nEvent: formal review\nActor: jimpo (human)", text)
         self.assertIn("rename this", text)
 
     def test_a_pull_request_update_reaches_the_agent_whose_branch_it_is_on(
@@ -1156,7 +1166,7 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         self.assertEqual(response.status_code, 200)
         ref, text = self.manager.sent[0]
         self.assertEqual(ref, self.AGENT)
-        self.assertIn("jimpo updated jimpo/foregent#9.", text)
+        self.assertIn("Event: pull request reopened", text)
         self.assertIn("Reopened.", text)
 
     def test_a_review_of_a_parked_agents_pull_request_wakes_and_unblocks_it(
@@ -1178,7 +1188,7 @@ class GitHubWebhookDeliveryTests(GitHubDeliveryTest):
         self.assertEqual(response.status_code, 200)
         ref, text = self.manager.sent[0]
         self.assertEqual(ref, self.AGENT)
-        self.assertIn("Waking you: CI success on jimpo/foregent#9: tests.", text)
+        self.assertIn("Source: GitHub CI jimpo/foregent#9\nEvent: CI workflow conclusion: success (tests)", text)
         self.assertIn("https://github.com/jimpo/foregent/actions/runs/123", text)
 
     def test_a_review_on_a_branch_nobody_is_working_is_accepted_and_dropped(
@@ -1433,7 +1443,7 @@ class PushWakeTests(GitHubDeliveryTest):
         self.push_to_main()
         self.assertEqual(self.urlopen.call_count, github._MERGEABILITY_TRIES)
         _, text = self.manager.sent[0]
-        self.assertIn("main advanced in jimpo/foregent.", text)
+        self.assertIn("Source: main advanced in jimpo/foregent", text)
         self.assertNotIn("conflicts", text)
 
     def test_a_failed_retry_keeps_what_the_earlier_try_read(self) -> None:
@@ -1461,14 +1471,14 @@ class PushWakeTests(GitHubDeliveryTest):
         self.urlopen.side_effect = OSError("connection refused")
         self.park("JIM-141")
         self.push_to_main()
-        self.assertIn("main advanced in jimpo/foregent.", self.manager.sent[0][1])
+        self.assertIn("Source: main advanced in jimpo/foregent", self.manager.sent[0][1])
 
     def test_a_query_github_refuses_wakes_with_the_plain_wording(self) -> None:
         self.urlopen.side_effect = None
         self.urlopen.return_value = io.BytesIO(b'{"errors": [{"message": "no"}]}')
         self.park("JIM-141")
         self.push_to_main()
-        self.assertIn("main advanced in jimpo/foregent.", self.manager.sent[0][1])
+        self.assertIn("Source: main advanced in jimpo/foregent", self.manager.sent[0][1])
 
     def test_a_worker_with_no_open_pull_request_is_woken(self) -> None:
         # Undetermined, so woken: its pull request may be closed, or on a
