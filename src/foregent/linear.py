@@ -116,6 +116,7 @@ query Poll($since: DateTimeOrDuration!, $keys: [ID!], $viewer: ID) {{
       id
       createdAt
       body
+      url
       user {{ id name }}
       issue {{ identifier }}
     }}
@@ -302,6 +303,10 @@ def poll_comments(
             actor=(node["user"] or {}).get("id", ""),
             author=(node["user"] or {}).get("name", ""),
             body=node["body"] or "",
+            event_type="comment",
+            url=node.get("url") or "",
+            # Linear attributes automated comments to no user at all.
+            bot=node["user"] is None,
         )
         for node in nodes
     ]
@@ -397,8 +402,10 @@ def webhook_event(payload: dict) -> Event | None:
     actor = payload.get("actor") or {}
     if payload["type"] == "Comment":
         kind, body = EventKind.COMMENT, data.get("body") or ""
+        event_type = "comment"
     else:
         kind = EventKind.ISSUE_UPDATE
+        event_type = "issue update"
         body = _changes(data, payload.get("updatedFrom") or {})
     return Event(
         kind=kind,
@@ -406,4 +413,8 @@ def webhook_event(payload: dict) -> Event | None:
         actor=actor.get("id") or "",
         author=actor.get("name") or "",
         body=body,
+        event_type=event_type,
+        url=payload.get("url") or data.get("url") or "",
+        # No actor means Linear itself wrote it.
+        bot=actor.get("type", "application") != "user",
     )

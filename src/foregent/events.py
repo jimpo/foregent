@@ -49,6 +49,8 @@ class EventKind(StrEnum):
     PR_UPDATE = "pr_update"
     # A completed GitHub Actions workflow on the linked pull request.
     PR_CHECK = "pr_check"
+    # A sub-issue the recipient queued landed. The event's issue is the parent.
+    SUB_ISSUE_LANDED = "sub_issue_landed"
     # `main` moved in a repository. The one kind that is about a repository
     # rather than an issue, and so the one that carries no issue key.
     MAIN_ADVANCED = "main_advanced"
@@ -92,6 +94,12 @@ class Event:
     # Human-readable name of the actor, and what they said.
     author: str = ""
     body: str = ""
+    # What exactly happened, in words ("PR comment", "review thread resolved");
+    # empty falls back to a generic one for the kind. ``url`` is the exact
+    # comment, review or run, and ``bot`` says the actor is not a person.
+    event_type: str = ""
+    url: str = ""
+    bot: bool = False
 
 
 def wakes(event: Event, viewer: str = "") -> str:
@@ -132,28 +140,39 @@ def delivery_message(event: Event, *, parked: bool) -> str:
     woken is a lie it would have to reason past. The event reads the same
     either way.
     """
-    who = event.author or "someone"
     pull_request = f"{event.repo}#{event.number}"
+    event_type = event.event_type
     match event.kind:
         case EventKind.COMMENT:
-            what = f"{who} commented on {event.issue_key}."
+            source, event_type = f"Linear issue {event.issue_key}", event_type or "comment"
         case EventKind.ISSUE_UPDATE:
-            what = f"{who} updated {event.issue_key}."
+            source = f"Linear issue {event.issue_key}"
+            event_type = event_type or "issue update"
         case EventKind.PR_REVIEW:
-            what = f"{who} reviewed {pull_request}."
+            source, event_type = f"GitHub PR {pull_request}", event_type or "review"
         case EventKind.PR_UPDATE:
-            what = f"{who} updated {pull_request}."
+            source = f"GitHub PR {pull_request}"
+            event_type = event_type or "pull request update"
         case EventKind.PR_CHECK:
-            what = f"CI {event.conclusion} on {pull_request}: {event.workflow}."
+            source = f"GitHub CI {pull_request}"
+            event_type = f"CI workflow conclusion: {event.conclusion} ({event.workflow})"
+        case EventKind.SUB_ISSUE_LANDED:
+            source, event_type = "Sub-issue landed", event_type or "sub-issue Done"
         case EventKind.MAIN_ADVANCED:
             # What moved, and whether GitHub says it broke the agent's pull
             # request. What to do about it is the worker skill's to say, and
             # saying it twice is how the two come to disagree.
-            what = f"main advanced in {event.repo}."
+            source, event_type = f"main advanced in {event.repo}", "push to main"
             if event.number:
-                what = (
-                    f"main advanced in {event.repo}, and {pull_request} "
-                    "now conflicts with it."
-                )
-    header = f"Waking you: {what}" if parked else what
+                event_type += f"; {pull_request} now conflicts with it"
+    lines = [f"Source: {source}", f"Event: {event_type}"]
+    if event.kind not in (EventKind.MAIN_ADVANCED, EventKind.SUB_ISSUE_LANDED):
+        lines.append(
+            f"Actor: {event.author or 'unknown'} ({'bot' if event.bot else 'human'})"
+        )
+    if event.url:
+        lines.append(f"Link: {event.url}")
+    if parked:
+        lines.insert(0, "Waking you.")
+    header = "\n".join(lines)
     return f"{header}\n\n{event.body}" if event.body else header
