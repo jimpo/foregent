@@ -29,7 +29,7 @@ from foregent.agents.base import (
     LaunchSpec,
     issue_key_from_label,
 )
-from foregent.agents.harness import harness_for, provider_for_kind
+from foregent.agents.harness import Harness, harness_for, provider_for_kind
 
 # herdr's own budget for getting a process up and detected. Generous: a cold
 # Claude Code start on a loaded box is slow, and the cost of being wrong is a
@@ -95,6 +95,12 @@ _NOT_READY = "agent_not_ready"
 _STALLED = "agent_prompt_stalled"
 _NOT_IDLE = "agent_not_idle"
 _NO_WORKSPACE = "workspace_not_found"
+_PANE_BUSY = "agent_pane_busy"
+
+# A fresh pane's shell may not be at its prompt yet when `agent.start` runs,
+# which herdr refuses as `agent_pane_busy`; the shell is up within moments.
+# Roughly 30s of retrying at RETRY_SECONDS apart.
+START_ATTEMPTS = 15
 
 # herdr's agent statuses. Anything unrecognized (a new herdr release) maps to
 # UNKNOWN rather than raising: an unreadable state is not a dead agent.
@@ -144,17 +150,7 @@ class HerdrManager:
         tab_id = opened["tab"]["tab_id"]
         harness = harness_for(spec.provider)
         try:
-            self._call(
-                "agent.start",
-                {
-                    "name": spec.label,
-                    "kind": harness.kind,
-                    "pane_id": pane_id,
-                    "args": harness.render_args(spec),
-                    "timeout_ms": START_MS,
-                },
-                timeout=herdr.timeout_for_wait(START_MS),
-            )
+            self._start(spec, harness, pane_id)
             self._await_ready(spec.label)
         except AgentError:
             # Never leave a bare tab behind: a failed dispatch that leaks a
@@ -163,6 +159,29 @@ class HerdrManager:
             self._close_tab(tab_id)
             raise
         return AgentRef(spec.label, spec.conversation_id)
+
+    def _start(self, spec: LaunchSpec, harness: Harness, pane_id: str) -> None:
+        """`agent.start`, retried while the new pane's shell is still coming up."""
+        params = {
+            "name": spec.label,
+            "kind": harness.kind,
+            "pane_id": pane_id,
+            "args": harness.render_args(spec),
+            "timeout_ms": START_MS,
+        }
+        for _ in range(START_ATTEMPTS - 1):
+            try:
+                self.client.call(
+                    "agent.start", params, timeout=herdr.timeout_for_wait(START_MS)
+                )
+                return
+            except herdr.HerdrAPIError as exc:
+                if exc.code != _PANE_BUSY:
+                    raise AgentError(str(exc)) from exc
+            except herdr.HerdrError as exc:
+                raise AgentError(str(exc)) from exc
+            time.sleep(RETRY_SECONDS)
+        self._call("agent.start", params, timeout=herdr.timeout_for_wait(START_MS))
 
     def _open_tab(self, spec: LaunchSpec, group: str, label: str) -> dict:
         """A new tab labeled ``label`` in the workspace labeled ``group``.

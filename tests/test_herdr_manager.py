@@ -223,6 +223,32 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(client.params_for("tab.close")["tab_id"], "w1:t2")
         self.assertNotIn("workspace.close", client.methods())
 
+    def test_a_pane_whose_shell_is_not_up_yet_is_retried(self) -> None:
+        # JIM-306: herdr refuses agent.start with agent_pane_busy until the
+        # fresh pane's shell is at its prompt.
+        attempts = []
+
+        def start(params: dict) -> dict:
+            attempts.append(params)
+            if len(attempts) == 1:
+                raise herdr.HerdrAPIError("agent_pane_busy", "not an available shell")
+            return {}
+
+        client = FakeClient({"workspace.create": WORKSPACE, "agent.start": start})
+        with mock.patch("time.sleep"):
+            manager(client).launch(spec())
+        self.assertEqual(len(attempts), 2)
+
+    def test_a_pane_that_stays_busy_fails_and_closes_its_tab(self) -> None:
+        client = FakeClient(
+            {"workspace.create": WORKSPACE},
+            {"agent.start": herdr.HerdrAPIError("agent_pane_busy", "no shell")},
+        )
+        with mock.patch("time.sleep"), self.assertRaises(AgentError):
+            manager(client).launch(spec())
+        self.assertEqual(client.methods().count("agent.start"), 15)
+        self.assertEqual(client.params_for("tab.close")["tab_id"], "w1:t1")
+
     def test_launch_waits_for_idle_before_returning(self) -> None:
         client = FakeClient({"workspace.create": WORKSPACE})
         manager(client).launch(spec())
